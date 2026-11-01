@@ -40,6 +40,11 @@ class TokenEntry:
     tier: str
 
 
+def is_valid_client_id(client_id: str) -> bool:
+    """The client-id allow-list, shared by MOF_MCP_TOKENS parsing and `hash-token`."""
+    return _CLIENT_ID.fullmatch(client_id) is not None
+
+
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -54,7 +59,7 @@ def parse_tokens(spec: str) -> list[TokenEntry]:
             raise ConfigError(f"MOF_MCP_TOKENS entry {position}: expected client:sha256[:tier]")
         client, digest = parts[0], parts[1].lower()
         tier = parts[2].lower() if len(parts) == 3 else "act"
-        if not _CLIENT_ID.fullmatch(client):  # never echoed: a token may sit here
+        if not is_valid_client_id(client):  # never echoed: a token may sit here
             raise ConfigError(
                 f"MOF_MCP_TOKENS entry {position}: client id must be 1-32 characters of A-Z a-z 0-9 _ . -"
             )

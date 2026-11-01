@@ -1,0 +1,19 @@
+# Copy to compose.yaml in YOUR deployment and fill .env (from .env.example).
+# Nothing host-specific belongs in this repository: addresses, networks and tokens live in .env.
+services:
+  mcp:
+    build: .
+    image: myopenfund-mcp
+    env_file: .env
+    ports:
+      # Default: loopback only. Publish on a private interface (VPN, private network) or put a
+      # reverse proxy / cloud load balancer with TLS in front. Never the public internet without TLS.
+      - "${MOF_MCP_BIND_ADDR:-127.0.0.1}:${MOF_MCP_BIND_PORT:-8000}:8000"
+    restart: unless-stopped
+    # To reach a vault Postgres on the same Docker host without publishing its port, join its network
+    # (uncomment both blocks and set MOF_VAULT_DOCKER_NETWORK in .env):
+    # networks: [vault]
+# networks:
+#   vault:
+#     external: true
+#     name: ${MOF_VAULT_DOCKER_NETWORK}
