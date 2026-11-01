@@ -8,6 +8,7 @@ def test_defaults_are_local_stdio():
     assert (s.transport, s.host, s.port, s.path) == ("stdio", "127.0.0.1", 8000, "/mcp")
     assert (s.default_rows, s.max_rows, s.query_timeout_s) == (50, 200, 20)
     assert (s.max_error_samples, s.max_text_chars) == (5, 2000)
+    assert s.connect_timeout_s == 10
     assert s.vault_database_url is None
 
 
@@ -49,6 +50,9 @@ def test_empty_strings_mean_unset():
         ({"MOF_MCP_PORT": "+5"}, "MOF_MCP_PORT"),
         ({"MOF_MCP_MAX_ROWS": "1_000"}, "MOF_MCP_MAX_ROWS"),
         ({"MOF_MCP_DEFAULT_ROWS": "٣٤"}, "MOF_MCP_DEFAULT_ROWS"),
+        # libpq silently raises a connect_timeout below 2 to 2: refused rather than misread.
+        ({"MOF_MCP_CONNECT_TIMEOUT_S": "1"}, "MOF_MCP_CONNECT_TIMEOUT_S"),
+        ({"MOF_MCP_CONNECT_TIMEOUT_S": "301"}, "MOF_MCP_CONNECT_TIMEOUT_S"),
     ],
 )
 def test_bounds_path_and_strict_integers_fail_at_start(env, match):
@@ -104,3 +108,8 @@ def test_secrets_never_appear_in_repr():
 def test_from_env_without_argument_reads_os_environ(monkeypatch):
     monkeypatch.setenv("MOF_MCP_PORT", "9123")
     assert Settings.from_env().port == 9123
+
+
+def test_connect_timeout_bounds_are_inclusive():
+    assert Settings.from_env({"MOF_MCP_CONNECT_TIMEOUT_S": "2"}).connect_timeout_s == 2
+    assert Settings.from_env({"MOF_MCP_CONNECT_TIMEOUT_S": "300"}).connect_timeout_s == 300

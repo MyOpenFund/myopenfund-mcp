@@ -53,6 +53,7 @@ class Settings:
     # MOF_VAULT_DATABASE_URL: as vault_readonly; unset = no vault toolset; kept out of repr
     vault_database_url: str | None = field(default=None, repr=False)
     query_timeout_s: int = 20  # MOF_MCP_QUERY_TIMEOUT_S: Postgres statement_timeout per call
+    connect_timeout_s: int = 10  # MOF_MCP_CONNECT_TIMEOUT_S: libpq connect_timeout per call
     default_rows: int = 50  # MOF_MCP_DEFAULT_ROWS
     max_rows: int = 200  # MOF_MCP_MAX_ROWS
     max_result_chars: int = 200_000  # MOF_MCP_MAX_RESULT_CHARS: larger results are refused, not cut
@@ -74,6 +75,8 @@ class Settings:
             vault_database_url=_get(env, "MOF_VAULT_DATABASE_URL"),
             # statement_timeout is an int32 in milliseconds.
             query_timeout_s=_int(env, "MOF_MCP_QUERY_TIMEOUT_S", 20, maximum=2_147_483),
+            # libpq silently raises a connect_timeout below 2 to 2: refused here rather than misread.
+            connect_timeout_s=_int(env, "MOF_MCP_CONNECT_TIMEOUT_S", 10, minimum=2, maximum=300),
             default_rows=_int(env, "MOF_MCP_DEFAULT_ROWS", 50),
             max_rows=_int(env, "MOF_MCP_MAX_ROWS", 200),
             max_result_chars=_int(env, "MOF_MCP_MAX_RESULT_CHARS", 200_000, minimum=1_000),

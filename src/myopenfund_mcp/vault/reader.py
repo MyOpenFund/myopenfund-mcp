@@ -27,20 +27,30 @@ class VaultReader(Protocol):
 
 
 class PostgresVaultReader:
-    def __init__(self, database_url: str, *, query_timeout_s: int):
+    def __init__(self, database_url: str, *, query_timeout_s: int, connect_timeout_s: int = 10):
         import psycopg2  # optional extra [vault]: imported only when the toolset is enabled
+        import psycopg2.extensions
         import vault_query
 
         self._pg, self._vq = psycopg2, vault_query
         self._url, self._timeout_ms = database_url, query_timeout_s * 1000
+        self._connect_timeout_s = connect_timeout_s
+
+    def _options(self) -> str:
+        # The DSN's own options (e.g. search_path) are kept; ours are appended so that, for the same GUC,
+        # ours win (the last -c wins): a DSN cannot lift the read-only guard or the statement timeout.
+        # Parsed per call, inside _run: a malformed DSN raises a driver error whose text holds the DSN.
+        theirs = self._pg.extensions.parse_dsn(self._url).get("options", "")
+        ours = f"-c statement_timeout={self._timeout_ms} -c default_transaction_read_only=on"
+        return f"{theirs} {ours}" if theirs.strip() else ours
 
     @contextmanager
     def _connection(self):
         conn = self._pg.connect(
             self._url,
-            connect_timeout=10,
+            connect_timeout=self._connect_timeout_s,
             application_name="myopenfund-mcp",
-            options=f"-c statement_timeout={self._timeout_ms} -c default_transaction_read_only=on",
+            options=self._options(),
         )
         try:
             # Autocommit (review A2): a read on a non-autocommit connection leaves it "idle in transaction",
@@ -58,7 +68,11 @@ class PostgresVaultReader:
         except self._vq.InvalidQuery as exc:
             error = tool_error(INVALID_ARGUMENT, str(exc))
         except self._pg.errors.QueryCanceled:
-            error = tool_error(TIMEOUT, "the vault query exceeded MOF_MCP_QUERY_TIMEOUT_S; narrow the filters")
+            error = tool_error(TIMEOUT, "the vault query exceeded MOF_MCP_QUERY_TIMEOUT_S (slow query, or the "
+                                        "vault is being migrated); retry later or narrow the filters")
+        except self._pg.DataError:
+            # Fixed text: the driver's message can echo the refused value.
+            error = tool_error(INVALID_ARGUMENT, "a value was refused by the database; check its format")
         except self._pg.Error:
             # Never the driver's text: a connection error can carry DSN fragments (vault api/db.py::_redact).
             error = tool_error(BACKEND_UNAVAILABLE, "the vault database is unreachable or refused the query")

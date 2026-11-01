@@ -30,7 +30,8 @@ def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
         from .vault.reader import PostgresVaultReader
 
         vault_reader = PostgresVaultReader(settings.vault_database_url,
-                                           query_timeout_s=settings.query_timeout_s)
+                                           query_timeout_s=settings.query_timeout_s,
+                                           connect_timeout_s=settings.connect_timeout_s)
     if vault_reader is not None:
         from .vault.tools import build_vault_toolset, register_vault_resources
 
