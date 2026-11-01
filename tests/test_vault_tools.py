@@ -1,5 +1,7 @@
+import datetime as dt
 import json
 import logging
+import sys
 
 import pytest
 from fakes import DOCS, FakeVaultReader, invalid_query_reader
@@ -7,6 +9,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from myopenfund_mcp.config import ConfigError, Settings
+from myopenfund_mcp.errors import BACKEND_UNAVAILABLE, tool_error
 from myopenfund_mcp.paging import MAX_OFFSET, encode_cursor
 from myopenfund_mcp.server import build_server
 
@@ -182,21 +185,44 @@ LEAK = RuntimeError("postgres://u:hunter2@h/db failed")
 
 
 async def test_unexpected_errors_are_masked_for_tools_server_info_and_the_resource(caplog):
-    caplog.set_level(logging.INFO, logger="myopenfund_mcp.audit")
+    caplog.set_level(logging.INFO, logger="myopenfund_mcp")
     async with _client(FakeVaultReader(fail_with=LEAK)) as c:
         messages = []
         for name, args in [("vault_search_documents", {}), ("vault_get_document", {"doc_id": "us1"}),
-                           ("vault_corpus_stats", {}), ("vault_runs_status", {}), ("server_info", {})]:
+                           ("vault_corpus_stats", {}), ("vault_runs_status", {})]:
             with pytest.raises(ToolError) as caught:
                 await c.call_tool(name, args)
             messages.append(str(caught.value))
+        info = (await c.call_tool("server_info", {})).data
+        messages.append(json.dumps(info))
         with pytest.raises(Exception) as caught:
             await c.read_resource("vault://documents/us1")
         messages.append(str(caught.value))
+    messages += [r.getMessage() for r in caplog.records]
     for message in messages:
         assert "hunter2" not in message and "postgres://" not in message, message
+    assert info["freshness"] is None and info["freshness_error"] == "backend_unavailable"
     lines = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.audit"]
-    assert len(lines) == 5 and all("outcome=error" in line for line in lines)
+    assert len(lines) == 5
+    assert sum("outcome=error" in line for line in lines) == 4
+    assert "tool=server_info client=local outcome=ok" in lines[4]
+    logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.server"]
+    assert any("RuntimeError" in line for line in logged), logged
+
+
+async def test_server_info_survives_a_vault_outage():
+    reader = FakeVaultReader(fail_with=tool_error(BACKEND_UNAVAILABLE, "the vault database is unreachable"))
+    async with _client(reader) as c:
+        info = (await c.call_tool("server_info", {})).data
+    assert info["version"] and info["tier"] == "act"
+    assert info["toolsets"]["vault"] == "enabled"
+    assert info["freshness"] is None and info["freshness_error"] == "backend_unavailable"
+
+
+async def test_server_info_has_no_freshness_error_when_the_read_succeeds():
+    async with _client() as c:
+        info = (await c.call_tool("server_info", {})).data
+    assert "freshness_error" not in info
 
 
 async def test_masking_keeps_our_coded_errors():
@@ -218,14 +244,52 @@ async def test_parameter_descriptions_are_present():
     async with _client() as c:
         tools = {t.name: t for t in await c.list_tools()}
     search = tools["vault_search_documents"].input_schema["properties"]
-    for name in ("doc_type", "language", "year", "mime_type", "include_deleted", "limit"):
+    for name in ("doc_type", "language", "year", "mime_type", "include_deleted", "limit",
+                 "sort_by", "sort_dir"):
         assert search[name].get("description"), name
     assert "refused" in search["limit"]["description"]
+    assert search["text"]["description"] == (
+        "Case-insensitive substring of the title (% and _ act as wildcards)")
     stats = tools["vault_corpus_stats"].input_schema["properties"]
     assert "maximum number of groups returned" in stats["limit"]["description"]
     assert "refused" in stats["limit"]["description"] and stats["corpus"].get("description")
-    runs = tools["vault_runs_status"].input_schema["properties"]["limit"]["description"]
-    assert "each" in runs and "refused" in runs
+    assert stats["group_by"].get("description")
+    runs = tools["vault_runs_status"].input_schema["properties"]
+    assert "each" in runs["limit"]["description"] and "refused" in runs["limit"]["description"]
+    assert runs["corpus"]["description"] == search["corpus"]["description"]
+    assert runs["source_code"]["description"] == search["source_code"]["description"]
+
+
+async def test_search_description_warns_that_pages_can_shift_while_ingesting():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    search = tools["vault_search_documents"].description
+    assert "shift" in search and "ingesting" in search
+
+
+@pytest.mark.parametrize(("given", "expected"), [
+    ("2026-09-01T00:00:00", dt.datetime(2026, 9, 1, tzinfo=dt.UTC)),
+    ("2026-09-01T02:00:00+02:00", dt.datetime(2026, 9, 1, 2, tzinfo=dt.timezone(dt.timedelta(hours=2)))),
+])
+async def test_runs_status_since_is_utc_when_naive_and_kept_otherwise(given, expected):
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        await c.call_tool("vault_runs_status", {"since": given})
+    sinces = [call[3] for call in reader.calls if call[0] == "runs_status"]
+    sinces += [call[2] for call in reader.calls if call[0] == "recent_runs"]
+    assert len(sinces) == 2
+    for since in sinces:
+        assert since == expected and since.utcoffset() == expected.utcoffset()
+
+
+@pytest.mark.parametrize("missing", ["vault_query", "psycopg2"])
+def test_vault_url_without_the_extra_is_a_config_error(monkeypatch, missing):
+    monkeypatch.setitem(sys.modules, missing, None)
+    with pytest.raises(ConfigError) as caught:
+        build_server(Settings(vault_database_url="postgresql://u:hunter2@h/db"))
+    assert str(caught.value) == ("MOF_VAULT_DATABASE_URL is set but the [vault] extra is not installed: "
+                                 "pip install 'myopenfund-mcp[vault]'")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 class _HugeTotalReader(FakeVaultReader):

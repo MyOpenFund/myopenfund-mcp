@@ -41,7 +41,8 @@ class PostgresVaultReader:
         # ours win (the last -c wins): a DSN cannot lift the read-only guard or the statement timeout.
         # Parsed per call, inside _run: a malformed DSN raises a driver error whose text holds the DSN.
         theirs = self._pg.extensions.parse_dsn(self._url).get("options", "")
-        ours = f"-c statement_timeout={self._timeout_ms} -c default_transaction_read_only=on"
+        # timezone=UTC: timestamptz values come back in UTC, whatever the server or role default.
+        ours = f"-c timezone=UTC -c statement_timeout={self._timeout_ms} -c default_transaction_read_only=on"
         return f"{theirs} {ours}" if theirs.strip() else ours
 
     @contextmanager

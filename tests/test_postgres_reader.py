@@ -129,6 +129,7 @@ def test_connection_is_autocommit_read_only_and_time_boxed(pg, monkeypatch):
     assert kwargs["connect_timeout"] == 7
     assert "-c statement_timeout=1000" in kwargs["options"]
     assert "-c default_transaction_read_only=on" in kwargs["options"]
+    assert "-c timezone=UTC" in kwargs["options"]
     assert pg["conns"][0].closed
 
 
@@ -152,6 +153,14 @@ def test_dsn_options_cannot_override_ours(pg, monkeypatch):
     _reader("postgresql://u:p@h/db?options=-c%20default_transaction_read_only%3Doff").freshness()
     options = pg["calls"][0][1]["options"]
     assert options.rindex("default_transaction_read_only=on") > options.index("default_transaction_read_only=off")
+
+
+def test_session_timezone_is_utc_and_wins_over_the_dsn(pg, monkeypatch):
+    monkeypatch.setattr(vault_query, "freshness", lambda conn: {})
+    _reader("postgresql://u:p@h/db?options=-c%20timezone%3DEurope/Paris").freshness()
+    options = pg["calls"][0][1]["options"]
+    assert options.startswith("-c timezone=Europe/Paris ")
+    assert options.rindex("timezone=UTC") > options.index("timezone=Europe/Paris")
 
 
 # Each reader method, its call, and the vault_query call it must make (args after conn, kwargs).

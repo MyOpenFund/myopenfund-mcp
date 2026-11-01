@@ -67,8 +67,8 @@ def test_hash_token_prints_a_token_and_its_entry(capsys):
 
 
 def test_hash_token_defaults_to_act_and_never_repeats(capsys):
-    _, first, entry = _hash_token(capsys, "marc")
-    _, second, _ = _hash_token(capsys, "marc")
+    _, first, entry = _hash_token(capsys, "alice")
+    _, second, _ = _hash_token(capsys, "alice")
     assert entry.endswith(":act")
     assert first != second
 
@@ -138,6 +138,14 @@ def test_serve_http_does_not_warn_about_tokens(clean_env, no_server, caplog):
     assert "ignored" not in caplog.text
 
 
+def test_serve_refuses_a_vault_url_without_the_extra(clean_env, capsys):
+    clean_env.setenv("MOF_VAULT_DATABASE_URL", "postgresql://u:hunter2@h/db")
+    clean_env.setitem(sys.modules, "vault_query", None)
+    assert cli.main(["serve"]) == 2
+    err = capsys.readouterr().err
+    assert "[vault] extra is not installed" in err and "hunter2" not in err
+
+
 def test_serve_http_uses_the_configured_address(clean_env, no_server):
     clean_env.setenv("MOF_MCP_TRANSPORT", "http")
     clean_env.setenv("MOF_MCP_TOKENS", f"agent:{'0' * 64}")
@@ -168,7 +176,6 @@ def test_serve_stdio_audit_lines_go_to_stderr_never_stdout(tmp_path):
             proc.stdin.flush()
             if "id" in request:
                 responses.append(json.loads(proc.stdout.readline()))
-        proc.stdin.close()
         rest, stderr = proc.communicate(timeout=30)
     finally:
         if proc.poll() is None:

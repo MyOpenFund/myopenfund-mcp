@@ -27,6 +27,12 @@ LIMIT_DESCRIPTION = f"Rows per page; omitted = server default; {_REFUSED}"
 STATS_LIMIT_DESCRIPTION = f"The maximum number of groups returned; omitted = server default; {_REFUSED}"
 RUNS_LIMIT_DESCRIPTION = (f"Applies to each list (runs, source_runs, open_discovery_errors); "
                           f"omitted = server default; {_REFUSED}")
+CORPUS_DESCRIPTION = "e.g. 'central-bank'"
+SOURCE_CODE_DESCRIPTION = "Publisher code, e.g. 'us' (Fed), 'fr'"
+TEXT_DESCRIPTION = "Case-insensitive substring of the title (% and _ act as wildcards)"
+SORT_BY_DESCRIPTION = "Field the rows are ordered by"
+SORT_DIR_DESCRIPTION = "asc (oldest / smallest first) or desc (newest / largest first)"
+GROUP_BY_DESCRIPTION = "Field the live documents are counted by"
 SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset); keeps runs FINISHED at or after it; runs still "
                      "in flight are left out when since is given; applies to `runs` and `source_runs` only")
 
@@ -52,8 +58,8 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
 
     @vault.tool(auth=read, annotations=READ_ONLY)
     async def search_documents(
-        corpus: Annotated[str | None, Field(description="e.g. 'central-bank'")] = None,
-        source_code: Annotated[str | None, Field(description="Publisher code, e.g. 'us' (Fed), 'fr'")] = None,
+        corpus: Annotated[str | None, Field(description=CORPUS_DESCRIPTION)] = None,
+        source_code: Annotated[str | None, Field(description=SOURCE_CODE_DESCRIPTION)] = None,
         doc_type: Annotated[str | None, Field(
             description="Publisher's document-type code, e.g. 'C1'; exact match")] = None,
         language: Annotated[str | None, Field(description="Language code, e.g. 'en', 'fr'; exact match")] = None,
@@ -62,10 +68,9 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
             description="e.g. 'application/pdf', 'text/html'; exact match")] = None,
         date_from: Annotated[dt.date | None, Field(description="YYYY-MM-DD, inclusive")] = None,
         date_to: Annotated[dt.date | None, Field(description="YYYY-MM-DD, inclusive")] = None,
-        text: Annotated[str | None, Field(description="Case-insensitive match on the title",
-                                          max_length=MAX_ARG_CHARS)] = None,
-        sort_by: SortField = "date",
-        sort_dir: Literal["asc", "desc"] = "desc",
+        text: Annotated[str | None, Field(description=TEXT_DESCRIPTION, max_length=MAX_ARG_CHARS)] = None,
+        sort_by: Annotated[SortField, Field(description=SORT_BY_DESCRIPTION)] = "date",
+        sort_dir: Annotated[Literal["asc", "desc"], Field(description=SORT_DIR_DESCRIPTION)] = "desc",
         limit: Annotated[int | None, Field(description=LIMIT_DESCRIPTION)] = None,
         cursor: Annotated[str | None, Field(description="next_cursor of the previous page, unchanged",
                                             max_length=MAX_ARG_CHARS)] = None,
@@ -75,7 +80,8 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         """Find official documents (metadata, not text). Start here: filter, then open one with
         vault_get_document. Rows are ordered by `sort_by` in `sort_dir`; documents with equal sort
         values are always ordered by doc_id ascending, whatever `sort_dir`. `total` counts the
-        whole filtered set; pass `next_cursor` back (same filters) to get the next page."""
+        whole filtered set; pass `next_cursor` back (same filters) to get the next page. Cursors are
+        offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped)."""
         page = clamp_limit(limit, settings)
         offset = decode_cursor(cursor)
         if date_from is not None and date_to is not None and date_from > date_to:
@@ -103,7 +109,7 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
 
     @vault.tool(auth=read, annotations=READ_ONLY)
     async def corpus_stats(
-        group_by: GroupField = "source_code",
+        group_by: Annotated[GroupField, Field(description=GROUP_BY_DESCRIPTION)] = "source_code",
         corpus: Annotated[str | None, Field(
             description="Count only this corpus, e.g. 'central-bank'; omitted = every corpus")] = None,
         limit: Annotated[int | None, Field(description=STATS_LIMIT_DESCRIPTION)] = None,
@@ -113,10 +119,15 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
                                       limit=clamp_limit(limit, settings)), settings)
 
     @vault.tool(auth=read, annotations=READ_ONLY, description=RUNS_STATUS_DESCRIPTION)
-    async def runs_status(corpus: str | None = None, source_code: str | None = None,
-                          since: Annotated[dt.datetime | None, Field(description=SINCE_DESCRIPTION)] = None,
-                          limit: Annotated[int | None, Field(description=RUNS_LIMIT_DESCRIPTION)] = None) -> dict:
+    async def runs_status(
+        corpus: Annotated[str | None, Field(description=CORPUS_DESCRIPTION)] = None,
+        source_code: Annotated[str | None, Field(description=SOURCE_CODE_DESCRIPTION)] = None,
+        since: Annotated[dt.datetime | None, Field(description=SINCE_DESCRIPTION)] = None,
+        limit: Annotated[int | None, Field(description=RUNS_LIMIT_DESCRIPTION)] = None,
+    ) -> dict:
         page = clamp_limit(limit, settings)
+        if since is not None and since.tzinfo is None:
+            since = since.replace(tzinfo=dt.UTC)  # a naive since is UTC (SINCE_DESCRIPTION)
         runs = await _call(reader.recent_runs, corpus=corpus, since=since, limit=page)
         source_runs = await _call(reader.runs_status, corpus=corpus, source_code=source_code, since=since,
                                   limit=page, max_error_samples=settings.max_error_samples,

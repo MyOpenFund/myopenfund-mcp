@@ -1,6 +1,7 @@
 """Assemble the server: core + every toolset whose stack is installed and configured."""
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 import anyio
@@ -13,7 +14,13 @@ from . import __version__
 from .audit import AuditMiddleware
 from .auth import HashedTokenVerifier, caller_tier, parse_tokens
 from .config import ConfigError, Settings
+from .errors import BACKEND_UNAVAILABLE
 from .paging import jsonable
+
+log = logging.getLogger("myopenfund_mcp.server")
+
+MISSING_VAULT_EXTRA = ("MOF_VAULT_DATABASE_URL is set but the [vault] extra is not installed: "
+                       "pip install 'myopenfund-mcp[vault]'")
 
 INSTRUCTIONS = (
     "MyOpenFund: official primary sources only (central banks today; company filings next). "
@@ -37,9 +44,16 @@ def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
     if vault_reader is None and settings.vault_database_url:
         from .vault.reader import PostgresVaultReader
 
-        vault_reader = PostgresVaultReader(settings.vault_database_url,
-                                           query_timeout_s=settings.query_timeout_s,
-                                           connect_timeout_s=settings.connect_timeout_s)
+        # Configured but not installed is a deployment mistake: refuse to start rather than run without
+        # the toolset the operator asked for. The ConfigError is raised outside the handler (no chaining).
+        try:
+            vault_reader = PostgresVaultReader(settings.vault_database_url,
+                                               query_timeout_s=settings.query_timeout_s,
+                                               connect_timeout_s=settings.connect_timeout_s)
+        except ImportError:
+            vault_reader = None
+        if vault_reader is None:
+            raise ConfigError(MISSING_VAULT_EXTRA)
     if vault_reader is not None:
         from .vault.tools import build_vault_toolset, register_vault_resources
 
@@ -50,16 +64,21 @@ def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
     @root.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
     async def server_info() -> dict:
         """What this deployment offers: enabled toolsets, your tier, version, data freshness."""
-        freshness = None
-        if vault_reader is not None:
-            freshness = jsonable(await anyio.to_thread.run_sync(partial(vault_reader.freshness)))
-        return {
+        info = {
             "version": __version__,
             "tier": caller_tier(get_access_token(), auth_enabled=auth_enabled),
             "toolsets": {"vault": "enabled" if vault_reader is not None else "not configured",
                          "rag": "not configured", "companies": "not configured"},
-            "freshness": freshness,
+            "freshness": None,
         }
+        if vault_reader is not None:
+            try:
+                info["freshness"] = jsonable(await anyio.to_thread.run_sync(partial(vault_reader.freshness)))
+            except Exception as exc:  # noqa: BLE001 -- an outage must not hide the tier and toolsets
+                # The class only: an exception's text can hold the DSN.
+                log.warning("server_info: freshness read failed (%s)", type(exc).__name__)
+                info["freshness_error"] = BACKEND_UNAVAILABLE
+        return info
 
     # HTTP only: an unauthenticated liveness probe for load balancers and the image HEALTHCHECK.
     # It answers "ok" and nothing else (no version, no data); /mcp keeps requiring a token.

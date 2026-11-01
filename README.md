@@ -6,8 +6,9 @@ pipeline health today, RAG and company data next.
 Any MCP client (a desktop assistant, a coding agent, your own agent, a local model) gets outcome-oriented
 tools over MyOpenFund's data: find official primary-source documents, read their facts with provenance
 (`doc_id`, dates, source URLs), count the corpus, check the ingestion pipeline's health. Toolsets are
-enabled per installed stack: a toolset whose extra is not installed or whose environment variables are
-not set is simply not mounted, and `server_info` says so.
+enabled per deployment: a toolset whose environment variables are not set is not configured, so it is not
+mounted, and `server_info` says so. A toolset whose variables are set but whose extra is not installed
+stops the server at start with a clear configuration error (it never runs silently without it).
 
 > **MyOpenFund manages nobody's money and gives no investment advice.** This server returns documents and
 > facts from official sources, with their provenance. What you do with them is your decision.
@@ -139,16 +140,21 @@ and `cursor` are at most 200 characters.
 | Tool | Purpose | Key arguments |
 |---|---|---|
 | `server_info` | What this deployment offers: enabled toolsets, your tier, version, data freshness (last vault ingest). Call it first. Open to every authenticated caller. | none |
-| `vault_search_documents` | Find official documents (metadata, not text). Start here: filter, then open one with `vault_get_document`. Rows are ordered by `sort_by` in `sort_dir`; equal sort values are always ordered by `doc_id` ascending, whatever `sort_dir`. `total` counts the whole filtered set. | `corpus` (e.g. `central-bank`), `source_code` (publisher, e.g. `us` for the Fed), `doc_type`, `language`, `year`, `mime_type`, `date_from` / `date_to` (YYYY-MM-DD, inclusive), `text` (case-insensitive match on the title), `sort_by` (`date` default, `year`, `corpus`, `source_code`, `doc_type`, `title`, `created_at`), `sort_dir` (`desc` default), `limit`, `cursor`, `include_deleted` (also return withdrawn documents, with `deleted_at` set) |
+| `vault_search_documents` | Find official documents (metadata, not text). Start here: filter, then open one with `vault_get_document`. Rows are ordered by `sort_by` in `sort_dir`; equal sort values are always ordered by `doc_id` ascending, whatever `sort_dir`. `total` counts the whole filtered set. Cursors are offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped). | `corpus` (e.g. `central-bank`), `source_code` (publisher, e.g. `us` for the Fed), `doc_type`, `language`, `year`, `mime_type`, `date_from` / `date_to` (YYYY-MM-DD, inclusive), `text` (case-insensitive substring of the title; `%` and `_` act as wildcards), `sort_by` (`date` default, `year`, `corpus`, `source_code`, `doc_type`, `title`, `created_at`), `sort_dir` (`desc` default), `limit`, `cursor`, `include_deleted` (also return withdrawn documents, with `deleted_at` set) |
 | `vault_get_document` | Every stored fact of one document: dates, source and PDF URLs, publisher, type, `extra`. | `doc_id` |
 | `vault_corpus_stats` | Live-document counts grouped by one field, largest first (NULL is a real group). | `group_by` (`source_code` default, `corpus`, `doc_type`, `language`, `year`, `provenance`, `mime_type`), `corpus`, `limit` |
-| `vault_runs_status` | Is the pipeline healthy? Four lists, newest first: `runs` (one row per run, with outcome and totals; a run that crashed before reaching any source appears only here), `source_runs` (one row per run and source: counts, outcome, bounded error samples), `open_discovery_errors` (unresolved discovery failures; while `seen_at_is_ingestion_time` is true, `last_seen_at` is approximate), `source_health` (expected-vs-observed publication cadence per series). | `corpus`, `source_code`, `since` (ISO 8601, UTC if no offset; keeps runs *finished* at or after it, leaves out runs still in flight; applies to `runs` and `source_runs` only), `limit` (applies to each of `runs`, `source_runs`, `open_discovery_errors`) |
+| `vault_runs_status` | Is the pipeline healthy? Four lists, newest first: `runs` (one row per run, with outcome and totals; a run that crashed before reaching any source appears only here), `source_runs` (one row per run and source: counts, outcome, bounded error samples), `open_discovery_errors` (unresolved discovery failures; while `seen_at_is_ingestion_time` is true, `last_seen_at` is approximate), `source_health` (expected-vs-observed publication cadence per series). | `corpus`, `source_code`, `since` (ISO 8601, UTC if no offset, an explicit offset is kept; keeps runs *finished* at or after it, leaves out runs still in flight; applies to `runs` and `source_runs` only), `limit` (applies to each of `runs`, `source_runs`, `open_discovery_errors`) |
 
 Resource: `vault://documents/{doc_id}`, one document's metadata as JSON (same content as
 `vault_get_document`).
 
-The `vault_*` tools and the resource exist only when `MOF_VAULT_DATABASE_URL` is set and the `[vault]`
-extra is installed.
+The `vault_*` tools and the resource exist only when `MOF_VAULT_DATABASE_URL` is set; the `[vault]` extra
+must then be installed, or the server refuses to start (`MOF_VAULT_DATABASE_URL is set but the [vault]
+extra is not installed`). Timestamps in results are UTC: the server's database session runs with
+`timezone=UTC`, whatever the database or role default.
+
+If the vault database is down, `server_info` still answers (version, tier, toolsets) with `freshness`
+null and `"freshness_error": "backend_unavailable"`; the server log names the exception class only.
 
 ## Errors
 
@@ -203,7 +209,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_MCP_CONNECT_TIMEOUT_S` | `10` | Postgres connection timeout, in seconds (2-300). |
 | `MOF_MCP_DEFAULT_ROWS` | `50` | Rows per page when the caller gives no `limit`; at most `MOF_MCP_MAX_ROWS`. |
 | `MOF_MCP_MAX_ROWS` | `200` | Largest `limit` a caller may ask for. |
-| `MOF_MCP_MAX_RESULT_CHARS` | `200000` | Largest tool result in characters (at least 1000); larger results are refused. |
+| `MOF_MCP_MAX_RESULT_CHARS` | `200000` | Largest tool result in characters (at least 1000); larger results are refused. The cap measures the result's text block (compact JSON); the protocol also carries the same data as structured content, so a response on the wire is roughly twice that size. |
 | `MOF_MCP_MAX_ERROR_SAMPLES` | `5` | Error samples kept per row of `vault_runs_status`. |
 | `MOF_MCP_MAX_TEXT_CHARS` | `2000` | Each error text in `vault_runs_status` is cut to this length. |
 

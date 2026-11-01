@@ -18,7 +18,7 @@ from myopenfund_mcp.server import build_server
 
 pytestmark = pytest.mark.anyio
 
-MARC_TOKEN = "t-marc-" + "m" * 40
+ALICE_TOKEN = "t-alice-" + "a" * 40
 AGENT_TOKEN = "t-agent-" + "a" * 40
 START_TIMEOUT_S = 10.0
 
@@ -33,7 +33,7 @@ def _free_port() -> int:
 def http_url():
     port = _free_port()
     settings = Settings(transport="http", port=port,
-                        tokens=f"marc:{hash_token(MARC_TOKEN)}:act,agent:{hash_token(AGENT_TOKEN)}:read")
+                        tokens=f"alice:{hash_token(ALICE_TOKEN)}:act,agent:{hash_token(AGENT_TOKEN)}:read")
     server = build_server(settings, vault_reader=FakeVaultReader())
 
     # v1 ships no act-only tool: a throwaway one proves tier enforcement over HTTP.
@@ -67,7 +67,7 @@ async def test_read_token_gets_read_tier_and_vault_tools(http_url):
 
 
 async def test_act_token_gets_act_tier(http_url):
-    async with Client(http_url, auth=MARC_TOKEN) as c:
+    async with Client(http_url, auth=ALICE_TOKEN) as c:
         assert (await c.call_tool("server_info", {})).data["tier"] == "act"
         assert "act_only_probe" in {t.name for t in await c.list_tools()}
         assert (await c.call_tool("act_only_probe", {})).data == "acted"

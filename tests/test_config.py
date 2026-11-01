@@ -81,7 +81,7 @@ def test_integers_are_stripped():
 
 
 def test_http_with_tokens_starts():
-    spec = "marc:" + "a" * 64
+    spec = "alice:" + "a" * 64
     s = Settings.from_env({"MOF_MCP_TRANSPORT": "http", "MOF_MCP_TOKENS": spec})
     assert s.transport == "http" and s.tokens == spec
 
@@ -92,7 +92,7 @@ def test_http_with_blank_tokens_is_refused():
 
 
 def test_secrets_never_appear_in_repr():
-    spec = "marc:" + "b" * 64
+    spec = "alice:" + "b" * 64
     s = Settings.from_env(
         {
             "MOF_MCP_TRANSPORT": "http",
