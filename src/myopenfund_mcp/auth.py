@@ -3,8 +3,18 @@
 MOF_MCP_TOKENS lists one entry per client: `client:sha256hex[:tier]`, comma-separated.
 Only the SHA-256 digest of a token is configured; the clear token lives with its
 client (`myopenfund-mcp hash-token` makes a pair). Tier `act` (the default, spec Q2)
-implies `read`. Over stdio there is no token: the local user owns the process and
-gets every tier.
+implies `read`; tiers are case-insensitive. Client ids are 1-32 characters of
+A-Z a-z 0-9 _ . - (a urlsafe token is at least 43 characters, so it fails the rule).
+
+Digests are unsalted SHA-256: safe only for high-entropy tokens such as the 256-bit
+random ones `myopenfund-mcp hash-token` generates. Never hash a human passphrase: an
+unsalted fast hash of a guessable secret falls to a dictionary attack.
+
+Configuration errors never echo an entry's content, not even its client id (a token
+of the allow-listed alphabet given in the client field would pass for one): they name
+the entry by position only.
+
+Over stdio there is no token: the local user owns the process and gets every tier.
 """
 from __future__ import annotations
 
@@ -19,7 +29,8 @@ from .config import ConfigError
 
 TIERS = ("read", "act")
 SCOPES = {"read": ["read"], "act": ["read", "act"]}
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_CLIENT_ID = re.compile(r"[A-Za-z0-9_.-]{1,32}")
 
 
 @dataclass(frozen=True)
@@ -39,21 +50,25 @@ def parse_tokens(spec: str) -> list[TokenEntry]:
     items = [item.strip() for item in spec.split(",") if item.strip()]
     for position, item in enumerate(items, start=1):
         parts = [p.strip() for p in item.split(":")]
-        if len(parts) not in (2, 3) or not parts[0]:
+        if len(parts) not in (2, 3):
             raise ConfigError(f"MOF_MCP_TOKENS entry {position}: expected client:sha256[:tier]")
         client, digest = parts[0], parts[1].lower()
-        tier = parts[2] if len(parts) == 3 else "act"
-        if not _HEX64.match(digest):
+        tier = parts[2].lower() if len(parts) == 3 else "act"
+        if not _CLIENT_ID.fullmatch(client):  # never echoed: a token may sit here
             raise ConfigError(
-                f"MOF_MCP_TOKENS entry {position} ({client}): give the token's SHA-256 hex digest, "
+                f"MOF_MCP_TOKENS entry {position}: client id must be 1-32 characters of A-Z a-z 0-9 _ . -"
+            )
+        if not _HEX64.fullmatch(digest):
+            raise ConfigError(
+                f"MOF_MCP_TOKENS entry {position}: give the token's SHA-256 hex digest, "
                 "not the token (myopenfund-mcp hash-token)"
             )
         if tier not in TIERS:
-            raise ConfigError(f"MOF_MCP_TOKENS entry {position} ({client}): tier must be read or act")
+            raise ConfigError(f"MOF_MCP_TOKENS entry {position}: tier must be read or act")
         if any(e.client_id == client for e in entries):
-            raise ConfigError(f"MOF_MCP_TOKENS entry {position}: client {client!r} appears twice")
+            raise ConfigError(f"MOF_MCP_TOKENS entry {position}: client id already given to an earlier entry")
         if any(e.digest == digest for e in entries):
-            raise ConfigError(f"MOF_MCP_TOKENS entry {position} ({client}): token already given to another client")
+            raise ConfigError(f"MOF_MCP_TOKENS entry {position}: token already given to another client")
         entries.append(TokenEntry(client, digest, tier))
     if not entries:
         raise ConfigError("MOF_MCP_TOKENS is set but holds no entry")
