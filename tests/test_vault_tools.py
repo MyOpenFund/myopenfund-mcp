@@ -6,7 +6,8 @@ from fakes import DOCS, FakeVaultReader, invalid_query_reader
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from myopenfund_mcp.config import Settings
+from myopenfund_mcp.config import ConfigError, Settings
+from myopenfund_mcp.paging import MAX_OFFSET, encode_cursor
 from myopenfund_mcp.server import build_server
 
 pytestmark = pytest.mark.anyio
@@ -113,7 +114,7 @@ async def test_document_resource_is_on_the_root_uri():
         templates = [t.uri_template for t in await c.list_resource_templates()]
         contents = await c.read_resource("vault://documents/us1")
         assert templates == ["vault://documents/{doc_id}"]
-        with pytest.raises(Exception, match="not_found"):
+        with pytest.raises(Exception, match=r"^\[not_found\] "):
             await c.read_resource("vault://documents/nope")
     doc = json.loads(contents[0].text)
     assert doc["doc_id"] == "us1" and doc["date"] == "2010-01-13"
@@ -175,3 +176,99 @@ async def test_audit_logs_one_line_per_call_without_arguments(caplog):
     assert "tool=vault_search_documents client=local outcome=ok" in lines[0]
     assert "tool=vault_get_document client=local outcome=error" in lines[1]
     assert not any("secret-term" in line or "nope" in line for line in lines)
+
+
+LEAK = RuntimeError("postgres://u:hunter2@h/db failed")
+
+
+async def test_unexpected_errors_are_masked_for_tools_server_info_and_the_resource(caplog):
+    caplog.set_level(logging.INFO, logger="myopenfund_mcp.audit")
+    async with _client(FakeVaultReader(fail_with=LEAK)) as c:
+        messages = []
+        for name, args in [("vault_search_documents", {}), ("vault_get_document", {"doc_id": "us1"}),
+                           ("vault_corpus_stats", {}), ("vault_runs_status", {}), ("server_info", {})]:
+            with pytest.raises(ToolError) as caught:
+                await c.call_tool(name, args)
+            messages.append(str(caught.value))
+        with pytest.raises(Exception) as caught:
+            await c.read_resource("vault://documents/us1")
+        messages.append(str(caught.value))
+    for message in messages:
+        assert "hunter2" not in message and "postgres://" not in message, message
+    lines = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.audit"]
+    assert len(lines) == 5 and all("outcome=error" in line for line in lines)
+
+
+async def test_masking_keeps_our_coded_errors():
+    async with _client() as c:
+        with pytest.raises(ToolError, match=r"^\[not_found\] "):
+            await c.call_tool("vault_get_document", {"doc_id": "nope"})
+        with pytest.raises(ToolError, match=r"^\[invalid_argument\] "):
+            await c.call_tool("vault_search_documents", {"limit": 0})
+
+
+async def test_since_description_states_finished_and_in_flight_semantics():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    since = tools["vault_runs_status"].input_schema["properties"]["since"]["description"]
+    assert "FINISHED" in since and "in flight" in since and "source_runs" in since
+
+
+async def test_parameter_descriptions_are_present():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    search = tools["vault_search_documents"].input_schema["properties"]
+    for name in ("doc_type", "language", "year", "mime_type", "include_deleted", "limit"):
+        assert search[name].get("description"), name
+    assert "refused" in search["limit"]["description"]
+    stats = tools["vault_corpus_stats"].input_schema["properties"]
+    assert "maximum number of groups returned" in stats["limit"]["description"]
+    assert "refused" in stats["limit"]["description"] and stats["corpus"].get("description")
+    runs = tools["vault_runs_status"].input_schema["properties"]["limit"]["description"]
+    assert "each" in runs and "refused" in runs
+
+
+class _HugeTotalReader(FakeVaultReader):
+    def search_documents(self, **kwargs):
+        _, rows = super().search_documents(**{**kwargs, "offset": 0})
+        return 10 * MAX_OFFSET, rows[:1]
+
+
+async def test_no_cursor_is_issued_past_the_offset_bound():
+    async with _client(_HugeTotalReader()) as c:
+        data = (await c.call_tool("vault_search_documents",
+                                  {"limit": 1, "cursor": encode_cursor(MAX_OFFSET - 1)})).data
+        assert data["returned"] == 1 and data["next_cursor"] is not None  # end == MAX_OFFSET
+        data = (await c.call_tool("vault_search_documents",
+                                  {"limit": 1, "cursor": encode_cursor(MAX_OFFSET)})).data
+    assert data["returned"] == 1 and data["next_cursor"] is None  # end would be MAX_OFFSET + 1
+
+
+def test_http_without_tokens_is_a_config_error():
+    with pytest.raises(ConfigError):
+        build_server(Settings(transport="http"), vault_reader=FakeVaultReader())
+
+
+async def test_date_from_after_date_to_is_refused():
+    async with _client() as c:
+        with pytest.raises(ToolError, match=r"^\[invalid_argument\] date_from is after date_to"):
+            await c.call_tool("vault_search_documents", {"date_from": "2011-01-02", "date_to": "2011-01-01"})
+
+
+@pytest.mark.parametrize(("tool", "arg"), [("vault_get_document", "doc_id"),
+                                           ("vault_search_documents", "text"),
+                                           ("vault_search_documents", "cursor")])
+async def test_string_arguments_are_length_capped(tool, arg):
+    async with _client() as c:
+        with pytest.raises(ToolError, match="at most 200 characters"):
+            await c.call_tool(tool, {arg: "a" * 201})
+        if arg != "cursor":
+            await c.call_tool(tool, {arg: "a" * 200}, raise_on_error=False)
+
+
+async def test_resource_body_is_the_compact_json_the_cap_measures():
+    async with _client() as c:
+        contents = await c.read_resource("vault://documents/fr1")
+    text = contents[0].text
+    assert text == json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":"))
+    assert "Décision" in text

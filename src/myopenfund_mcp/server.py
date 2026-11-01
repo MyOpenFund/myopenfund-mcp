@@ -10,7 +10,7 @@ from fastmcp.server.dependencies import get_access_token
 from . import __version__
 from .audit import AuditMiddleware
 from .auth import HashedTokenVerifier, caller_tier, parse_tokens
-from .config import Settings
+from .config import ConfigError, Settings
 from .paging import jsonable
 
 INSTRUCTIONS = (
@@ -22,9 +22,15 @@ INSTRUCTIONS = (
 
 def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
     auth_enabled = settings.transport == "http"
+    if auth_enabled and not settings.tokens:
+        raise ConfigError(
+            "MOF_MCP_TRANSPORT=http requires MOF_MCP_TOKENS: the HTTP server never runs unauthenticated"
+        )
     auth = HashedTokenVerifier(parse_tokens(settings.tokens)) if auth_enabled else None
+    # mask_error_details: an unexpected exception (driver error, DSN in a message) reaches the
+    # client as a generic error; our ToolError / ResourceError keep their `[code] message`.
     root = FastMCP("myopenfund", instructions=INSTRUCTIONS, version=__version__, auth=auth,
-                   middleware=[AuditMiddleware()])
+                   middleware=[AuditMiddleware()], mask_error_details=True)
 
     if vault_reader is None and settings.vault_database_url:
         from .vault.reader import PostgresVaultReader
