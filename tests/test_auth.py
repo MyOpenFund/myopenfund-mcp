@@ -59,7 +59,7 @@ def test_parse_tokens_never_echoes_a_realistic_token_given_as_client():
     )
 
 
-@pytest.mark.parametrize("client", ["marc", "agent-1", "claude.code", "a_b", "x" * 32])
+@pytest.mark.parametrize("client", ["marc", "agent-1", "ops.bot-1", "a_b", "x" * 32])
 def test_parse_tokens_accepts_allow_listed_client_ids(client):
     assert parse_tokens(f"{client}:{D1}")[0].client_id == client
 
