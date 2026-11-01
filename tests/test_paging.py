@@ -1,9 +1,13 @@
 import base64
 import datetime as dt
+import ipaddress
 import json
+import uuid
+from collections import OrderedDict
 from decimal import Decimal
 
 import pytest
+from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import default_serializer
 
@@ -66,6 +70,14 @@ def test_max_offset_matches_vault_query_bound():
 def test_cursor_tampering_refused(bad):
     with pytest.raises(ToolError, match=r"^\[invalid_argument\] cursor"):
         decode_cursor(bad)
+
+
+def test_cursor_error_tells_the_caller_what_to_do():
+    with pytest.raises(ToolError) as exc:
+        decode_cursor("garbage")
+    assert str(exc.value) == (
+        "[invalid_argument] cursor is not one this server issued; pass next_cursor from the "
+        "previous page unchanged, or omit it to start over")
 
 
 def test_encode_cursor_refuses_out_of_range():
@@ -143,3 +155,72 @@ def test_cap_result_counts_characters_not_escapes():
     overhead = len('{"b":""}')
     payload = {"b": "é" * (1_000 - overhead)}  # would be 6x larger with \\u escapes
     assert cap_result(payload, s) == payload
+
+
+def test_cap_result_hint_is_contextual():
+    s = Settings(max_result_chars=10)
+    with pytest.raises(ToolError, match=r"; ask for a smaller limit$"):
+        cap_result({"b": "x" * 50}, s)
+    with pytest.raises(ToolError, match=r"^\[result_too_large\] result is \d+ characters \(cap 10\); "
+                       r"read the document by section$"):
+        cap_result({"b": "x" * 50}, s, hint="read the document by section")
+
+
+def test_clamp_limit_refuses_rather_than_clamps():
+    assert "refuse" in clamp_limit.__doc__.lower()
+    with pytest.raises(ToolError):
+        clamp_limit(S.max_rows + 1, S)
+
+
+def test_jsonable_uuid_and_other_types_become_strings():
+    u = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    assert jsonable({"u": u, "ip": ipaddress.ip_address("10.0.0.1")}) == {
+        "u": "12345678-1234-5678-1234-567812345678", "ip": "10.0.0.1"}
+
+
+def test_jsonable_time_and_timedelta():
+    assert jsonable(dt.time(3, 4, 5)) == "03:04:05"
+    assert jsonable(dt.timedelta(days=1, seconds=1, microseconds=500_000)) == 86401.5
+
+
+def test_jsonable_binary_becomes_base64():
+    expected = base64.b64encode(b"\x00\xffab").decode("ascii")
+    assert jsonable(memoryview(b"\x00\xffab")) == expected
+    assert jsonable(b"\x00\xffab") == expected
+    assert jsonable(bytearray(b"\x00\xffab")) == expected
+
+
+def test_jsonable_integral_decimal_becomes_int():
+    out = jsonable([Decimal(12345), Decimal("1.2E+3"), Decimal("1.5"), Decimal("-0")])
+    assert out == [12345, 1200, 1.5, 0]
+    assert [type(v) for v in out] == [int, int, float, int]
+
+
+def test_jsonable_mapping_subclasses_become_plain_dicts():
+    out = jsonable(OrderedDict([("a", OrderedDict([("b", Decimal(2))]))]))
+    assert type(out) is dict and type(out["a"]) is dict
+    assert out == {"a": {"b": 2}}
+
+
+def test_jsonable_output_is_plain_json():
+    payload = {"u": uuid.uuid4(), "b": b"x", "t": dt.time(1), "td": dt.timedelta(1), "o": object()}
+    json.dumps(jsonable(payload), allow_nan=False)
+
+
+@pytest.mark.anyio
+async def test_result_chars_matches_a_real_fastmcp_tool_on_the_wire():
+    payload = jsonable({
+        "rows": [{"title": "Société Exemple — résumé « été »", "d": dt.date(2020, 1, 2),
+                  "t": dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.UTC), "x": Decimal(12345),
+                  "y": Decimal("1.25"), "nested": [[1, [2.5, None]], {"q": 'quote " \\ \n'}]}],
+        "next_cursor": encode_cursor(50),
+    })
+    mcp = FastMCP("t")
+
+    @mcp.tool
+    def probe() -> dict:
+        return payload
+
+    async with Client(mcp) as c:
+        res = await c.call_tool("probe", {})
+    assert len(res.content[0].text) == result_chars(payload)
