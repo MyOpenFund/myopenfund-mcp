@@ -63,7 +63,10 @@ def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
     # Open to any authenticated caller (no tier check): it is how a client learns its tier.
     @root.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
     async def server_info() -> dict:
-        """What this deployment offers: enabled toolsets, your tier, version, data freshness."""
+        """What this deployment offers: enabled toolsets, your tier, version, data freshness.
+
+        If the vault cannot be read, `freshness` is null and `freshness_error` says why; the rest still answers.
+        """
         info = {
             "version": __version__,
             "tier": caller_tier(get_access_token(), auth_enabled=auth_enabled),
