@@ -1,5 +1,6 @@
 """The command line: `hash-token` makes a token pair, `serve` refuses a bad configuration."""
 import json
+import logging
 import os
 import re
 import subprocess
@@ -39,9 +40,21 @@ def no_server(monkeypatch):
 
 
 def _hash_token(capsys, *argv):
+    """The token goes to stderr (for the human), only the entry to stdout (safe for `>> .env`)."""
     code = cli.main(["hash-token", *argv])
-    out = capsys.readouterr().out
-    return code, TOKEN.search(out).group(1), ENTRY.search(out).group(1)
+    captured = capsys.readouterr()
+    token = TOKEN.search(captured.err).group(1)
+    assert token not in captured.out
+    assert ENTRY.search(captured.err) is None
+    return code, token, ENTRY.search(captured.out).group(1)
+
+
+def test_hash_token_stdout_is_only_the_entry(capsys):
+    assert cli.main(["hash-token", "agent"]) == 0
+    captured = capsys.readouterr()
+    [line] = captured.out.splitlines()
+    assert ENTRY.fullmatch(line)
+    assert TOKEN.search(captured.err)
 
 
 def test_hash_token_prints_a_token_and_its_entry(capsys):
@@ -100,6 +113,29 @@ def test_bad_token_entry_exits_2_without_echoing_it(clean_env, capsys):
 def test_serve_stdio_by_default(clean_env, no_server):
     assert cli.main([]) == 0
     assert no_server[-1] == ("run", {"transport": "stdio", "show_banner": False})
+
+
+def test_serve_stdio_warns_once_that_tokens_are_ignored(clean_env, no_server, caplog):
+    clean_env.setenv("MOF_MCP_TOKENS", f"agent:{'0' * 64}")
+    with caplog.at_level(logging.WARNING, logger="myopenfund_mcp"):
+        assert cli.main(["serve"]) == 0
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r.getMessage() for r in warnings] == ["MOF_MCP_TOKENS is ignored over stdio"]
+    assert "0" * 64 not in caplog.text
+
+
+def test_serve_stdio_without_tokens_does_not_warn(clean_env, no_server, caplog):
+    with caplog.at_level(logging.WARNING, logger="myopenfund_mcp"):
+        assert cli.main(["serve"]) == 0
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_serve_http_does_not_warn_about_tokens(clean_env, no_server, caplog):
+    clean_env.setenv("MOF_MCP_TRANSPORT", "http")
+    clean_env.setenv("MOF_MCP_TOKENS", f"agent:{'0' * 64}")
+    with caplog.at_level(logging.WARNING, logger="myopenfund_mcp"):
+        assert cli.main(["serve"]) == 0
+    assert "ignored" not in caplog.text
 
 
 def test_serve_http_uses_the_configured_address(clean_env, no_server):

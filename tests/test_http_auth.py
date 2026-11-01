@@ -117,3 +117,22 @@ async def test_refusals_are_http_401(http_url, headers):
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                        "clientInfo": {"name": "probe", "version": "0"}}}
     assert await anyio.to_thread.run_sync(_post_status, http_url, body, headers) == 401
+
+
+def _get(url: str) -> tuple[int, str]:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback: never via a proxy
+    try:
+        with opener.open(url, timeout=10) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read().decode()
+
+
+async def test_health_answers_ok_without_a_token(http_url):
+    health = http_url.rsplit("/", 1)[0] + "/health"
+    assert await anyio.to_thread.run_sync(_get, health) == (200, "ok")
+
+
+async def test_mcp_still_refuses_without_a_token_next_to_health(http_url):
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    assert await anyio.to_thread.run_sync(_post_status, http_url, body, {}) == 401

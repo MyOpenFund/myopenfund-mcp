@@ -31,7 +31,10 @@ not set is simply not mounted, and `server_info` says so.
 
 ## Quick start (stdio)
 
-Requires Python 3.12+ and read access to a vault database (the read-only role).
+Prerequisites:
+
+- Python 3.12+ and git (the `[vault]` extra installs a pinned dependency from git);
+- read access to the vault database as the read-only role `vault_readonly` (never a writing role).
 
 ```bash
 git clone https://github.com/MyOpenFund/myopenfund-mcp.git
@@ -44,13 +47,16 @@ Register it with your MCP client. With Claude Code:
 
 ```bash
 claude mcp add myopenfund \
-  -e MOF_VAULT_DATABASE_URL='postgresql://vault_readonly:<password>@<host>:5432/documents?sslmode=require' \
+  -e MOF_VAULT_DATABASE_URL='postgresql://vault_readonly:<password>@<host>:5432/documents?sslmode=verify-full' \
   -- /path/to/myopenfund-mcp/.venv/bin/myopenfund-mcp serve
 ```
 
 Any other client: run the command `myopenfund-mcp serve` (stdio is the default transport) with the same
-environment. Over stdio there is no token: the local user owns the process and gets every tier. Then ask
-the client to call `server_info`.
+environment. Over stdio there is no token: the local user owns the process and gets every tier
+(`MOF_MCP_TOKENS`, if set, is ignored with a warning on stderr). Then ask the client to call `server_info`.
+
+> The snippet above stores the database URL, **password included**, in the MCP client's configuration
+> file. Use the read-only role `vault_readonly` only, and keep that file private.
 
 ## HTTP deployment
 
@@ -71,9 +77,21 @@ cp .env.example .env                                   # never committed
 docker compose up -d --build
 ```
 
+No venv on the deployment host? Run `hash-token` in the container instead (after `cp .env.example .env`,
+which compose needs, and with the image built):
+
+```bash
+docker compose build
+docker compose run --rm mcp myopenfund-mcp hash-token alice
+```
+
+`hash-token` prints the **token on stderr** (copy it to the client) and **only the `MOF_MCP_TOKENS`
+entry on stdout**, so redirecting stdout (`>> entries.txt`) never writes the clear token into a file.
+
 The image runs as a non-root user (uid 10001), listens on `0.0.0.0:8000` **inside the container**, and
 the compose file publishes it on `127.0.0.1` of the host unless `MOF_MCP_BIND_ADDR` says otherwise. In
-`.env`, leave `MOF_MCP_TRANSPORT` and `MOF_MCP_HOST` unset: the image sets them.
+`.env`, leave `MOF_MCP_TRANSPORT` and `MOF_MCP_HOST` unset: the image sets them. The compose file also runs it with a
+read-only root filesystem (writable `/tmp` only), no Linux capabilities and `no-new-privileges`.
 
 A client connects with its token, e.g. with Claude Code:
 
@@ -100,15 +118,22 @@ A home server, a NAS or an office machine reachable only over a VPN or a private
 - Keep the default `MOF_MCP_BIND_ADDR=127.0.0.1` and terminate **TLS at a reverse proxy** on the same VM
   (Caddy, nginx, Traefik) proxying to `127.0.0.1:8000`, or run the container behind the provider's **load
   balancer** with a TLS listener and a security group that only admits the balancer.
-- Reach the vault database over the provider's private network with `sslmode=require` (or `verify-full`).
+- Health check for the load balancer or orchestrator: `GET /health` answers `200` with the body `ok`,
+  without a token (it reveals no version and no data); `/mcp` keeps requiring one. The image's Docker
+  `HEALTHCHECK` uses the same endpoint.
+- Reach the vault database over the provider's private network with `sslmode=verify-full` and the
+  provider's CA certificate (`sslrootcert=...`). `sslmode=require` is a fallback: it encrypts but does not
+  authenticate the server.
 - Restrict who can reach the HTTPS endpoint (IP allow-list, private load balancer) wherever you can: the
   bearer token is the only authentication in v1.
 
 ## Tools
 
-Tool names carry their toolset prefix. All v1 tools are read-only (`readOnlyHint`). Paged tools take
-`limit` (default `MOF_MCP_DEFAULT_ROWS`; a value outside `[1, MOF_MCP_MAX_ROWS]` is refused, not clamped)
-and return `next_cursor` to pass back unchanged with the same filters. String arguments `doc_id`, `text`
+Tool names carry their toolset prefix. All v1 tools are read-only (`readOnlyHint`). Only
+`vault_search_documents` is paged: it returns `next_cursor` to pass back unchanged with the same filters.
+`vault_corpus_stats` and `vault_runs_status` only bound their lists with `limit` (no cursor). Every
+`limit` defaults to `MOF_MCP_DEFAULT_ROWS`; a value outside `[1, MOF_MCP_MAX_ROWS]` is refused, not
+clamped. String arguments `doc_id`, `text`
 and `cursor` are at most 200 characters.
 
 | Tool | Purpose | Key arguments |
@@ -152,8 +177,9 @@ unknown token is rejected with HTTP `401` before any tool runs.
   comma-separated. Client ids are 1-32 characters of `A-Z a-z 0-9 _ . -`. The client id appears in the
   audit log line of every tool call (`tool=... client=... outcome=... ms=...`, on stderr; arguments are
   never logged).
-- Make a token with `myopenfund-mcp hash-token <client> [--tier read|act]`. It **generates** a random
-  256-bit token and prints it with the `MOF_MCP_TOKENS` entry. Give the token to that client only; the
+- Make a token with `myopenfund-mcp hash-token <client> [--tier read|act]` (in a container:
+  `docker compose run --rm mcp myopenfund-mcp hash-token <client>`). It **generates** a random 256-bit
+  token, prints it on stderr, and prints the `MOF_MCP_TOKENS` entry alone on stdout. Give the token to that client only; the
   server stores only its SHA-256 digest. It never accepts a token you supply.
 - **Entropy:** digests are unsalted SHA-256, which is safe only for high-entropy random tokens such as the
   generated ones. Never use a passphrase or a hand-picked token.
@@ -172,7 +198,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_MCP_PORT` | `8000` | HTTP port (1-65535). |
 | `MOF_MCP_PATH` | `/mcp` | HTTP endpoint path; must start with `/`. |
 | `MOF_MCP_TOKENS` | unset | `client:sha256hex[:tier],...`; required when the transport is `http`. |
-| `MOF_VAULT_DATABASE_URL` | unset | Vault Postgres URL, read-only role; unset = no vault toolset. Set `sslmode` explicitly (`disable` only on a trusted private network, `require` otherwise) to avoid a wasted SSL attempt per call. |
+| `MOF_VAULT_DATABASE_URL` | unset | Vault Postgres URL, read-only role; unset = no vault toolset. Set `sslmode` explicitly (also avoids a wasted SSL attempt per call): `verify-full` with the provider's CA preferred; `require` as a fallback (encrypts, does not authenticate the server); `disable` only on a trusted private network. |
 | `MOF_MCP_QUERY_TIMEOUT_S` | `20` | Postgres `statement_timeout` per call, in seconds (1-2147483). |
 | `MOF_MCP_CONNECT_TIMEOUT_S` | `10` | Postgres connection timeout, in seconds (2-300). |
 | `MOF_MCP_DEFAULT_ROWS` | `50` | Rows per page when the caller gives no `limit`; at most `MOF_MCP_MAX_ROWS`. |

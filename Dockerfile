@@ -24,4 +24,8 @@ ENV PATH=/opt/venv/bin:$PATH \
 USER 10001:10001
 WORKDIR /home/mcp
 EXPOSE 8000
+# Liveness via the unauthenticated GET /health (python stdlib: no curl in the image). Proxies are
+# bypassed on purpose: an inherited HTTP(S)_PROXY must never capture a loopback probe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import os, urllib.request as u; port = os.environ.get('MOF_MCP_PORT', '').strip() or '8000'; u.build_opener(u.ProxyHandler({})).open(f'http://127.0.0.1:{port}/health', timeout=4)"]
 CMD ["myopenfund-mcp", "serve"]

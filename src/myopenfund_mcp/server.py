@@ -6,6 +6,8 @@ from functools import partial
 import anyio
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_access_token
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
 from . import __version__
 from .audit import AuditMiddleware
@@ -58,5 +60,11 @@ def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
                          "rag": "not configured", "companies": "not configured"},
             "freshness": freshness,
         }
+
+    # HTTP only: an unauthenticated liveness probe for load balancers and the image HEALTHCHECK.
+    # It answers "ok" and nothing else (no version, no data); /mcp keeps requiring a token.
+    @root.custom_route("/health", methods=["GET"], include_in_schema=False)
+    async def health(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
 
     return root
