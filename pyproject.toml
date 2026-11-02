@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "myopenfund-mcp"
+version = "0.1.0"
+description = "One MCP server over the MyOpenFund bricks: official documents and pipeline health today, RAG and company data next."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["fastmcp>=4.1.4,<5"]
+
+[project.optional-dependencies]
+vault = ["vault-query @ git+https://github.com/MyOpenFund/vault@552503014dbfe454a626033701042070154d7c25#subdirectory=query"]
+dev = ["pytest>=8.3", "ruff>=0.6"]
+
+[project.scripts]
+myopenfund-mcp = "myopenfund_mcp.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/myopenfund_mcp"]
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: needs a real vault database (MOF_MCP_IT_DATABASE_URL)",
+  "llm: needs a local Ollama (MOF_MCP_IT_OLLAMA_URL)",
+]
+addopts = "-m 'not integration and not llm'"
+
+[tool.ruff]
+line-length = 110

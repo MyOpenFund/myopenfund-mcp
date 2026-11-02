@@ -1,0 +1,92 @@
+"""Assemble the server: core + every toolset whose stack is installed and configured."""
+from __future__ import annotations
+
+import logging
+from functools import partial
+
+import anyio
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_access_token
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+
+from . import __version__
+from .audit import AuditMiddleware
+from .auth import HashedTokenVerifier, caller_tier, parse_tokens
+from .config import ConfigError, Settings
+from .errors import BACKEND_UNAVAILABLE
+from .paging import jsonable
+
+log = logging.getLogger("myopenfund_mcp.server")
+
+MISSING_VAULT_EXTRA = ("MOF_VAULT_DATABASE_URL is set but the [vault] extra is not installed: "
+                       "pip install 'myopenfund-mcp[vault]'")
+
+INSTRUCTIONS = (
+    "MyOpenFund: official primary sources only (central banks today; company filings next). "
+    "Call server_info first to see which toolsets this deployment enables. Results carry doc_id, "
+    "dates and source URLs: cite them. Errors start with a stable [code]."
+)
+
+
+def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
+    auth_enabled = settings.transport == "http"
+    if auth_enabled and not settings.tokens:
+        raise ConfigError(
+            "MOF_MCP_TRANSPORT=http requires MOF_MCP_TOKENS: the HTTP server never runs unauthenticated"
+        )
+    auth = HashedTokenVerifier(parse_tokens(settings.tokens)) if auth_enabled else None
+    # mask_error_details: an unexpected exception (driver error, DSN in a message) reaches the
+    # client as a generic error; our ToolError / ResourceError keep their `[code] message`.
+    root = FastMCP("myopenfund", instructions=INSTRUCTIONS, version=__version__, auth=auth,
+                   middleware=[AuditMiddleware()], mask_error_details=True)
+
+    if vault_reader is None and settings.vault_database_url:
+        from .vault.reader import PostgresVaultReader
+
+        # Configured but not installed is a deployment mistake: refuse to start rather than run without
+        # the toolset the operator asked for. The ConfigError is raised outside the handler (no chaining).
+        try:
+            vault_reader = PostgresVaultReader(settings.vault_database_url,
+                                               query_timeout_s=settings.query_timeout_s,
+                                               connect_timeout_s=settings.connect_timeout_s)
+        except ImportError:
+            vault_reader = None
+        if vault_reader is None:
+            raise ConfigError(MISSING_VAULT_EXTRA)
+    if vault_reader is not None:
+        from .vault.tools import build_vault_toolset, register_vault_resources
+
+        root.mount(build_vault_toolset(vault_reader, settings, auth_enabled=auth_enabled), namespace="vault")
+        register_vault_resources(root, vault_reader, settings, auth_enabled=auth_enabled)
+
+    # Open to any authenticated caller (no tier check): it is how a client learns its tier.
+    @root.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
+    async def server_info() -> dict:
+        """What this deployment offers: enabled toolsets, your tier, version, data freshness.
+
+        If the vault cannot be read, `freshness` is null and `freshness_error` says why; the rest still answers.
+        """
+        info = {
+            "version": __version__,
+            "tier": caller_tier(get_access_token(), auth_enabled=auth_enabled),
+            "toolsets": {"vault": "enabled" if vault_reader is not None else "not configured",
+                         "rag": "not configured", "companies": "not configured"},
+            "freshness": None,
+        }
+        if vault_reader is not None:
+            try:
+                info["freshness"] = jsonable(await anyio.to_thread.run_sync(partial(vault_reader.freshness)))
+            except Exception as exc:  # noqa: BLE001 -- an outage must not hide the tier and toolsets
+                # The class only: an exception's text can hold the DSN.
+                log.warning("server_info: freshness read failed (%s)", type(exc).__name__)
+                info["freshness_error"] = BACKEND_UNAVAILABLE
+        return info
+
+    # HTTP only: an unauthenticated liveness probe for load balancers and the image HEALTHCHECK.
+    # It answers "ok" and nothing else (no version, no data); /mcp keeps requiring a token.
+    @root.custom_route("/health", methods=["GET"], include_in_schema=False)
+    async def health(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    return root
