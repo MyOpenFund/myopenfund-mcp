@@ -5,7 +5,6 @@
 !.env.example
 .venv
 tests
-scripts
 **/__pycache__
 .pytest_cache
 .ruff_cache

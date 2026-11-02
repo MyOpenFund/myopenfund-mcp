@@ -8,7 +8,7 @@ Pass = it called vault_corpus_stats (grouped by source_code) or vault_search_doc
 source_code='us', and its final answer contains 3.
 
     MOF_MCP_IT_OLLAMA_URL=http://127.0.0.1:11434 [MOF_MCP_IT_OLLAMA_MODEL=qwen2.5:7b] \
-        python scripts/llm_smoke.py
+        python tests/llm/llm_smoke.py
 
 Stdlib HTTP only (urllib): no dependency beyond the server's own.
 """
@@ -24,7 +24,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))  # fakes.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tests/, for fakes.py when run directly
 
 DEFAULT_MODEL = "qwen2.5:7b"
 MAX_ROUNDS = 5

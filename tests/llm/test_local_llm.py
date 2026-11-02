@@ -1,4 +1,4 @@
-"""The local-LLM smoke check (scripts/llm_smoke.py).
+"""The local-LLM smoke check (tests/llm/llm_smoke.py).
 
 `test_local_model_answers` is opt-in (`-m llm`, needs MOF_MCP_IT_OLLAMA_URL). The others run by
 default: they exercise the schema conversion, the HTTP call and the tool loop against stand-ins
@@ -6,20 +6,16 @@ for Ollama, so the opt-in check cannot rot unnoticed.
 """
 import json
 import os
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 
+import llm_smoke  # sibling module: pytest puts this directory on sys.path (rootdir-less tests/)
 import pytest
 from fakes import FakeVaultReader
 from fastmcp import Client
 
 from myopenfund_mcp.config import Settings
 from myopenfund_mcp.server import build_server
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-import llm_smoke
 
 OLLAMA_URL = os.environ.get("MOF_MCP_IT_OLLAMA_URL")
 
