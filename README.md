@@ -101,6 +101,21 @@ claude mcp add --transport http myopenfund https://<your-host>/mcp \
   --header "Authorization: Bearer <token>"
 ```
 
+### Connect from any MyOpenFund repo
+
+Each MyOpenFund code repo ships a `.mcp.json` holding variables only, never an address or a token. Clone one
+repo or all of them: each works on its own, including in new worktrees, and projects outside MyOpenFund do not
+see the server. Set these two client-side variables once, in your shell profile or a private file it loads:
+
+```bash
+export MOF_MCP_URL=https://<your-host>/mcp
+export MOF_MCP_TOKEN=<token>   # your client token, the one from hash-token
+```
+
+`MOF_MCP_TOKEN` is the client's clear token; `MOF_MCP_TOKENS` is the server's list of digests. Claude Code asks
+you to approve the server once per project. Start it from a shell that has the variables. Without them, it
+warns about the missing variables and everything else keeps working.
+
 ### Pattern 1: a host on a private network
 
 A home server, a NAS or an office machine reachable only over a VPN or a private interface.
