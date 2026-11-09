@@ -8,6 +8,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from myopenfund_mcp.companies.common import parse_as_of, rows_to_utc, store_call
+from myopenfund_mcp.companies.datasets import rows_to_csv
 from myopenfund_mcp.companies.store import (
     CompaniesStore,
     StoreBackendError,
@@ -35,7 +36,7 @@ def _client(store, **kw):
 async def test_tools_listed_read_only(store):
     async with _client(store) as c:
         tools = {t.name: t for t in await c.list_tools()}
-    for n in ("datasets_list", "datasets_describe", "datasets_read_asof"):
+    for n in ("datasets_list", "datasets_describe", "datasets_read_asof", "datasets_export_csv"):
         assert tools[n].annotations.read_only_hint is True
     for n in ("companies_resolve", "companies_facts", "companies_fundamentals"):
         assert tools[n].annotations.read_only_hint is True
@@ -213,3 +214,69 @@ async def test_store_call_times_out():
     with pytest.raises(ToolError, match=r"^\[timeout\].*narrow the request"):
         await store_call(lambda: time.sleep(3), settings=s)
     assert time.monotonic() - t0 < 2.5
+
+
+async def test_export_csv_is_inline_text(store):
+    async with _client(store) as c:
+        res = (await c.call_tool("datasets_export_csv", {
+            "dataset": "entity_observations", "filters": {"subject_value": AAPL}})).data
+    lines = res["csv"].splitlines()
+    assert lines[0].startswith('"entity_id"') or lines[0].startswith("entity_id") or "subject_value" in lines[0]
+    assert len(lines) == 1 + res["returned"] and res["returned"] > 0
+
+
+async def test_export_csv_too_large_is_refused_not_cut(store):
+    async with _client(store, max_result_chars=1000) as c:
+        with pytest.raises(ToolError, match=r"^\[result_too_large\]"):
+            await c.call_tool("datasets_export_csv", {"dataset": "filing_statements"})
+
+
+async def test_export_csv_timestamps_are_utc_and_decimals_exact(store):
+    import csv
+    import io
+    from decimal import Decimal
+
+    cols = ["original_tag", "valid_date", "value", "known_at"]
+    async with _client(store) as c:
+        args = {"dataset": "fundamentals", "filters": {"entity_value": AAPL}, "columns": cols}
+        res = (await c.call_tool("datasets_export_csv", args)).data
+        rows = (await c.call_tool("datasets_read_asof", args)).data["rows"]
+    parsed = list(csv.DictReader(io.StringIO(res["csv"])))
+    assert len(parsed) == len(rows) == res["returned"]
+    assert res["as_of"].endswith("+00:00")
+    for got, want in zip(parsed, rows, strict=True):
+        assert Decimal(got["value"]) == Decimal(str(want["value"]))  # exact, no float rounding
+        assert got["known_at"].startswith(want["known_at"][:10])
+        assert want["known_at"].endswith("+00:00")
+
+
+async def test_export_csv_pages_like_read_asof(store):
+    async with _client(store) as c:
+        args = {"dataset": "fundamentals", "filters": {"entity_value": AAPL}, "limit": 3}
+        first = (await c.call_tool("datasets_export_csv", args)).data
+        second = (await c.call_tool("datasets_export_csv", {**args, "cursor": first["next_cursor"]})).data
+    assert first["returned"] == 3 and second["returned"] == 2 and second["next_cursor"] is None
+
+
+async def test_export_csv_empty_result(store):
+    async with _client(store) as c:
+        base = {"dataset": "fundamentals", "filters": {"entity_value": "0000000000"}}
+        # columns known: header only; columns not given: nothing to name, so an empty string
+        with_cols = (await c.call_tool("datasets_export_csv", {**base, "columns": ["original_tag", "value"]})).data
+        without = (await c.call_tool("datasets_export_csv", base)).data
+    assert with_cols["returned"] == 0 and with_cols["csv"].strip() == '"original_tag","value"'
+    assert without["returned"] == 0 and without["csv"] == ""
+
+
+def test_rows_to_csv_writes_decimals_exactly():
+    from decimal import Decimal
+
+    # Arrow keeps Decimal as decimal128: digits are written as they are, no float round trip
+    # (all values of a column share the widest scale: 1.5 is written 1.500000, the same number).
+    text = rows_to_csv([{"v": Decimal("123456789012345678.123456"), "n": "a,b"},
+                        {"v": Decimal("0.1"), "n": None}], None)
+    lines = text.splitlines()
+    assert lines[0] == '"v","n"'
+    assert lines[1] == '123456789012345678.123456,"a,b"'
+    assert Decimal(lines[2].split(",")[0]) == Decimal("0.1")
+    assert "e" not in lines[2].lower().split(",")[0]

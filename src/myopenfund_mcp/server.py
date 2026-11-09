@@ -25,9 +25,10 @@ MISSING_COMPANIES_EXTRA = ("MOF_COMPANIES_CATALOG is set but the [companies] ext
                            "pip install 'myopenfund-mcp[companies]'")
 
 INSTRUCTIONS = (
-    "MyOpenFund: official primary sources only (central banks today; company filings next). "
+    "MyOpenFund: official primary sources only (central banks and SEC company filings). "
     "Call server_info first to see which toolsets this deployment enables. Results carry doc_id, "
-    "dates and source URLs: cite them. Errors start with a stable [code]."
+    "dates and source URLs: cite them. Company data is point-in-time: pass as_of to see what was "
+    "known then. Errors start with a stable [code]."
 )
 
 

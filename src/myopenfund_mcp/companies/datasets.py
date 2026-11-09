@@ -21,6 +21,25 @@ MAX_NAME_CHARS = 100
 MAX_CURSOR_CHARS = 200
 
 
+def rows_to_csv(rows: list[dict], columns: list[str] | None) -> str:
+    """CSV text, header + one line per row. Arrow writes Decimal exactly (decimal128, no float).
+    No rows: the header alone when `columns` names them, else an empty string (nothing to name)."""
+    import io
+
+    import pyarrow as pa
+    import pyarrow.csv as pcsv
+
+    if rows:
+        table = pa.Table.from_pylist(rows)
+    elif columns:
+        table = pa.table({c: pa.array([], pa.null()) for c in columns})
+    else:
+        return ""
+    buf = io.BytesIO()
+    pcsv.write_csv(table, buf)
+    return buf.getvalue().decode()
+
+
 def build_datasets_toolset(store, settings: Settings, *, auth_enabled: bool) -> FastMCP:
     ds = FastMCP("datasets", mask_error_details=True)
     read = tier_check("read", auth_enabled=auth_enabled)
@@ -71,5 +90,25 @@ def build_datasets_toolset(store, settings: Settings, *, auth_enabled: bool) -> 
                            "next_cursor": nxt, "rows": chunk}, settings,
                           hint="ask for fewer columns or a smaller limit")
 
-    # export_csv (Task C5) is defined here too, before this return, and reuses page_rows.
+    @ds.tool(auth=read, annotations=READ_ONLY)
+    async def export_csv(
+        dataset: Annotated[str, Field(description="Name from datasets_list", max_length=MAX_NAME_CHARS)],
+        filters: Annotated[dict[str, FilterValue] | None, Field(description=FILTERS_DESCRIPTION)] = None,
+        columns: Annotated[list[str] | None, Field(description="Columns to return; omitted = all")] = None,
+        as_of: Annotated[dt.datetime | None, Field(description=AS_OF_DESCRIPTION)] = None,
+        vintages: Annotated[bool, Field(
+            description="Every version known at as_of, not only the latest per natural key")] = False,
+        limit: Annotated[int | None, Field(
+            description="Rows per page; omitted = server default; outside [1, server maximum] is refused")] = None,
+        cursor: Annotated[str | None, Field(description="next_cursor of the previous page, unchanged",
+                                            max_length=MAX_CURSOR_CHARS)] = None,
+    ) -> dict:
+        """Same rows as datasets_read_asof, as CSV text (header + one line per row, datetimes UTC) to
+        save or paste. Refused, never cut, when larger than the server's result cap: page with
+        next_cursor. No rows: header only if `columns` is given, else an empty string."""
+        when, chunk, nxt = await page_rows(dataset, filters, columns, as_of, vintages, limit, cursor)
+        return cap_result({"dataset": dataset, "as_of": when.isoformat(), "returned": len(chunk),
+                           "next_cursor": nxt, "csv": rows_to_csv(chunk, columns)}, settings,
+                          hint="ask for fewer columns or a smaller limit")
+
     return ds
