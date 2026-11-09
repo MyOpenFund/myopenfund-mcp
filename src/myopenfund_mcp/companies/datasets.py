@@ -105,7 +105,8 @@ def build_datasets_toolset(store, settings: Settings, *, auth_enabled: bool) -> 
     ) -> dict:
         """Same rows as datasets_read_asof, as CSV text (header + one line per row, datetimes UTC) to
         save or paste. Refused, never cut, when larger than the server's result cap: page with
-        next_cursor. No rows: header only if `columns` is given, else an empty string."""
+        next_cursor. No rows: header only if `columns` is given, else an empty string (`columns=[]` counts
+        as all columns, so it gives an empty string)."""
         when, chunk, nxt = await page_rows(dataset, filters, columns, as_of, vintages, limit, cursor)
         return cap_result({"dataset": dataset, "as_of": when.isoformat(), "returned": len(chunk),
                            "next_cursor": nxt, "csv": rows_to_csv(chunk, columns)}, settings,

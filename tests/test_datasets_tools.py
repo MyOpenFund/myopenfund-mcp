@@ -221,7 +221,8 @@ async def test_export_csv_is_inline_text(store):
         res = (await c.call_tool("datasets_export_csv", {
             "dataset": "entity_observations", "filters": {"subject_value": AAPL}})).data
     lines = res["csv"].splitlines()
-    assert lines[0].startswith('"entity_id"') or lines[0].startswith("entity_id") or "subject_value" in lines[0]
+    assert lines[0] == ('"entity_id","subject_scheme","subject_value","id_scheme","id_value","name","country",'
+                        '"valid_date","known_at","known_at_kind","source_code","source_doc_id","batch_id"')
     assert len(lines) == 1 + res["returned"] and res["returned"] > 0
 
 
@@ -247,6 +248,7 @@ async def test_export_csv_timestamps_are_utc_and_decimals_exact(store):
     for got, want in zip(parsed, rows, strict=True):
         assert Decimal(got["value"]) == Decimal(str(want["value"]))  # exact, no float rounding
         assert got["known_at"].startswith(want["known_at"][:10])
+        assert got["known_at"].endswith("Z")  # UTC
         assert want["known_at"].endswith("+00:00")
 
 

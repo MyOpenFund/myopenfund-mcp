@@ -175,7 +175,9 @@ null and `"freshness_error": "backend_unavailable"`; the server log names the ex
 
 The `companies_*` and `datasets_*` tools (read-only, over the published my-open-data store) exist only when
 `MOF_COMPANIES_CATALOG` and `MOF_COMPANIES_DATA_ROOT` are set; the `[companies]` extra must then be installed
-(`pip install "myopenfund-mcp[companies]"`, or `".[vault,companies]"` from a checkout). The
+(from a checkout, `pip install ".[vault,companies]"`, or from the git URL,
+`pip install "myopenfund-mcp[companies] @ git+https://github.com/MyOpenFund/myopenfund-mcp"`; the extra pins two
+git dependencies, so git must be available). The
 store is read-only (as the `lake_reader` role); nothing is ever written. Configuration:
 `MOF_COMPANIES_CATALOG`, `MOF_COMPANIES_DATA_ROOT`, `MOF_COMPANIES_QUERY_TIMEOUT_S`,
 `MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY` (see [Configuration and limits](#configuration-and-limits)).
@@ -194,8 +196,8 @@ store is read-only (as the `lake_reader` role); nothing is ever written. Configu
   offset is read as UTC) returns what was publicly known at that moment, so a restatement filed later
   does not leak into an earlier view. Results echo the `as_of` used. Datetimes are UTC.
 - **Concepts and ratios are company-corpus's.** The server computes none: it calls company-corpus for the
-  concept catalogue and the ratios. The one quarterly derivation, TTM, takes Q4 as FY minus (Q1 + Q2 + Q3),
-  from the store's own values.
+  concept catalogue and the ratios. The one quarterly derivation, TTM, is company-corpus's too: it takes Q4 as
+  FY minus (Q1 + Q2 + Q3), computed from the store's own values, not by this server.
 - **`frequency`.** In `companies_fundamentals`, `annual`, `quarterly` and `semiannual` also return the
   balance-sheet values (frequency `instant`) dated at the ends of the included periods, as the ratios use
   them; `instant` alone returns balance-sheet values only. In `companies_facts`, `frequency` filters the
@@ -213,10 +215,10 @@ branch on the code and show the message.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses. | Fix the argument; pass `next_cursor` unchanged. |
+| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses; for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics. | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
-| `timeout` | The vault query exceeded `MOF_MCP_QUERY_TIMEOUT_S` (cancelled by Postgres). | Narrow the filters. |
-| `backend_unavailable` | The vault database is unreachable or refused the query. | Retry later; check the deployment. |
+| `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
+| `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
 | `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit`. |
 | `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
 | `unknown_company` | No company matches the reference. | Use `companies_resolve`. |
