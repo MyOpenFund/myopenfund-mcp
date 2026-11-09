@@ -466,3 +466,55 @@ def test_missing_company_corpus_is_an_import_error_at_construction(tmp_path, mon
     monkeypatch.setitem(sys.modules, "company_corpus.concepts.store_summaries", None)
     with pytest.raises(ImportError):
         CompaniesStore(str(tmp_path), "x")
+
+
+class _CountingStore:
+    """Delegates to a real store, counting describe() calls; ``hidden`` datasets read as
+    unpublished (no columns) until removed."""
+
+    def __init__(self, inner, calls, hidden):
+        self._inner, self._calls, self._hidden = inner, calls, hidden
+
+    def describe(self, dataset):
+        self._calls.append(dataset)
+        d = self._inner.describe(dataset)
+        return {**d, "columns": []} if dataset in self._hidden else d
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _counting(cfg, calls, hidden=frozenset()):
+    from myopendata.reader import Store
+    return CompaniesStore(str(cfg.data_root), cfg.catalog,
+                          store_factory=lambda c: _CountingStore(Store.open(c), calls, hidden))
+
+
+def test_a_published_dataset_is_described_once(cfg):
+    calls = []
+    s = _counting(cfg, calls)
+    try:
+        first = s.concept_rows(AAPL, LATER)
+        assert len(s.concept_rows(AAPL, LATER)[0]) == len(first[0]) > 0
+        s.entities()
+        s.entities()
+        assert calls.count("fundamentals") == 1
+        assert calls.count("entity_observations") == 1
+    finally:
+        s.close()
+
+
+def test_an_unpublished_dataset_is_rechecked_so_publication_is_seen(cfg):
+    calls, hidden = [], {"fundamentals"}
+    s = _counting(cfg, calls, hidden)
+    try:
+        assert s.concept_rows(AAPL, LATER) == ([], [])
+        assert s.concept_rows(AAPL, LATER) == ([], [])
+        assert calls.count("fundamentals") == 2
+        hidden.clear()  # the dataset is published now
+        rows, _ = s.concept_rows(AAPL, LATER)
+        assert rows
+        s.concept_rows(AAPL, LATER)
+        assert calls.count("fundamentals") == 3  # described until seen published, then remembered
+    finally:
+        s.close()

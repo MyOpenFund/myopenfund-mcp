@@ -204,6 +204,10 @@ class CompaniesStore:
         self._lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(max_concurrency)
         self._entities: tuple[int, list[dict]] | None = None
+        # Publication is monotonic, so only the positive answer is remembered (``describe`` costs
+        # one catalogue query per column). Added without the lock: a set add is atomic and a
+        # concurrent first check merely describes twice.
+        self._published_datasets: set[str] = set()
 
     def __repr__(self) -> str:
         return f"CompaniesStore(data_root={str(self._cfg.data_root)!r})"
@@ -278,6 +282,14 @@ class CompaniesStore:
                     raise self._withheld(exc) from None
                 raise
 
+    def _is_published(self, s, dataset: str) -> bool:
+        if dataset in self._published_datasets:
+            return True
+        if _published(s.describe(dataset)):
+            self._published_datasets.add(dataset)
+            return True
+        return False
+
     def freshness(self) -> dict:
         return self._run(lambda s: s.freshness())
 
@@ -288,7 +300,7 @@ class CompaniesStore:
         cached = self._entities
         if cached is None or cached[0] != batches:
             rows = self._run(lambda s: s.read_asof("entity_observations").to_pylist()
-                             if _published(s.describe("entity_observations")) else [])
+                             if self._is_published(s, "entity_observations") else [])
             cached = self._entities = (batches, rows)
         return [dict(r) for r in cached[1]]
 
@@ -305,6 +317,7 @@ class CompaniesStore:
             description = s.describe(dataset)
             if not _published(description):
                 return []
+            self._published_datasets.add(dataset)
             checked = _checked(description, dataset, filters, columns)
             key = [*description["natural_key"], "known_at"]
             # Sort, slice and project in Arrow: only the returned rows become Python objects (an
@@ -338,7 +351,7 @@ class CompaniesStore:
         key = {"entity_scheme": ["cik"], "entity_value": [cik]}
 
         def go(s):
-            if not _published(s.describe("fundamentals")):
+            if not self._is_published(s, "fundamentals"):
                 return [], []
             facts = s.read_asof("fundamentals", as_of, filters=key, vintages=True)
             if facts.num_rows == 0:
