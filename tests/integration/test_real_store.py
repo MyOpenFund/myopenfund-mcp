@@ -2,7 +2,9 @@
 
     MOF_MCP_IT_COMPANIES_CATALOG=<catalogue connection string> \
     MOF_MCP_IT_COMPANIES_DATA_ROOT=<where this host sees the store files> \
-        python -m pytest -m integration tests/integration/test_real_store.py
+        python -m pytest -m integration -s tests/integration/test_real_store.py
+
+(-s, or -rP, shows the printed companies_fundamentals latency.)
 
 Optional: MOF_MCP_IT_COMPANIES_TIMEOUT_S (per store call, default 120: over SMB one read can take
 minutes) and MOF_MCP_IT_ASSERT_LATENCY=1 (enforce the < 5 s fundamentals criterion; meaningful on the NAS only).
@@ -19,7 +21,6 @@ from myopenfund_mcp.server import build_server
 
 CATALOG = os.environ.get("MOF_MCP_IT_COMPANIES_CATALOG")
 DATA_ROOT = os.environ.get("MOF_MCP_IT_COMPANIES_DATA_ROOT")
-TIMEOUT_S = int(os.environ.get("MOF_MCP_IT_COMPANIES_TIMEOUT_S") or 120)
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio,
               pytest.mark.skipif(not (CATALOG and DATA_ROOT),
@@ -29,9 +30,22 @@ APPLE_CIK = "0000320193"
 REVENUE_TAG = "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
 
 
+def _timeout_s() -> int:
+    """MOF_MCP_IT_COMPANIES_TIMEOUT_S, read at use (a malformed value fails the test that uses it,
+    with a clear message, instead of breaking collection)."""
+    raw = os.environ.get("MOF_MCP_IT_COMPANIES_TIMEOUT_S") or "120"
+    try:
+        value = int(raw)
+    except ValueError:
+        pytest.fail(f"MOF_MCP_IT_COMPANIES_TIMEOUT_S must be an integer number of seconds, got {raw!r}")
+    if value < 1:
+        pytest.fail(f"MOF_MCP_IT_COMPANIES_TIMEOUT_S must be >= 1, got {value}")
+    return value
+
+
 def _client() -> Client:
     return Client(build_server(Settings(companies_catalog=CATALOG, companies_data_root=DATA_ROOT,
-                                        companies_query_timeout_s=TIMEOUT_S)))
+                                        companies_query_timeout_s=_timeout_s())))
 
 
 async def test_apple_fy2024_revenue_as_known_in_december_2024():
@@ -49,10 +63,12 @@ async def test_fundamentals_one_company():
         t0 = time.monotonic()
         res = (await c.call_tool("companies_fundamentals", {"companies": ["AAPL"], "metrics": "all"})).data
         elapsed = time.monotonic() - t0
-        # the revenue row is looked up in its own period: the page above is newest-first and may not reach it
+        # the revenue row is looked up in its own period: the page above is newest-first and may not reach
+        # it; pinned to the annual value as known before the FY2025 10-K (which restates FY2024)
         fy = (await c.call_tool("companies_fundamentals", {
-            "companies": ["AAPL"], "concepts": ["revenue"], "period_from": "2024-09-28",
-            "period_to": "2024-09-28"})).data
+            "companies": ["AAPL"], "concepts": ["revenue"], "frequency": "annual",
+            "period_from": "2024-09-28", "period_to": "2024-09-28",
+            "as_of": "2024-12-01T00:00:00Z"})).data
     print(f"companies_fundamentals AAPL metrics=all: {elapsed:.1f} s")
     assert res["total"] > 0
     assert any(r["kind"] == "metric" for r in res["rows"])

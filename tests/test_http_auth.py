@@ -29,12 +29,20 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+class _ListingOnlyStore:
+    """Enough of a CompaniesStore to mount the companies and datasets toolsets (listing tools
+    never reads the store)."""
+
+    def freshness(self):
+        return {"batches": 0, "last_published_at": None}
+
+
 @pytest.fixture
 def http_url():
     port = _free_port()
     settings = Settings(transport="http", port=port,
                         tokens=f"alice:{hash_token(ALICE_TOKEN)}:act,agent:{hash_token(AGENT_TOKEN)}:read")
-    server = build_server(settings, vault_reader=FakeVaultReader())
+    server = build_server(settings, vault_reader=FakeVaultReader(), companies_store=_ListingOnlyStore())
 
     # v1 ships no act-only tool: a throwaway one proves tier enforcement over HTTP.
     @server.tool(auth=tier_check("act", auth_enabled=True))
@@ -64,6 +72,13 @@ async def test_read_token_gets_read_tier_and_vault_tools(http_url):
     async with Client(http_url, auth=AGENT_TOKEN) as c:
         assert (await c.call_tool("server_info", {})).data["tier"] == "read"
         assert (await c.call_tool("vault_search_documents", {})).data["total"] == 4
+
+
+async def test_read_token_lists_the_companies_and_datasets_tools(http_url):
+    async with Client(http_url, auth=AGENT_TOKEN) as c:
+        names = {t.name for t in await c.list_tools()}
+    assert {"companies_resolve", "companies_facts", "companies_fundamentals"} <= names
+    assert {"datasets_list", "datasets_describe", "datasets_read_asof", "datasets_export_csv"} <= names
 
 
 async def test_act_token_gets_act_tier(http_url):
