@@ -5,7 +5,8 @@ Adversarial on purpose (no perfect-world fixture):
   that 10-K has no filing_statements rows (its positions are borrowed from the 2024 filing);
 - NatWest (IFRS filer) has entity rows but no fundamentals at all;
 - APPLE HOSPITALITY REIT shares the "APPLE" substring with Apple, without any fact;
-- JPMorgan is a bank (Revenues, no positions, no gross profit), with a quarterly fact;
+- JPMorgan is a bank (Revenues, no positions, no gross profit), with a quarterly fact and a
+  balance-sheet value dated at that quarter end only (none at its annual end);
 - Apple's ticker row has no name, JPMorgan's repeats the current name (as production ticker
   rows may), and Apple has two names over time.
 """
@@ -24,8 +25,8 @@ NOW = datetime(2026, 11, 9, 8, 0, tzinfo=UTC)
 AAPL, JPM, NWG, APPLE_LIKE = "0000320193", "0000019617", "0000844150", "0000999999"
 REV = "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
 AAPL_10K_2024, AAPL_10K_2025 = "0000320193-24-000123", "0000320193-25-000079"
-#: fundamentals rows latest per key at 2026-01-01: 9 facts, the restated one counts once
-N_FUNDAMENTALS_LATEST = 8
+#: fundamentals rows latest per key at 2026-01-01: 10 facts, the restated one counts once
+N_FUNDAMENTALS_LATEST = 9
 
 
 def _ts(s: str) -> datetime:
@@ -89,6 +90,8 @@ def seed(tmp_path) -> StoreConfig:
              start=date(2024, 1, 1), accn=jpm_10k, known="2025-02-14T20:00:00"),
         fact(JPM, "us-gaap:Revenues", date(2025, 3, 31), 45310000000, start=date(2025, 1, 1),
              freq="quarterly", accn=jpm_10q, known="2025-05-01T20:00:00"),
+        fact(JPM, "us-gaap:Assets", date(2025, 3, 31), 4357856000000, freq="instant",
+             accn=jpm_10q, known="2025-05-01T20:00:00"),
     ]
     write_batch(FUNDAMENTALS, pa.Table.from_pylist(rows, schema=FUNDAMENTALS.schema),
                 landing_root=land, run_id="r1", producer="test", now=NOW)

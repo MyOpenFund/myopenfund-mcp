@@ -23,6 +23,7 @@ import re
 import threading
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from pathlib import Path
 
 
@@ -153,6 +154,20 @@ def _checked(description: dict, dataset: str, filters, columns) -> dict | None:
         except (ValueError, TypeError):
             raise StoreBadArgument(f"filter {col!r} expects {_EXPECTS[kind]} values") from None
     return out
+
+
+@cache
+def _concept_catalog() -> tuple[dict, ...]:
+    from company_corpus.concepts.store_summaries import concept_catalog
+
+    return tuple(concept_catalog())
+
+
+@cache
+def _metric_catalog() -> tuple[dict, ...]:
+    from company_corpus.concepts.store_summaries import metric_catalog
+
+    return tuple(metric_catalog())
 
 
 def _open(cfg):
@@ -307,7 +322,8 @@ class CompaniesStore:
     def summaries(self, cik: str, name: str, rows: list[dict], vintages: list[dict]) -> list:
         """company-corpus period summaries (values, ratios, TTM) of ``concept_rows``' output.
 
-        The store has no SIC, so the sector is unknown (every ``sector_relevant`` is None)."""
+        The store has no SIC, so the sector is unknown: ``sector_relevant`` is None on the
+        sector-sensitive metrics (banks, insurers) and True on the others."""
         from company_corpus.concepts.store_summaries import summaries_from_rows
 
         with self._slots:
@@ -318,11 +334,9 @@ class CompaniesStore:
                 raise StoreBadArgument(str(exc)) from None
 
     def concept_catalog(self) -> list[dict]:
-        from company_corpus.concepts.store_summaries import concept_catalog
-
-        return concept_catalog()
+        """company-corpus's concepts (read once per process; copies, so callers cannot alter it)."""
+        return [dict(c) for c in _concept_catalog()]
 
     def metric_catalog(self) -> list[dict]:
-        from company_corpus.concepts.store_summaries import metric_catalog
-
-        return metric_catalog()
+        """company-corpus's metrics (read once per process; copies)."""
+        return [dict(m) for m in _metric_catalog()]

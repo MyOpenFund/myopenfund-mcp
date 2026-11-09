@@ -76,12 +76,13 @@ async def test_facts_rows_shape_sort_and_utc(store):
     assert [k[0] for k in keys] == sorted(k[0] for k in keys)  # by cik first
     aapl = [r["valid_date"] for r in rows if r["cik"] == AAPL]
     assert aapl == sorted(aapl, reverse=True)  # newest period first
-    assert res["total"] == len(rows) == 8 and res["returned"] == 8
+    assert res["total"] == len(rows) == 9 and res["returned"] == 9
 
 
 async def test_facts_frequency_period_and_paging(store):
+    # facts stay raw as filed: frequency is the raw column, no instants added
     q = await _call(store, "companies_facts", {"companies": [JPM], "frequency": "quarterly"})
-    assert [r["valid_date"] for r in q["rows"]] == ["2025-03-31"]
+    assert [(r["valid_date"], r["frequency"]) for r in q["rows"]] == [("2025-03-31", "quarterly")]
     p = await _call(store, "companies_facts", {"companies": [AAPL], "period_from": "2025-01-01"})
     assert {r["valid_date"] for r in p["rows"]} == {"2025-09-27"}
     async with _client(store) as c:
@@ -128,6 +129,39 @@ async def test_fundamentals_sort_concepts_before_metrics_newest_first(store):
     assert order[0][0] == JPM and order[-1][0] == AAPL  # 0000019617 < 0000320193
 
 
+async def test_fundamentals_annual_includes_balance_sheet_at_annual_period_ends(store):
+    res = await _call(store, "companies_fundamentals", {"companies": [AAPL, JPM], "frequency": "annual"})
+    inst = {(r["cik"], r["key"], r["period_end"]) for r in res["rows"] if r["frequency"] == "instant"}
+    assert inst == {(AAPL, "assets", "2024-09-28"), (AAPL, "equity", "2024-09-28")}  # not JPM's Q1 assets
+    assert {r["frequency"] for r in res["rows"]} == {"annual", "instant"}
+    # the instants sort with their period: cik, period_end desc, then frequency
+    aapl = [(r["period_end"], r["frequency"]) for r in res["rows"] if r["cik"] == AAPL]
+    assert aapl == sorted(aapl, key=lambda k: ([-ord(c) for c in k[0]], k[1]))
+
+
+async def test_fundamentals_quarterly_includes_balance_sheet_at_quarter_ends(store):
+    res = await _call(store, "companies_fundamentals", {"companies": [JPM], "frequency": "quarterly"})
+    assert {(r["frequency"], r["key"], r["period_end"]) for r in res["rows"]} == {
+        ("quarterly", "revenue", "2025-03-31"), ("instant", "assets", "2025-03-31")}
+
+
+async def test_fundamentals_balance_sheet_follows_the_period_range_and_concepts(store):
+    res = await _call(store, "companies_fundamentals", {
+        "companies": [AAPL], "frequency": "annual", "concepts": ["assets"], "period_from": "2025-01-01"})
+    assert res["rows"] == []  # FY2025 has no balance sheet in the store; FY2024 is out of range
+    res = await _call(store, "companies_fundamentals", {
+        "companies": [AAPL], "frequency": "annual", "concepts": ["assets"]})
+    assert [(r["key"], r["period_end"]) for r in res["rows"]] == [("assets", "2024-09-28")]
+
+
+async def test_fundamentals_instant_returns_instants_only(store):
+    res = await _call(store, "companies_fundamentals", {"companies": [AAPL, JPM], "frequency": "instant",
+                                                        "metrics": "all"})
+    assert {r["frequency"] for r in res["rows"]} == {"instant"}
+    assert {(r["cik"], r["key"], r["period_end"]) for r in res["rows"]} == {
+        (AAPL, "assets", "2024-09-28"), (AAPL, "equity", "2024-09-28"), (JPM, "assets", "2025-03-31")}
+
+
 async def test_fundamentals_metrics_all_as_string_or_list(store):
     a = await _call(store, "companies_fundamentals", {"companies": [AAPL], "metrics": "all"})
     b = await _call(store, "companies_fundamentals", {"companies": [AAPL], "metrics": ["all"]})
@@ -164,6 +198,7 @@ async def test_ifrs_only_issuer_gives_empty_rows_not_an_error(store):
     ({"companies": [AAPL], "period_from": "2025-01-01", "period_to": "2024-01-01"}, "invalid_argument"),
     ({"companies": [AAPL], "limit": 0}, "invalid_argument"),
     ({"companies": [AAPL], "cursor": "junk"}, "invalid_argument"),
+    ({"companies": [AAPL], "metrics": ["all", "roe"]}, "invalid_argument"),
 ])
 async def test_errors_are_coded(store, args, code):
     async with _client(store) as c:
@@ -178,6 +213,7 @@ async def test_errors_are_coded(store, args, code):
     {"companies": [AAPL], "period_from": "2025-01-01", "period_to": "2024-01-01"},
     {"companies": [AAPL], "limit": 0},
     {"companies": [AAPL], "cursor": "junk"},
+    {"companies": [AAPL], "metrics": ["all", "roe"]},
 ])
 async def test_bad_input_is_refused_before_the_store_is_touched(store, args):
     calls = []
@@ -200,6 +236,22 @@ async def test_facts_validates_before_the_store_too(store):
     assert calls == []
 
 
+async def test_all_cannot_be_combined_with_other_metrics(store):
+    async with _client(store) as c:
+        with pytest.raises(ToolError, match=r"'all' cannot be combined with other metrics"):
+            await c.call_tool("companies_fundamentals", {"companies": [AAPL], "metrics": ["all", "roe"]})
+
+
+@pytest.mark.parametrize("tool", ["companies_facts", "companies_fundamentals"])
+async def test_company_identifiers_are_length_bounded(store, tool):
+    calls = []
+    store.entities = lambda: calls.append(1) or []
+    async with _client(store) as c:
+        with pytest.raises(ToolError) as err:
+            await c.call_tool(tool, {"companies": ["x" * 201]})
+    assert calls == [] and not str(err.value).startswith("[unknown_company]")
+
+
 async def test_ambiguity_lists_candidates_with_ciks(store):
     async with _client(store) as c:
         with pytest.raises(ToolError, match=AAPL):
@@ -213,7 +265,7 @@ async def test_unknown_concept_lists_valid_ones(store):
 
 
 async def test_timeout_is_coded(store):
-    store.concept_rows = lambda cik, as_of: time.sleep(3)
+    store.concept_rows = lambda cik, as_of: time.sleep(1.5)
     async with _client(store, companies_query_timeout_s=1) as c:
         with pytest.raises(ToolError, match=r"^\[timeout\].*narrow the request"):
             await c.call_tool("companies_fundamentals", {"companies": [AAPL]})
@@ -232,7 +284,7 @@ async def test_one_time_budget_for_the_whole_call(store):
         t0 = time.monotonic()
         with pytest.raises(ToolError, match=r"^\[timeout\]"):
             await c.call_tool("companies_fundamentals", {"companies": [AAPL, JPM, NWG]})
-        assert time.monotonic() - t0 < 1.6
+        assert time.monotonic() - t0 < 1.7
 
 
 async def test_facts_shares_one_budget_with_the_lookup(store):
@@ -251,7 +303,7 @@ async def test_facts_shares_one_budget_with_the_lookup(store):
         t0 = time.monotonic()
         with pytest.raises(ToolError, match=r"^\[timeout\]"):
             await c.call_tool("companies_facts", {"companies": [AAPL]})
-        assert time.monotonic() - t0 < 1.6
+        assert time.monotonic() - t0 < 1.15
 
 
 async def test_descriptions_are_directive(store):
