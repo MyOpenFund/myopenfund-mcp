@@ -518,3 +518,134 @@ def test_an_unpublished_dataset_is_rechecked_so_publication_is_seen(cfg):
         assert calls.count("fundamentals") == 3  # described until seen published, then remembered
     finally:
         s.close()
+
+
+# --- a Store is never closed under a call in flight (DuckDB refuses, or the call's next query fails) ---
+
+class _BusyStore:
+    """Like a DuckDB connection: ``close`` refuses while a call runs, a closed Store fails calls."""
+
+    def __init__(self, gate, inside):
+        self.gate, self.inside = gate, inside
+        self.active = 0
+        self.closed = 0
+
+    def _check(self):
+        if self.closed:
+            raise RuntimeError("Connection already closed")
+
+    def freshness(self):                  # blocks between two queries until the gate opens
+        self._check()
+        self.active += 1
+        try:
+            self.inside.set()
+            self.gate.wait(5)
+            self._check()
+            return {"batches": 0, "last_published_at": None}
+        finally:
+            self.active -= 1
+
+    def datasets(self):                   # a backend failure
+        raise RuntimeError("backend down")
+
+    def close(self):
+        if self.active:
+            raise RuntimeError("connection is busy with another call")
+        self.closed += 1
+
+
+def _busy_store(tmp_path, gate, inside):
+    opened = []
+
+    def factory(c):
+        opened.append(_BusyStore(gate, inside))
+        return opened[-1]
+
+    return CompaniesStore(str(tmp_path), "x", max_concurrency=2, store_factory=factory), opened
+
+
+def _in_flight(s, inside):
+    out = {}
+
+    def call():
+        try:
+            out["result"] = s.freshness()
+        except Exception as exc:  # noqa: BLE001 — the assertion below shows it
+            out["result"] = exc
+
+    t = threading.Thread(target=call)
+    t.start()
+    assert inside.wait(5)
+    return t, out
+
+
+def test_a_discard_leaves_calls_in_flight_their_store(tmp_path):
+    gate, inside = threading.Event(), threading.Event()
+    s, opened = _busy_store(tmp_path, gate, inside)
+    t, out = _in_flight(s, inside)
+    with pytest.raises(RuntimeError, match="backend down"):
+        s.datasets()                      # another call fails: its Store is discarded...
+    old = opened[0]
+    assert s._store is None and old.closed == 0   # ...detached, not closed under the call
+    gate.set()
+    t.join(5)
+    assert out["result"] == {"batches": 0, "last_published_at": None}  # the call completes
+    assert old.closed == 1                # closed by the last call to leave it
+    assert s.freshness() == {"batches": 0, "last_published_at": None}
+    assert len(opened) == 2 and opened[1].closed == 0   # the next call opened a new Store
+    s.close()
+    assert opened[1].closed == 1
+
+
+def test_close_leaves_calls_in_flight_their_store(tmp_path):
+    gate, inside = threading.Event(), threading.Event()
+    s, opened = _busy_store(tmp_path, gate, inside)
+    t, out = _in_flight(s, inside)
+    s.close()                             # shutdown with a call in flight (e.g. an abandoned one)
+    assert s._store is None and opened[0].closed == 0
+    gate.set()
+    t.join(5)
+    assert out["result"] == {"batches": 0, "last_published_at": None}
+    assert opened[0].closed == 1
+
+
+def test_close_when_idle_closes_at_once(tmp_path):
+    gate, inside = threading.Event(), threading.Event()
+    gate.set()
+    s, opened = _busy_store(tmp_path, gate, inside)
+    s.freshness()
+    s.close()
+    assert opened[0].closed == 1
+    s.close()                             # idempotent
+    assert opened[0].closed == 1
+
+
+def test_a_discard_mid_call_on_the_real_store(cfg):
+    """my-open-data's Store: a discard between two queries of another call must not close the
+    DuckDB connection that call still uses."""
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    between, go_on, out = threading.Event(), threading.Event(), {}
+
+    def two_queries(st):
+        st.datasets()
+        between.set()
+        go_on.wait(5)
+        return st.datasets()
+
+    def call():
+        try:
+            out["result"] = s._run(two_queries)
+        except Exception as exc:  # noqa: BLE001
+            out["result"] = exc
+
+    t = threading.Thread(target=call)
+    t.start()
+    try:
+        assert between.wait(5)
+        s._discard(s._store)              # as after another thread's backend failure
+        go_on.set()
+        t.join(5)
+        assert isinstance(out["result"], list) and out["result"]
+    finally:
+        go_on.set()
+        s.close()

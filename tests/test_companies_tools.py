@@ -1,5 +1,7 @@
+import threading
 import time
 
+import anyio
 import pytest
 from companies_fixture import AAPL, AAPL_10K_2025, JPM, NWG, REV, seed
 from fastmcp import Client
@@ -19,6 +21,30 @@ def store(tmp_path):
     s = CompaniesStore(str(cfg.data_root), cfg.catalog)
     yield s
     s.close()
+
+
+def _tracked(fn):
+    """``fn`` wrapped so a test can wait for the calls its tool abandoned on timeout: they keep
+    running in their threads, and the fixture's teardown must not race them."""
+    running, idle = [0], threading.Condition()
+
+    def wrapper(*a, **kw):
+        with idle:
+            running[0] += 1
+        try:
+            return fn(*a, **kw)
+        finally:
+            with idle:
+                running[0] -= 1
+                idle.notify_all()
+
+    async def settled():
+        def wait():
+            with idle:
+                assert idle.wait_for(lambda: running[0] == 0, timeout=10)
+        await anyio.to_thread.run_sync(wait)
+
+    return wrapper, settled
 
 
 def _client(store, **kw):
@@ -266,10 +292,11 @@ async def test_unknown_concept_lists_valid_ones(store):
 
 
 async def test_timeout_is_coded(store):
-    store.concept_rows = lambda cik, as_of: time.sleep(1.5)
+    store.concept_rows, settled = _tracked(lambda cik, as_of: time.sleep(1.5))
     async with _client(store, companies_query_timeout_s=1) as c:
         with pytest.raises(ToolError, match=r"^\[timeout\].*narrow the request"):
             await c.call_tool("companies_fundamentals", {"companies": [AAPL]})
+    await settled()
 
 
 async def test_one_time_budget_for_the_whole_call(store):
@@ -280,12 +307,13 @@ async def test_one_time_budget_for_the_whole_call(store):
         time.sleep(0.6)
         return real(cik, as_of)
 
-    store.concept_rows = slow
+    store.concept_rows, settled = _tracked(slow)
     async with _client(store, companies_query_timeout_s=1) as c:
         t0 = time.monotonic()
         with pytest.raises(ToolError, match=r"^\[timeout\]"):
             await c.call_tool("companies_fundamentals", {"companies": [AAPL, JPM, NWG]})
         assert time.monotonic() - t0 < 1.7
+    await settled()
 
 
 async def test_facts_shares_one_budget_with_the_lookup(store):
@@ -301,12 +329,14 @@ async def test_facts_shares_one_budget_with_the_lookup(store):
         time.sleep(0.8)
         return real_read(*a, **kw)
 
-    store.entities, store.read = slow_entities, slow_read
+    store.entities = slow_entities
+    store.read, settled = _tracked(slow_read)   # the abandoned read is still running after the call
     async with _client(store, companies_query_timeout_s=1) as c:
         t0 = time.monotonic()
         with pytest.raises(ToolError, match=r"^\[timeout\]"):
             await c.call_tool("companies_facts", {"companies": [AAPL]})
         assert time.monotonic() - t0 < 1.5
+    await settled()
 
 
 async def test_descriptions_are_directive(store):

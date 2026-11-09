@@ -3,7 +3,9 @@
 Blocking (DuckDB): the tools call it in a worker thread under a time budget. One my-open-data
 ``Store`` per process, opened lazily and reopened after a backend failure (``Store.read_asof``
 takes a cursor per call, so threads share it safely). A semaphore bounds concurrent calls, and an
-abandoned (timed-out) call keeps its slot until it ends, so calls never pile up.
+abandoned (timed-out) call keeps its slot until it ends, so calls never pile up. A Store is never
+closed under a call in flight (after a failure or at shutdown it is detached, and the last call
+still using it closes it).
 
 Arguments are checked before any query: filter and column names against ``describe``, each
 filter value against its column's declared type (wrong values would otherwise surface as DuckDB
@@ -201,6 +203,11 @@ class CompaniesStore:
         self._secrets = tuple(x for x in (catalog, _password(catalog)) if x)
         self._factory = store_factory or _open
         self._store = None
+        # Calls in flight per Store (keyed by identity). A Store is closed only once no call uses
+        # it: DuckDB refuses to close a connection running a query, and a call's next query on a
+        # closed one fails. ``close``/``_discard`` detach the Store; the last call to leave a
+        # detached Store closes it.
+        self._in_flight: dict[int, int] = {}
         self._lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(max_concurrency)
         self._entities: tuple[int, list[dict]] | None = None
@@ -213,20 +220,44 @@ class CompaniesStore:
         return f"CompaniesStore(data_root={str(self._cfg.data_root)!r})"
 
     def close(self) -> None:
+        """Detach the Store and close it now if idle; otherwise the last call in flight closes it
+        (a timed-out call abandoned by its tool may still be running at shutdown)."""
         with self._lock:
             store, self._store = self._store, None
-        if store is not None:
+            idle = store is not None and not self._in_flight.get(id(store))
+        if idle:
             store.close()
 
     def _discard(self, store) -> None:
-        """Close the Store that failed, unless another thread already replaced it."""
+        """Detach the Store that failed, unless another thread already replaced it: new calls open
+        a fresh one, and the last call still using it closes it (see ``_leave``)."""
         with self._lock:
-            if self._store is not store:
+            if self._store is store:
+                self._store = None
+
+    def _enter(self):
+        """The current Store (opened if needed), counted as in use until ``_leave``."""
+        # The factory (a Postgres connect in production) runs under the lock: a slow connect
+        # stalls the other callers, each within its own time budget.
+        with self._lock:
+            if self._store is None:
+                self._store = self._factory(self._cfg)
+            store = self._store
+            self._in_flight[id(store)] = self._in_flight.get(id(store), 0) + 1
+            return store
+
+    def _leave(self, store) -> None:
+        with self._lock:
+            left = self._in_flight[id(store)] - 1
+            if left:
+                self._in_flight[id(store)] = left
                 return
-            self._store = None
-        try:
+            del self._in_flight[id(store)]
+            if self._store is store:
+                return
+        try:  # the last call to leave a detached Store closes it
             store.close()
-        except Exception:  # noqa: BLE001, S110 — it is already broken; the next call reopens
+        except Exception:  # noqa: BLE001, S110 — detached: nothing uses it, nothing to report
             pass
 
     def _names_the_catalogue(self, exc: BaseException) -> bool:
@@ -254,12 +285,7 @@ class CompaniesStore:
         with self._slots:
             store = None
             try:
-                # The factory (a Postgres connect in production) runs under the lock: a slow
-                # connect stalls the other callers, each within its own time budget.
-                with self._lock:
-                    if self._store is None:
-                        self._store = self._factory(self._cfg)
-                    store = self._store
+                store = self._enter()
                 return fn(store)
             except UnknownDataset as exc:
                 if self._names_the_catalogue(exc):
@@ -281,6 +307,9 @@ class CompaniesStore:
                 if self._names_the_catalogue(exc):
                     raise self._withheld(exc) from None
                 raise
+            finally:
+                if store is not None:
+                    self._leave(store)
 
     def _is_published(self, s, dataset: str) -> bool:
         if dataset in self._published_datasets:
