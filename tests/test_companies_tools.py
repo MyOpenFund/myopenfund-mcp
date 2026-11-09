@@ -5,6 +5,7 @@ from companies_fixture import AAPL, AAPL_10K_2025, JPM, NWG, REV, seed
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from myopenfund_mcp.companies.common import parse_as_of
 from myopenfund_mcp.companies.store import CompaniesStore
 from myopenfund_mcp.config import Settings
 from myopenfund_mcp.server import build_server
@@ -290,12 +291,14 @@ async def test_one_time_budget_for_the_whole_call(store):
 async def test_facts_shares_one_budget_with_the_lookup(store):
     real_entities, real_read = store.entities, store.read
 
+    # 0.8 s each: one shared 1 s budget times out at ~1.0 s; a budget per call would not time out
+    # at all (each fits), and the call would end at ~1.6 s. The window between is wide on purpose.
     def slow_entities():
-        time.sleep(0.6)
+        time.sleep(0.8)
         return real_entities()
 
     def slow_read(*a, **kw):
-        time.sleep(0.6)
+        time.sleep(0.8)
         return real_read(*a, **kw)
 
     store.entities, store.read = slow_entities, slow_read
@@ -303,7 +306,7 @@ async def test_facts_shares_one_budget_with_the_lookup(store):
         t0 = time.monotonic()
         with pytest.raises(ToolError, match=r"^\[timeout\]"):
             await c.call_tool("companies_facts", {"companies": [AAPL]})
-        assert time.monotonic() - t0 < 1.15
+        assert time.monotonic() - t0 < 1.5
 
 
 async def test_descriptions_are_directive(store):
@@ -313,3 +316,43 @@ async def test_descriptions_are_directive(store):
     assert "companies_resolve" in tools["companies_facts"].description
     assert "as_of" in tools["companies_facts"].description
     assert "companies_fundamentals" in tools["companies_facts"].description
+
+
+# --- an empty published store (contracts approved, nothing published) ---------------------------
+
+@pytest.fixture
+def empty_store(tmp_path):
+    from myopendata.config import StoreConfig
+    from myopendata.contracts.standard import ENTITY_OBSERVATIONS, FILING_STATEMENTS, FUNDAMENTALS
+    from myopendata.publisher import approve_contract
+
+    cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
+    for contract in (ENTITY_OBSERVATIONS, FUNDAMENTALS, FILING_STATEMENTS):
+        approve_contract(cfg, contract, "test")
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    yield s
+    s.close()
+
+
+async def test_an_empty_store_answers_without_errors(empty_store):
+    async with _client(empty_store) as c:
+        names = {d["name"] for d in (await c.call_tool("datasets_list", {})).data["datasets"]}
+        resolved = (await c.call_tool("companies_resolve", {"query": "apple"})).data
+        with pytest.raises(ToolError, match=r"^\[unknown_company\]"):
+            await c.call_tool("companies_fundamentals", {"companies": [AAPL]})
+        info = (await c.call_tool("server_info", {})).data
+    assert names == set()  # approved but unpublished datasets are not listed
+    assert resolved["candidates"] == [] and resolved["total"] == 0
+    assert "companies_freshness_error" not in info
+    assert info["companies_freshness"]["batches"] == 0
+
+
+async def test_an_unpublished_dataset_reads_as_empty(empty_store):
+    async with _client(empty_store) as c:
+        res = (await c.call_tool("datasets_read_asof", {"dataset": "fundamentals"})).data
+    assert res["rows"] == [] and res["next_cursor"] is None
+
+
+async def test_an_empty_store_gives_no_entities_and_no_concept_rows(empty_store):
+    assert empty_store.entities() == []
+    assert empty_store.concept_rows(AAPL, parse_as_of(None)) == ([], [])

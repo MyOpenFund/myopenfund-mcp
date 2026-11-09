@@ -9,12 +9,14 @@ Arguments are checked before any query: filter and column names against ``descri
 filter value against its column's declared type (wrong values would otherwise surface as DuckDB
 conversion errors, i.e. as a backend failure).
 
-Errors: my-open-data's ``UnknownDataset`` -> :class:`StoreUnknownDataset`, ``ValueError`` (bad
-filter, column, limit, naive ``as_of``...) and DuckDB ``DataError`` (a value the checks missed)
--> :class:`StoreBadArgument`; all keep the Store open. Anything else closes the Store and
-propagates (the tools map it to ``[backend_unavailable]``), except that an error whose chain
-(causes, contexts, args) names the catalogue or its password is replaced by a
-:class:`StoreBackendError` with a fixed message. The catalogue never goes in a message or a log.
+Errors: my-open-data's ``UnknownDataset`` -> :class:`StoreUnknownDataset`, its argument
+``ValueError`` (bad filter, column, limit, naive ``as_of``...) and DuckDB ``DataError`` (a value the
+checks missed) -> :class:`StoreBadArgument`; all keep the Store open. Arrow errors (``ArrowInvalid``
+is a ``ValueError``) and company-corpus's selection errors are data or backend faults, not the
+caller's: like anything else they close the Store and propagate (the tools map them to
+``[backend_unavailable]``). Whatever the branch, an error whose chain (causes, contexts, args)
+names the catalogue or its password is replaced by a :class:`StoreBackendError` with a fixed
+message. The catalogue never goes in a message or a log.
 """
 from __future__ import annotations
 
@@ -37,6 +39,11 @@ class StoreBadArgument(ValueError):
 
 class StoreBackendError(RuntimeError):
     """A backend failure whose original message was withheld (it named the catalogue)."""
+
+
+class _SelectionFault(RuntimeError):
+    """company-corpus's selection failed on the stored data (a ValueError, or a DuckDB DataError
+    that would otherwise read as a bad filter value): a data fault, never the caller's."""
 
 
 _PASSWORD_RES = (
@@ -170,21 +177,25 @@ def _metric_catalog() -> tuple[dict, ...]:
     return tuple(metric_catalog())
 
 
+def _published(description: dict) -> bool:
+    """Whether an approved dataset has a published table: my-open-data's ``describe`` lists only
+    the columns of the published table (none before the first publication), and ``read_asof`` on
+    an unpublished dataset is a catalogue error. Unpublished reads as empty here."""
+    return bool(description["columns"])
+
+
 def _open(cfg):
     from myopendata.reader import Store
 
     return Store.open(cfg)
 
 
-def _sort_key(key: list[str]):
-    # None last within a column; a column's non-null values share one type, so they compare.
-    return lambda r: tuple((r[k] is None, "" if r[k] is None else r[k]) for k in key)
-
-
 class CompaniesStore:
     def __init__(self, data_root: str, catalog: str, *, max_concurrency: int = 2,
                  store_factory=None):
-        from myopendata.config import StoreConfig  # ImportError here = [companies] extra missing
+        # ImportError here = [companies] extra missing (my-open-data or company-corpus)
+        import company_corpus.concepts.store_summaries  # noqa: F401
+        from myopendata.config import StoreConfig
 
         self._cfg = StoreConfig(data_root=Path(data_root), catalog=catalog)
         self._secrets = tuple(x for x in (catalog, _password(catalog)) if x)
@@ -228,9 +239,13 @@ class CompaniesStore:
             todo += [e.__cause__, e.__context__]
         return False
 
+    def _withheld(self, exc: BaseException) -> StoreBackendError:
+        return StoreBackendError(f"store backend error ({type(exc).__name__}; message withheld)")
+
     def _run(self, fn):
         from duckdb import DataError
         from myopendata.reader.api import UnknownDataset
+        from pyarrow.lib import ArrowException
 
         with self._slots:
             store = None
@@ -243,19 +258,24 @@ class CompaniesStore:
                     store = self._store
                 return fn(store)
             except UnknownDataset as exc:
+                if self._names_the_catalogue(exc):
+                    raise self._withheld(exc) from None
                 raise StoreUnknownDataset(exc.args[0] if exc.args else "unknown dataset") from None
             except StoreBadArgument:
                 raise
-            except ValueError as exc:
-                raise StoreBadArgument(str(exc)) from None
             except DataError:  # a value the checks missed: the caller's mistake, Store is fine
                 raise StoreBadArgument(_DATA_ERROR_MESSAGE) from None
             except Exception as exc:
+                # my-open-data's argument checks raise ValueError; Arrow's ValueErrors
+                # (ArrowInvalid...) are data/backend faults and take the backend path below.
+                if isinstance(exc, ValueError) and not isinstance(exc, ArrowException):
+                    if self._names_the_catalogue(exc):
+                        raise self._withheld(exc) from None
+                    raise StoreBadArgument(str(exc)) from None
                 if store is not None:
                     self._discard(store)
                 if self._names_the_catalogue(exc):
-                    raise StoreBackendError(
-                        f"store backend error ({type(exc).__name__}; message withheld)") from None
+                    raise self._withheld(exc) from None
                 raise
 
     def freshness(self) -> dict:
@@ -267,29 +287,36 @@ class CompaniesStore:
         batches = self.freshness()["batches"]
         cached = self._entities
         if cached is None or cached[0] != batches:
-            rows = self._run(lambda s: s.read_asof("entity_observations").to_pylist())
+            rows = self._run(lambda s: s.read_asof("entity_observations").to_pylist()
+                             if _published(s.describe("entity_observations")) else [])
             cached = self._entities = (batches, rows)
         return [dict(r) for r in cached[1]]
 
     def read(self, dataset: str, *, as_of: datetime, filters: dict | None,
              columns: list[str] | None, limit: int | None, vintages: bool = False) -> list[dict]:
         """Rows knowable at ``as_of``, sorted by the dataset's natural key then ``known_at`` so
-        pages are stable across calls; ``limit`` and ``columns`` apply after the sort."""
+        pages are stable across calls; ``limit`` and ``columns`` apply after the sort. A dataset
+        approved but not yet published reads as empty (it has no columns to check against)."""
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
                                   or limit < 0):
             raise StoreBadArgument("limit must be a non-negative int")
 
         def go(s):
             description = s.describe(dataset)
+            if not _published(description):
+                return []
             checked = _checked(description, dataset, filters, columns)
             key = [*description["natural_key"], "known_at"]
-            rows = s.read_asof(dataset, as_of, filters=checked, vintages=vintages).to_pylist()
-            rows.sort(key=_sort_key(key))
+            # Sort, slice and project in Arrow: only the returned rows become Python objects (an
+            # unfiltered read of a large dataset must not be materialised). Arrow's sort is stable
+            # and puts nulls last by default (pinned by a test).
+            t = s.read_asof(dataset, as_of, filters=checked, vintages=vintages)
+            t = t.sort_by([(k, "ascending") for k in key])
             if limit is not None:
-                rows = rows[:limit]
+                t = t.slice(0, limit)
             if columns:
-                rows = [{c: r[c] for c in columns} for r in rows]
-            return rows
+                t = t.select(list(columns))
+            return t.to_pylist()
 
         return self._run(go)
 
@@ -311,11 +338,17 @@ class CompaniesStore:
         key = {"entity_scheme": ["cik"], "entity_value": [cik]}
 
         def go(s):
+            if not _published(s.describe("fundamentals")):
+                return [], []
             facts = s.read_asof("fundamentals", as_of, filters=key, vintages=True)
             if facts.num_rows == 0:
                 return [], []
             positions = s.read_asof("filing_statements", as_of, filters=key)
-            return run_selection(facts, positions), facts.to_pylist()
+            try:
+                selected = run_selection(facts, positions)
+            except Exception as exc:  # the stored data, never the caller's arguments
+                raise _SelectionFault(f"concept selection failed ({type(exc).__name__})") from exc
+            return selected, facts.to_pylist()
 
         return self._run(go)
 
@@ -328,9 +361,12 @@ class CompaniesStore:
 
         with self._slots:
             try:
+                # spec Q6: TTM Q4 = annual - Q1 - Q2 - Q3 (no 9-month YTD in the store), pinned explicitly
                 return summaries_from_rows(rows, company=name or cik, sector_known=False,
-                                           vintages=vintages)
+                                           vintages=vintages, q4_rule="sum_of_quarters")
             except ValueError as exc:
+                if self._names_the_catalogue(exc):
+                    raise self._withheld(exc) from None
                 raise StoreBadArgument(str(exc)) from None
 
     def concept_catalog(self) -> list[dict]:

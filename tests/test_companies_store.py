@@ -352,3 +352,117 @@ def _context(outer, inner):
             raise outer  # implicit __context__ on purpose
     except Exception as exc:  # noqa: BLE001
         return exc
+
+
+# --- final-review fixes: Arrow-side sort/slice/project, Arrow errors are backend faults ---
+
+class _TableStore:
+    """A minimal Store serving one in-memory table (natural key ``k``, nullable on purpose)."""
+
+    def __init__(self, table):
+        self.table, self.reads = table, 0
+
+    def describe(self, dataset):
+        return {"natural_key": ["k"], "added_by_publisher": [],
+                "columns": [{"name": f.name, "type": str(f.type)} for f in self.table.schema]}
+
+    def read_asof(self, dataset, as_of, *, filters=None, vintages=False):
+        self.reads += 1
+        return self.table
+
+    def close(self):
+        pass
+
+
+def test_nulls_in_a_sort_key_go_last_and_ties_break_on_known_at(tmp_path):
+    import pyarrow as pa
+
+    t = pa.table({
+        "k": ["b", None, "a", "b", None, "a"],
+        "known_at": [datetime(2025, 1, 2, tzinfo=UTC), datetime(2025, 1, 1, tzinfo=UTC),
+                     datetime(2025, 1, 3, tzinfo=UTC), datetime(2025, 1, 1, tzinfo=UTC),
+                     None, datetime(2025, 1, 1, tzinfo=UTC)],
+        "v": [1, 2, 3, 4, 5, 6],
+    })
+    s = CompaniesStore(str(tmp_path), "x", store_factory=lambda c: _TableStore(t))
+    rows = s.read("d", as_of=LATER, filters=None, columns=None, limit=None)
+    assert [r["v"] for r in rows] == [6, 3, 4, 1, 2, 5]  # None keys last; None known_at last
+    page = s.read("d", as_of=LATER, filters=None, columns=["v"], limit=4)
+    assert page == [{"v": 6}, {"v": 3}, {"v": 4}, {"v": 1}]
+
+
+ARROW_SECRET = "postgres:dbname=lake host=db user=lake_reader password=hunter2"
+
+
+@pytest.mark.parametrize("message", [f"cannot read {ARROW_SECRET}", "password=hunter2 rejected"])
+def test_an_arrow_error_naming_the_catalogue_is_withheld(tmp_path, message):
+    import pyarrow as pa
+
+    from myopenfund_mcp.companies.store import StoreBackendError
+
+    def factory(c):
+        raise pa.lib.ArrowInvalid(message)
+
+    s = CompaniesStore(str(tmp_path), ARROW_SECRET, store_factory=factory)
+    with pytest.raises(StoreBackendError) as info:
+        s.freshness()
+    assert "hunter2" not in str(info.value) and "lake_reader" not in str(info.value)
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+
+
+def test_a_plain_arrow_error_is_a_backend_fault_not_a_bad_argument(tmp_path):
+    import pyarrow as pa
+
+    class Broken(_TableStore):
+        def read_asof(self, dataset, as_of, *, filters=None, vintages=False):
+            raise pa.lib.ArrowInvalid("Parquet magic bytes not found")
+
+    opened = []
+
+    def factory(c):
+        opened.append(1)
+        return Broken(pa.table({"k": ["a"], "known_at": [LATER]}))
+
+    s = CompaniesStore(str(tmp_path), "x", store_factory=factory)
+    with pytest.raises(pa.lib.ArrowInvalid) as info:
+        s.read("d", as_of=LATER, filters=None, columns=None, limit=None)
+    assert not isinstance(info.value, StoreBadArgument)
+    assert s._store is None                              # discarded: the next call reopens
+    with pytest.raises(pa.lib.ArrowInvalid):
+        s.read("d", as_of=LATER, filters=None, columns=None, limit=None)
+    assert len(opened) == 2
+
+
+@pytest.mark.parametrize("error", [ValueError("inconsistent units in stored facts"),
+                                   "duckdb-data-error"])
+def test_a_selection_failure_is_not_the_callers(store, monkeypatch, error):
+    import duckdb
+    from company_corpus.concepts import selection
+
+    def boom(facts, positions):
+        raise duckdb.ConversionException("Could not convert") if error == "duckdb-data-error" else error
+
+    monkeypatch.setattr(selection, "run_selection", boom)
+    with pytest.raises(Exception) as info:
+        store.concept_rows(AAPL, LATER)
+    assert not isinstance(info.value, StoreBadArgument)
+
+
+def test_an_argument_value_error_naming_the_catalogue_is_withheld(tmp_path):
+    from myopenfund_mcp.companies.store import StoreBackendError
+
+    def factory(c):
+        raise ValueError(f"bad option in {ARROW_SECRET}")
+
+    s = CompaniesStore(str(tmp_path), ARROW_SECRET, store_factory=factory)
+    with pytest.raises(StoreBackendError) as info:
+        s.freshness()
+    assert "hunter2" not in str(info.value)
+
+
+def test_missing_company_corpus_is_an_import_error_at_construction(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "company_corpus.concepts.store_summaries", None)
+    with pytest.raises(ImportError):
+        CompaniesStore(str(tmp_path), "x")
