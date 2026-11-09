@@ -151,7 +151,8 @@ async def test_runs_status_values_are_json_safe():
 async def test_server_info_reports_toolsets_tier_and_freshness():
     async with _client() as c:
         info = (await c.call_tool("server_info", {})).data
-    assert info["toolsets"] == {"vault": "enabled", "rag": "not configured", "companies": "not configured"}
+    assert info["toolsets"] == {"vault": "enabled", "rag": "not configured", "companies": "not configured",
+                                "datasets": "not configured"}
     assert info["tier"] == "act"  # stdio: local user
     assert info["version"]
     assert info["freshness"]["live_documents"] == 4

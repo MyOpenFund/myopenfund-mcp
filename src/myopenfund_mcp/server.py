@@ -21,6 +21,8 @@ log = logging.getLogger("myopenfund_mcp.server")
 
 MISSING_VAULT_EXTRA = ("MOF_VAULT_DATABASE_URL is set but the [vault] extra is not installed: "
                        "pip install 'myopenfund-mcp[vault]'")
+MISSING_COMPANIES_EXTRA = ("MOF_COMPANIES_CATALOG is set but the [companies] extra is not installed: "
+                           "pip install 'myopenfund-mcp[companies]'")
 
 INSTRUCTIONS = (
     "MyOpenFund: official primary sources only (central banks today; company filings next). "
@@ -29,7 +31,7 @@ INSTRUCTIONS = (
 )
 
 
-def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
+def build_server(settings: Settings, *, vault_reader=None, companies_store=None) -> FastMCP:
     auth_enabled = settings.transport == "http"
     if auth_enabled and not settings.tokens:
         raise ConfigError(
@@ -60,18 +62,41 @@ def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
         root.mount(build_vault_toolset(vault_reader, settings, auth_enabled=auth_enabled), namespace="vault")
         register_vault_resources(root, vault_reader, settings, auth_enabled=auth_enabled)
 
+    if companies_store is None and settings.companies_catalog:
+        # Same rule as the vault: configured but not installed refuses to start.
+        try:
+            from .companies.store import CompaniesStore
+
+            companies_store = CompaniesStore(settings.companies_data_root, settings.companies_catalog,
+                                             max_concurrency=settings.companies_max_concurrency)
+        except ImportError:
+            companies_store = None
+        if companies_store is None:
+            raise ConfigError(MISSING_COMPANIES_EXTRA)
+    if companies_store is not None:
+        from .companies.common import dict_to_utc
+        from .companies.datasets import build_datasets_toolset
+
+        root.mount(build_datasets_toolset(companies_store, settings, auth_enabled=auth_enabled),
+                   namespace="datasets")
+        # the companies toolset (same store) is mounted here in Task C4
+
+    companies_status = "enabled" if companies_store is not None else "not configured"
+
     # Open to any authenticated caller (no tier check): it is how a client learns its tier.
     @root.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
     async def server_info() -> dict:
         """What this deployment offers: enabled toolsets, your tier, version, data freshness.
 
         If the vault cannot be read, `freshness` is null and `freshness_error` says why; the rest still answers.
+        With the company store: `companies_freshness` (last publication, UTC; batch count), or
+        `companies_freshness_error` if the store cannot be read.
         """
         info = {
             "version": __version__,
             "tier": caller_tier(get_access_token(), auth_enabled=auth_enabled),
             "toolsets": {"vault": "enabled" if vault_reader is not None else "not configured",
-                         "rag": "not configured", "companies": "not configured"},
+                         "rag": "not configured", "companies": companies_status, "datasets": companies_status},
             "freshness": None,
         }
         if vault_reader is not None:
@@ -81,6 +106,15 @@ def build_server(settings: Settings, *, vault_reader=None) -> FastMCP:
                 # The class only: an exception's text can hold the DSN.
                 log.warning("server_info: freshness read failed (%s)", type(exc).__name__)
                 info["freshness_error"] = BACKEND_UNAVAILABLE
+        if companies_store is not None:
+            try:
+                with anyio.fail_after(settings.companies_query_timeout_s):
+                    fresh = await anyio.to_thread.run_sync(partial(companies_store.freshness),
+                                                           abandon_on_cancel=True)
+                info["companies_freshness"] = jsonable(dict_to_utc(fresh))
+            except Exception as exc:  # noqa: BLE001 -- an outage (or a timeout) must not hide the rest
+                log.warning("server_info: companies freshness read failed (%s)", type(exc).__name__)
+                info["companies_freshness_error"] = BACKEND_UNAVAILABLE
         return info
 
     # HTTP only: an unauthenticated liveness probe for load balancers and the image HEALTHCHECK.
