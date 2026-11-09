@@ -30,7 +30,7 @@ packages = ["src/myopenfund_mcp"]
 
 [tool.pytest.ini_options]
 markers = [
-  "integration: needs a real vault database (MOF_MCP_IT_DATABASE_URL)",
+  "integration: needs a real vault database (MOF_MCP_IT_DATABASE_URL) or a real company store (MOF_MCP_IT_COMPANIES_CATALOG + MOF_MCP_IT_COMPANIES_DATA_ROOT)",
   "llm: needs a local Ollama (MOF_MCP_IT_OLLAMA_URL)",
 ]
 addopts = "-m 'not integration and not llm'"
