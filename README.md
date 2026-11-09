@@ -171,6 +171,12 @@ extra is not installed`). Timestamps in results are UTC: the server's database s
 If the vault database is down, `server_info` still answers (version, tier, toolsets) with `freshness`
 null and `"freshness_error": "backend_unavailable"`; the server log names the exception class only.
 
+### Companies and datasets
+
+The `companies_*` and `datasets_*` tools (read-only, over the published my-open-data store) exist only when
+`MOF_COMPANIES_CATALOG` and `MOF_COMPANIES_DATA_ROOT` are set; the `[companies]` extra must then be installed
+(`pip install ".[vault,companies]"`). Tool list: to be filled in with the tools.
+
 ## Errors
 
 Tool errors are MCP tool errors whose message starts with a stable code, `[code] message`, so agents can
@@ -227,6 +233,11 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_MCP_MAX_RESULT_CHARS` | `200000` | Largest tool result in characters (at least 1000); larger results are refused. The cap measures the result's text block (compact JSON); the protocol also carries the same data as structured content, so a response on the wire is roughly twice that size. |
 | `MOF_MCP_MAX_ERROR_SAMPLES` | `5` | Error samples kept per row of `vault_runs_status`. |
 | `MOF_MCP_MAX_TEXT_CHARS` | `2000` | Each error text in `vault_runs_status` is cut to this length. |
+| `MOF_COMPANIES_CATALOG` | unset | my-open-data catalogue connection string as the read-only `lake_reader` role (`postgres:dbname=<db> host=<host> port=5432 user=lake_reader password=<password>`); unset = no companies or datasets toolsets. Needs `MOF_COMPANIES_DATA_ROOT` too. |
+| `MOF_COMPANIES_DATA_ROOT` | unset | Folder holding `lake/` as this host sees it; read-only is enough. Needs `MOF_COMPANIES_CATALOG` too. |
+| `MOF_COMPANIES_QUERY_TIMEOUT_S` | `20` | Seconds before a store call stops waiting (1-3600). |
+| `MOF_COMPANIES_MAX_COMPANIES` | `10` | Most companies a single call may name (1-100). |
+| `MOF_COMPANIES_MAX_CONCURRENCY` | `2` | Store reads running at once (1-16); a read that hit its time budget keeps its slot until it ends. |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

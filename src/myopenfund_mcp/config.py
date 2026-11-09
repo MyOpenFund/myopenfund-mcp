@@ -59,6 +59,12 @@ class Settings:
     max_result_chars: int = 200_000  # MOF_MCP_MAX_RESULT_CHARS: larger results are refused, not cut
     max_error_samples: int = 5  # MOF_MCP_MAX_ERROR_SAMPLES: error samples kept per runs_status row
     max_text_chars: int = 2000  # MOF_MCP_MAX_TEXT_CHARS: each error text cut to this length
+    # MOF_COMPANIES_CATALOG: my-open-data catalogue as lake_reader; unset = no companies/datasets toolsets
+    companies_catalog: str | None = field(default=None, repr=False)
+    companies_data_root: str | None = None  # MOF_COMPANIES_DATA_ROOT: where this host sees the store files
+    companies_query_timeout_s: int = 20  # MOF_COMPANIES_QUERY_TIMEOUT_S: time budget per store call
+    companies_max_companies: int = 10  # MOF_COMPANIES_MAX_COMPANIES: companies per call
+    companies_max_concurrency: int = 2  # MOF_COMPANIES_MAX_CONCURRENCY: store reads running at once
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -82,7 +88,15 @@ class Settings:
             max_result_chars=_int(env, "MOF_MCP_MAX_RESULT_CHARS", 200_000, minimum=1_000),
             max_error_samples=_int(env, "MOF_MCP_MAX_ERROR_SAMPLES", 5),
             max_text_chars=_int(env, "MOF_MCP_MAX_TEXT_CHARS", 2000),
+            companies_catalog=_get(env, "MOF_COMPANIES_CATALOG"),
+            companies_data_root=_get(env, "MOF_COMPANIES_DATA_ROOT"),
+            companies_query_timeout_s=_int(env, "MOF_COMPANIES_QUERY_TIMEOUT_S", 20, maximum=3600),
+            companies_max_companies=_int(env, "MOF_COMPANIES_MAX_COMPANIES", 10, maximum=100),
+            companies_max_concurrency=_int(env, "MOF_COMPANIES_MAX_CONCURRENCY", 2, maximum=16),
         )
+        if bool(settings.companies_catalog) != bool(settings.companies_data_root):
+            missing = "MOF_COMPANIES_DATA_ROOT" if settings.companies_catalog else "MOF_COMPANIES_CATALOG"
+            raise ConfigError(f"{missing} is required with the other MOF_COMPANIES_* store variable")
         if not settings.path.startswith("/"):
             raise ConfigError(f"MOF_MCP_PATH must start with '/', got {settings.path!r}")
         if settings.default_rows > settings.max_rows:
