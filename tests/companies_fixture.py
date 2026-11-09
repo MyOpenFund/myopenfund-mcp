@@ -6,7 +6,8 @@ Adversarial on purpose (no perfect-world fixture):
 - NatWest (IFRS filer) has entity rows but no fundamentals at all;
 - APPLE HOSPITALITY REIT shares the "APPLE" substring with Apple, without any fact;
 - JPMorgan is a bank (Revenues, no positions, no gross profit), with a quarterly fact;
-- ticker rows have no name, and Apple has two names over time.
+- Apple's ticker row has no name, JPMorgan's repeats the current name (as production ticker
+  rows may), and Apple has two names over time.
 """
 from __future__ import annotations
 
@@ -65,7 +66,7 @@ def seed(tmp_path) -> StoreConfig:
         obs(AAPL, "ticker", "AAPL", valid=date(2026, 11, 2)),
         obs(APPLE_LIKE, "cik", APPLE_LIKE, "APPLE HOSPITALITY REIT INC", date(2015, 1, 1)),
         obs(JPM, "cik", JPM, "JPMORGAN CHASE & CO", date(2005, 1, 1)),
-        obs(JPM, "ticker", "JPM", valid=date(2026, 11, 2)),
+        obs(JPM, "ticker", "JPM", "JPMORGAN CHASE & CO", valid=date(2026, 11, 2)),
         obs(NWG, "cik", NWG, "NatWest Group plc", date(2020, 7, 22), country="GB"),
         obs(NWG, "ticker", "NWG", valid=date(2026, 11, 2)),
     ], schema=ENTITY_OBSERVATIONS.schema), landing_root=land, run_id="r1", producer="test",

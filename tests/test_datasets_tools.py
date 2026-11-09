@@ -37,7 +37,8 @@ async def test_tools_listed_read_only(store):
         tools = {t.name: t for t in await c.list_tools()}
     for n in ("datasets_list", "datasets_describe", "datasets_read_asof"):
         assert tools[n].annotations.read_only_hint is True
-    assert not any(n.startswith("companies_") for n in tools)  # mounted in C4
+    for n in ("companies_resolve", "companies_facts", "companies_fundamentals"):
+        assert tools[n].annotations.read_only_hint is True
 
 
 async def test_list_and_describe(store):
@@ -175,6 +176,16 @@ def test_rows_to_utc_converts_aware_datetimes_only():
     assert out[0]["d"] == dt.date(2025, 1, 1) and out[0]["n"] == dt.datetime(2025, 1, 1)
     assert out[0]["s"] == "x" and out[0]["v"] is None
     assert rows[0]["t"].tzinfo == paris  # input untouched
+
+
+def test_rows_to_utc_is_recursive():
+    paris = dt.timezone(dt.timedelta(hours=1))
+    t = dt.datetime(2025, 1, 1, 1, tzinfo=paris)
+    rows = [{"nested": {"t": t, "l": [t, {"t": t}]}, "tuple": (t,)}]
+    out = rows_to_utc(rows)[0]
+    for v in (out["nested"]["t"], out["nested"]["l"][0], out["nested"]["l"][1]["t"], out["tuple"][0]):
+        assert v.tzinfo == dt.UTC and v == t
+    assert rows[0]["nested"]["t"].tzinfo == paris and rows[0]["nested"]["l"][1]["t"].tzinfo == paris
 
 
 async def test_store_call_maps_errors():

@@ -10,7 +10,8 @@ def _when(row: dict) -> str:
 
 
 def index(entities: list[dict]) -> dict[str, dict]:
-    """Entities keyed by CIK (subject_value): names oldest first, current name, tickers, country."""
+    """Entities keyed by CIK (subject_value): names oldest first (consecutive repeats once, `since` = first
+    seen), current name, tickers, country."""
     out: dict[str, dict[str, Any]] = {}
     for row in sorted(entities, key=lambda r: (_when(r), str(r.get("name") or ""), str(r.get("id_value") or ""))):
         cik = row["subject_value"]
@@ -18,7 +19,9 @@ def index(entities: list[dict]) -> dict[str, dict]:
                                  "current_name": None, "tickers": [], "country": None})
         if e["entity_id"] is None:
             e["entity_id"] = row.get("entity_id")
-        if row.get("name"):
+        # A name observed again (ticker rows may repeat the current name) is not a new name;
+        # a name used again after another one is (A, B, A).
+        if row.get("name") and row["name"] != e["current_name"]:
             e["names"].append({"name": row["name"], "since": row.get("valid_date")})
             e["current_name"] = row["name"]
         if row.get("country"):
@@ -38,7 +41,7 @@ def resolve(idx: dict[str, dict], query: str) -> list[dict]:
     if not q:
         return []
     if q.isdigit():
-        hit = idx.get(q.zfill(10))
+        hit = idx.get(q.lstrip("0").zfill(10))  # "320193", "0000320193", "000000320193"
         return [hit] if hit else []
     folded = q.casefold()
     for match in (lambda e: any(t.casefold() == folded for t in e["tickers"]),

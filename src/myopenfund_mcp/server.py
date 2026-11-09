@@ -76,10 +76,12 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None)
     if companies_store is not None:
         from .companies.common import dict_to_utc
         from .companies.datasets import build_datasets_toolset
+        from .companies.tools import build_companies_toolset
 
         root.mount(build_datasets_toolset(companies_store, settings, auth_enabled=auth_enabled),
                    namespace="datasets")
-        # the companies toolset (same store) is mounted here in Task C4
+        root.mount(build_companies_toolset(companies_store, settings, auth_enabled=auth_enabled),
+                   namespace="companies")
 
     companies_status = "enabled" if companies_store is not None else "not configured"
 
