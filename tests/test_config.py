@@ -113,3 +113,22 @@ def test_from_env_without_argument_reads_os_environ(monkeypatch):
 def test_connect_timeout_bounds_are_inclusive():
     assert Settings.from_env({"MOF_MCP_CONNECT_TIMEOUT_S": "2"}).connect_timeout_s == 2
     assert Settings.from_env({"MOF_MCP_CONNECT_TIMEOUT_S": "300"}).connect_timeout_s == 300
+
+
+def test_companies_settings_from_env():
+    s = Settings.from_env({"MOF_COMPANIES_CATALOG": "postgres:dbname=lake_catalog host=h user=lake_reader password=p",
+                           "MOF_COMPANIES_DATA_ROOT": "/data/my_open_data",
+                           "MOF_COMPANIES_MAX_COMPANIES": "5"})
+    assert s.companies_data_root == "/data/my_open_data" and s.companies_max_companies == 5
+    assert s.companies_query_timeout_s == 20 and s.companies_max_concurrency == 2
+    assert "password" not in repr(s)
+
+
+def test_companies_catalog_needs_a_data_root():
+    with pytest.raises(ConfigError, match="MOF_COMPANIES_DATA_ROOT"):
+        Settings.from_env({"MOF_COMPANIES_CATALOG": "x"})
+
+
+def test_companies_data_root_alone_is_refused():
+    with pytest.raises(ConfigError, match="MOF_COMPANIES_CATALOG"):
+        Settings.from_env({"MOF_COMPANIES_DATA_ROOT": "/d"})

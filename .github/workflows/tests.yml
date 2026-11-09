@@ -18,6 +18,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - run: pip install -e ".[vault,dev]"
+      - run: pip install -e ".[vault,companies,dev]"
       - run: ruff check .
       - run: python -m pytest -q

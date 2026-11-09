@@ -171,6 +171,43 @@ extra is not installed`). Timestamps in results are UTC: the server's database s
 If the vault database is down, `server_info` still answers (version, tier, toolsets) with `freshness`
 null and `"freshness_error": "backend_unavailable"`; the server log names the exception class only.
 
+### Companies and datasets
+
+The `companies_*` and `datasets_*` tools (read-only, over the published my-open-data store) exist only when
+`MOF_COMPANIES_CATALOG` and `MOF_COMPANIES_DATA_ROOT` are set; the `[companies]` extra must then be installed
+(from a checkout, `pip install ".[vault,companies]"`, or from the git URL,
+`pip install "myopenfund-mcp[companies] @ git+https://github.com/MyOpenFund/myopenfund-mcp"`; the extra pins two
+git dependencies, so git must be available). The
+store is read-only (as the `lake_reader` role); nothing is ever written. Configuration:
+`MOF_COMPANIES_CATALOG`, `MOF_COMPANIES_DATA_ROOT`, `MOF_COMPANIES_QUERY_TIMEOUT_S`,
+`MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY` (see [Configuration and limits](#configuration-and-limits)).
+
+| Tool | What it does |
+|---|---|
+| `companies_resolve` | Find companies by name (former names too), ticker, CIK or entity id; returns candidates. |
+| `companies_facts` | Raw reported facts of up to `MOF_COMPANIES_MAX_COMPANIES` companies, as filed, with filing reference and provenance. |
+| `companies_fundamentals` | Standardised concepts and ratios per company and period, with their provenance. |
+| `datasets_list` | The datasets the store publishes: name, version, kind, licence, row estimate. |
+| `datasets_describe` | Columns (type, allowed values, doc), natural key and licence of one dataset. |
+| `datasets_read_asof` | Rows of a dataset as known at `as_of`, with structured filters (no free SQL), paged with `next_cursor`. |
+| `datasets_export_csv` | The same rows as CSV text to save or paste; refused, never cut, above `MOF_MCP_MAX_RESULT_CHARS`. |
+
+- **Point in time.** Company data is bitemporal: `as_of` (a timestamp, default now; a value without an
+  offset is read as UTC) returns what was publicly known at that moment, so a restatement filed later
+  does not leak into an earlier view. Results echo the `as_of` used. Datetimes are UTC.
+- **Concepts and ratios are company-corpus's.** The server computes none: it calls company-corpus for the
+  concept catalogue and the ratios. The one quarterly derivation, TTM, is company-corpus's too: it takes Q4 as
+  FY minus (Q1 + Q2 + Q3), computed from the store's own values, not by this server.
+- **`frequency`.** In `companies_fundamentals`, `annual`, `quarterly` and `semiannual` also return the
+  balance-sheet values (frequency `instant`) dated at the ends of the included periods, as the ratios use
+  them; `instant` alone returns balance-sheet values only. In `companies_facts`, `frequency` filters the
+  filed column as it is (raw).
+- **Sector unknown.** There is no SIC classification yet: `sector_relevant` is null on the
+  sector-sensitive ratios and true on the others.
+- **CSV.** `datasets_export_csv` takes the same arguments as `datasets_read_asof`; decimals are written
+  exactly (a column's decimals share the widest scale, so `1.5` can appear as `1.500000`). With no rows, the
+  header alone if `columns` is given, else an empty string.
+
 ## Errors
 
 Tool errors are MCP tool errors whose message starts with a stable code, `[code] message`, so agents can
@@ -178,14 +215,21 @@ branch on the code and show the message.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses. | Fix the argument; pass `next_cursor` unchanged. |
+| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses; for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics. | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
-| `timeout` | The vault query exceeded `MOF_MCP_QUERY_TIMEOUT_S` (cancelled by Postgres). | Narrow the filters. |
-| `backend_unavailable` | The vault database is unreachable or refused the query. | Retry later; check the deployment. |
+| `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
+| `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
 | `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit`. |
+| `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
+| `unknown_company` | No company matches the reference. | Use `companies_resolve`. |
+| `unknown_concept` | A concept key is not in the catalogue. | The message lists valid keys. |
+| `unknown_metric` | A ratio key is not in the catalogue. | The message lists valid keys. |
+| `unknown_dataset` | No dataset with that name. | Names come from `datasets_list`. |
+| `unknown_column` | A filter or column is not in the dataset. | Columns come from `datasets_describe`. |
+| `too_many_companies` | More companies than `MOF_COMPANIES_MAX_COMPANIES`. | Split the request. |
 
-Arguments that do not match a tool's input schema (wrong type, string too long) are refused by schema
-validation before the tool runs. An unexpected internal failure reaches the client as a generic error
+Arguments that do not match a tool's input schema (wrong type, string too long, e.g. an over-long company
+id) are rejected by the MCP framework before a tool runs, without a `[code]`. An unexpected internal failure reaches the client as a generic error
 without details (they may hold connection strings); the server log has the rest. Over HTTP, a missing or
 unknown token is rejected with HTTP `401` before any tool runs.
 
@@ -227,6 +271,11 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_MCP_MAX_RESULT_CHARS` | `200000` | Largest tool result in characters (at least 1000); larger results are refused. The cap measures the result's text block (compact JSON); the protocol also carries the same data as structured content, so a response on the wire is roughly twice that size. |
 | `MOF_MCP_MAX_ERROR_SAMPLES` | `5` | Error samples kept per row of `vault_runs_status`. |
 | `MOF_MCP_MAX_TEXT_CHARS` | `2000` | Each error text in `vault_runs_status` is cut to this length. |
+| `MOF_COMPANIES_CATALOG` | unset | my-open-data catalogue connection string as the read-only `lake_reader` role (`postgres:dbname=<db> host=<host> port=5432 user=lake_reader password=<password>`); unset = no companies or datasets toolsets. Needs `MOF_COMPANIES_DATA_ROOT` too. |
+| `MOF_COMPANIES_DATA_ROOT` | unset | Folder holding `lake/` as this host sees it; read-only is enough. Needs `MOF_COMPANIES_CATALOG` too. |
+| `MOF_COMPANIES_QUERY_TIMEOUT_S` | `20` | Seconds before a store call stops waiting (1-3600). |
+| `MOF_COMPANIES_MAX_COMPANIES` | `10` | Most companies a single call may name (1-100). |
+| `MOF_COMPANIES_MAX_CONCURRENCY` | `2` | Store reads running at once (1-16); a read abandoned at its time budget keeps its slot until it ends, so the next callers may also get `[timeout]` for a while. |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the
@@ -263,6 +312,7 @@ The default test run needs no database, network or model. Opt-in suites are excl
 with an explicit marker:
 
 - `pytest -m integration`: against a real vault database, with `MOF_MCP_IT_DATABASE_URL` set.
+- `pytest -m integration tests/integration/test_real_store.py`: against a real company store, with `MOF_MCP_IT_COMPANIES_CATALOG` and `MOF_MCP_IT_COMPANIES_DATA_ROOT` set (optional: `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, default 120; `MOF_MCP_IT_ASSERT_LATENCY=1` to enforce the 5 s criterion, on the NAS only; add `-s` or `-rP` to see the printed fundamentals latency).
 - `pytest -m llm`: a scripted session with a local model, with `MOF_MCP_IT_OLLAMA_URL` set.
 
 Build the image with `docker build -t myopenfund-mcp .`; `docker run --rm myopenfund-mcp myopenfund-mcp

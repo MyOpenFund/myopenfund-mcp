@@ -29,8 +29,12 @@ FIELDS = {
     "MOF_MCP_DEFAULT_ROWS": "default_rows", "MOF_MCP_MAX_ROWS": "max_rows",
     "MOF_MCP_MAX_RESULT_CHARS": "max_result_chars", "MOF_MCP_MAX_ERROR_SAMPLES": "max_error_samples",
     "MOF_MCP_MAX_TEXT_CHARS": "max_text_chars",
+    "MOF_COMPANIES_CATALOG": "companies_catalog", "MOF_COMPANIES_DATA_ROOT": "companies_data_root",
+    "MOF_COMPANIES_QUERY_TIMEOUT_S": "companies_query_timeout_s",
+    "MOF_COMPANIES_MAX_COMPANIES": "companies_max_companies",
+    "MOF_COMPANIES_MAX_CONCURRENCY": "companies_max_concurrency",
 }
-COMMENTED = re.findall(r"^# (MOF_[A-Z_]+)=(\S+)$", ENV_EXAMPLE, re.MULTILINE)
+COMMENTED = re.findall(r"^# (MOF_[A-Z_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
 
 
 def test_every_env_example_variable_is_read_by_the_server():
