@@ -35,7 +35,12 @@ def test_entities_carry_names_and_tickers(store):
 
 
 def test_entities_are_cached_until_a_new_batch(store):
-    assert store.entities() is store.entities()
+    first = store.entities()
+    cached = store._entities[1]
+    assert store.entities() == first and store._entities[1] is cached  # no re-read
+    store._entities = (-1, cached)                                    # batches changed
+    store.entities()
+    assert store._entities[1] is not cached                          # re-read
 
 
 def _rev(store, as_of):
@@ -224,3 +229,126 @@ def test_concurrency_is_bounded(tmp_path):
     for t in threads:
         t.join(5)
     assert len(inside) == 2
+
+
+# --- fix round 1: argument validation before the query, deep scrubbing ---
+
+@pytest.mark.parametrize("filters", [
+    {"valid_date": ["not-a-date"]},
+    {"value": ["abc"]},
+    {"valid_date": [[1, 2]]},
+    {"known_at": ["2025-01-01T00:00:00"]},   # naive timestamp
+    {"value": [True]},
+    {"value": [float("nan")]},
+    {"entity_value": [320193]},              # string column, int value
+    {"entity_value": [None]},
+    {"entity_value": [{"a": 1}]},
+])
+def test_wrong_typed_filter_values_are_bad_arguments_and_keep_the_store(store, filters):
+    store.freshness()
+    first = store._store
+    with pytest.raises(StoreBadArgument, match="filter"):
+        store.read("fundamentals", as_of=LATER, filters=filters, columns=None, limit=None)
+    assert store._store is first
+
+
+def test_filters_accept_iso_strings_and_numeric_strings(store):
+    by_str = store.read("fundamentals", as_of=LATER,
+                        filters={"valid_date": "2024-09-28", "value": ["391036000000"],
+                                 "known_at": ["2025-10-31T20:00:00+00:00"]},
+                        columns=["entity_value", "value"], limit=None)
+    assert by_str == [{"entity_value": AAPL, "value": 391036000000}]
+
+
+def test_filters_on_publisher_columns(store):
+    eid = store.read("fundamentals", as_of=LATER, filters={"entity_value": AAPL},
+                     columns=["entity_id"], limit=1)[0]["entity_id"]
+    rows = store.read("fundamentals", as_of=LATER, filters={"entity_id": [eid]},
+                      columns=["entity_value"], limit=None)
+    assert {r["entity_value"] for r in rows} == {AAPL}
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"filters": {"nope": ["x"]}},
+    {"filters": ["entity_value"]},
+    {"columns": "value"},
+    {"columns": ["nope"]},
+])
+def test_names_and_shapes_are_checked_before_the_query(store, kwargs):
+    args = {"filters": None, "columns": None, "limit": None, **kwargs}
+    with pytest.raises(StoreBadArgument):
+        store.read("fundamentals", as_of=LATER, **args)
+
+
+def test_a_duckdb_data_error_is_a_bad_argument_without_discarding(store):
+    import duckdb
+
+    store.freshness()
+    first = store._store
+
+    def boom(s):
+        raise duckdb.ConversionException("Could not convert string 'x' to DATE")
+
+    with pytest.raises(StoreBadArgument, match="^a filter value does not match its column type$"):
+        store._run(boom)
+    assert store._store is first
+
+
+def test_concept_rows_reject_a_non_string_cik(store):
+    with pytest.raises(StoreBadArgument):
+        store.concept_rows(320193, LATER)
+
+
+def test_entities_cannot_be_mutated_by_callers(store):
+    store.entities()[0]["name"] = "tampered"
+    store.entities().clear()
+    assert store.entities() and "tampered" not in {r["name"] for r in store.entities()}
+
+
+SECRET = "postgres:dbname=lake host=db user=lake_reader password=hunter2"
+
+
+@pytest.mark.parametrize("make", [
+    lambda: _chained(RuntimeError("boom"), RuntimeError(f"ATTACH {SECRET}")),
+    lambda: RuntimeError("auth failed for password hunter2"),
+    lambda: RuntimeError("x", {"dsn": SECRET}),
+    lambda: _context(RuntimeError("outer"), OSError("password=hunter2 rejected")),
+])
+def test_scrubbing_walks_the_whole_chain(tmp_path, make):
+    def factory(c):
+        raise make()
+
+    s = CompaniesStore(str(tmp_path), SECRET, store_factory=factory)
+    with pytest.raises(Exception) as info:
+        s.freshness()
+    from myopenfund_mcp.companies.store import StoreBackendError
+
+    assert type(info.value) is StoreBackendError
+    assert "hunter2" not in str(info.value) and info.value.__cause__ is None
+    assert info.value.__suppress_context__
+
+
+def test_an_unrelated_backend_error_propagates_unchanged(tmp_path):
+    def factory(c):
+        raise _chained(RuntimeError("boom"), OSError("connection refused"))
+
+    s = CompaniesStore(str(tmp_path), SECRET, store_factory=factory)
+    with pytest.raises(RuntimeError, match="^boom$"):
+        s.freshness()
+
+
+def _chained(outer, cause):
+    try:
+        raise outer from cause
+    except Exception as exc:  # noqa: BLE001
+        return exc
+
+
+def _context(outer, inner):
+    try:
+        try:
+            raise inner
+        except Exception:  # noqa: BLE001
+            raise outer  # implicit __context__ on purpose
+    except Exception as exc:  # noqa: BLE001
+        return exc
