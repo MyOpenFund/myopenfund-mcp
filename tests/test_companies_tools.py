@@ -103,7 +103,7 @@ async def test_facts_rows_shape_sort_and_utc(store):
     assert [k[0] for k in keys] == sorted(k[0] for k in keys)  # by cik first
     aapl = [r["valid_date"] for r in rows if r["cik"] == AAPL]
     assert aapl == sorted(aapl, reverse=True)  # newest period first
-    assert res["total"] == len(rows) == 9 and res["returned"] == 9
+    assert res["total"] == len(rows) == 10 and res["returned"] == 10
 
 
 async def test_facts_frequency_period_and_paging(store):
@@ -145,7 +145,8 @@ async def test_fundamentals_concepts_and_metrics(store):
                        "ttm", "sector_relevant"}
     assert nm["ttm"] is False and nm["unit"] == "%" and abs(nm["value"] - 23.97) < 0.01
     assert next(r for r in res["rows"] if r["key"] == "net_margin_ttm")["ttm"] is True
-    assert res["sector"].startswith("unknown") and res["dictionary_version"] == "1.0.0"
+    # the dictionary version company-corpus 43a27ed ships
+    assert res["sector"].startswith("unknown") and res["dictionary_version"] == "2.0.0"
 
 
 async def test_fundamentals_sort_concepts_before_metrics_newest_first(store):
@@ -402,3 +403,29 @@ def test_server_passes_the_configured_q4_rule_to_the_store(tmp_path, monkeypatch
     build_server(Settings(companies_catalog="x", companies_data_root=str(tmp_path),
                           companies_q4_rule="sum_of_quarters"))
     assert made and made[0]["q4_rule"] == "sum_of_quarters"
+
+
+async def test_facts_return_the_nine_month_row_as_filed(store):
+    # fundamentals 3.1.0 stores 9-month year-to-date facts as 'ytd9'; facts expose them raw
+    res = await _call(store, "companies_facts", {"companies": [JPM], "frequency": "ytd9"})
+    assert [(r["frequency"], r["valid_date"], r["original_tag"], r["value"]) for r in res["rows"]] == [
+        ("ytd9", "2025-09-30", "us-gaap:Revenues", 135000000000)]
+
+
+async def test_facts_without_frequency_include_the_nine_month_row(store):
+    res = await _call(store, "companies_facts", {"companies": [JPM]})
+    assert "ytd9" in {r["frequency"] for r in res["rows"]}
+
+
+async def test_fundamentals_never_output_a_nine_month_row(store):
+    for args in ({"companies": [JPM]}, {"companies": [JPM], "metrics": "all"},
+                 {"companies": [JPM], "concepts": ["revenue"], "metrics": "all"}):
+        res = await _call(store, "companies_fundamentals", args)
+        assert res["rows"] and "ytd9" not in {r["frequency"] for r in res["rows"]}
+
+
+async def test_fundamentals_have_no_nine_month_periods(store):
+    # 9-month values only derive an unreported Q4 (as in company-corpus); asking for them is refused
+    async with _client(store) as c:
+        with pytest.raises(ToolError):
+            await c.call_tool("companies_fundamentals", {"companies": [AAPL], "frequency": "ytd9"})

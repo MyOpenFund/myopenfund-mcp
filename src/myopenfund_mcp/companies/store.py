@@ -409,9 +409,9 @@ class CompaniesStore:
         with self._slots:
             try:
                 # MOF_COMPANIES_Q4_RULE, default ytd9 = the rule of company-corpus's published outputs
-                # (an unreported Q4 = FY - 9-month YTD; summaries_from_rows itself defaults to
-                # sum_of_quarters). Without a 9-month row the TTM windows needing that Q4 are absent,
-                # never computed by the other rule.
+                # (an unreported Q4 = FY - 9-month YTD). The rule is passed explicitly so the
+                # server's setting, not the library default, decides. Without a 9-month row the TTM
+                # windows needing that Q4 are absent, never computed by the other rule.
                 return summaries_from_rows(rows, company=name or cik, sector_known=False,
                                            vintages=vintages, q4_rule=self._q4_rule)
             except ValueError as exc:

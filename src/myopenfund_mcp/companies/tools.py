@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 from functools import cache
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 
 from fastmcp import FastMCP
 from pydantic import Field
@@ -29,6 +29,10 @@ from . import resolve as res
 from .common import AS_OF_DESCRIPTION, READ_ONLY, parse_as_of, rows_to_utc, store_call, time_budget
 
 Frequency = Literal["annual", "semiannual", "quarterly", "instant"]
+#: as filed in the store; ytd9 = the 9-month year-to-date, which only derives an unreported Q4
+FactsFrequency = Literal[*get_args(Frequency), "ytd9"]
+#: stored frequencies that exist only to derive other values (TTM): never output by companies_fundamentals
+_DERIVATION_ONLY = frozenset({"ytd9"})
 SECTOR = ("unknown (SIC not in the store): sector_relevant is null for the ratios that depend on the "
           "sector (banks, insurers)")
 COMPANIES_DESCRIPTION = ("CIKs, tickers or entity_ids, at most the server maximum per call; with only a "
@@ -37,8 +41,8 @@ FUNDAMENTALS_FREQUENCY_DESCRIPTION = (
     "Period covered: annual/quarterly/semiannual include the balance-sheet values (frequency 'instant') "
     "dated at those period ends, as the ratios use them; 'instant' = balance-sheet values only; "
     "omitted = all")
-FACTS_FREQUENCY_DESCRIPTION = ("The fact's own period as filed (balance-sheet values are 'instant'); "
-                               "omitted = all")
+FACTS_FREQUENCY_DESCRIPTION = ("The fact's own period as filed (balance-sheet values are 'instant'; "
+                               "'ytd9' = 9-month year-to-date); omitted = all")
 MAX_QUERY_CHARS = 200
 #: one company identifier (CIK, ticker, entity_id); same bound as companies_resolve's query
 CompanyId = Annotated[str, Field(max_length=MAX_QUERY_CHARS)]
@@ -116,7 +120,7 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
         companies: Annotated[list[CompanyId], Field(description=COMPANIES_DESCRIPTION, min_length=1)],
         tags: Annotated[list[str] | None, Field(
             description="Tags as filed, 'namespace:Tag', e.g. 'us-gaap:Revenues'; omitted = all")] = None,
-        frequency: Annotated[Frequency | None, Field(description=FACTS_FREQUENCY_DESCRIPTION)] = None,
+        frequency: Annotated[FactsFrequency | None, Field(description=FACTS_FREQUENCY_DESCRIPTION)] = None,
         period_from: Annotated[dt.date | None, Field(description="Period end on or after, YYYY-MM-DD")] = None,
         period_to: Annotated[dt.date | None, Field(description="Period end on or before, YYYY-MM-DD")] = None,
         as_of: Annotated[dt.datetime | None, Field(description=AS_OF_DESCRIPTION)] = None,
@@ -191,7 +195,9 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
         when = parse_as_of(as_of)
 
         def keep(day, freq):  # a duration period (or, for frequency='instant', a balance-sheet date)
-            return (frequency is None or freq == frequency) and _in_range(day, period_from, period_to)
+            # output filter only: store.summaries below still receives the whole selection (ytd9 included)
+            return (freq not in _DERIVATION_ONLY and (frequency is None or freq == frequency)
+                    and _in_range(day, period_from, period_to))
 
         def keep_concept(r, period_ends):
             """F1's period model: a duration frequency brings the instants dated at its period ends."""

@@ -105,7 +105,7 @@ def test_concept_rows_give_revenue_and_vintages(store):
 def test_concept_rows_of_a_bank_without_positions(store):
     rows, vint = store.concept_rows(JPM, LATER)
     assert {r["concept"] for r in rows} >= {"revenue", "net_income"}
-    assert len(vint) == 4
+    assert len(vint) == 5
 
 
 def test_an_issuer_without_fundamentals_gives_no_rows(store):
