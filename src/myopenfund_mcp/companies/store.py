@@ -30,6 +30,8 @@ from decimal import Decimal, InvalidOperation
 from functools import cache
 from pathlib import Path
 
+from ..config import Q4_RULES
+
 
 class StoreUnknownDataset(LookupError):
     pass
@@ -194,11 +196,14 @@ def _open(cfg):
 
 class CompaniesStore:
     def __init__(self, data_root: str, catalog: str, *, max_concurrency: int = 2,
-                 store_factory=None):
+                 q4_rule: str = "ytd9", store_factory=None):
         # ImportError here = [companies] extra missing (my-open-data or company-corpus)
         import company_corpus.concepts.store_summaries  # noqa: F401
         from myopendata.config import StoreConfig
 
+        if q4_rule not in Q4_RULES:
+            raise ValueError(f"q4_rule must be one of {', '.join(Q4_RULES)}, got {q4_rule!r}")
+        self._q4_rule = q4_rule
         self._cfg = StoreConfig(data_root=Path(data_root), catalog=catalog)
         self._secrets = tuple(x for x in (catalog, _password(catalog)) if x)
         self._factory = store_factory or _open
@@ -403,9 +408,11 @@ class CompaniesStore:
 
         with self._slots:
             try:
-                # spec Q6: TTM Q4 = annual - Q1 - Q2 - Q3 (no 9-month YTD in the store), pinned explicitly
+                # MOF_COMPANIES_Q4_RULE, default ytd9 = company-corpus's own rule (Q4 = FY - 9-month
+                # YTD). Without a 9-month row for the year that quarter's TTM is absent, never
+                # replaced by the other rule.
                 return summaries_from_rows(rows, company=name or cik, sector_known=False,
-                                           vintages=vintages, q4_rule="sum_of_quarters")
+                                           vintages=vintages, q4_rule=self._q4_rule)
             except ValueError as exc:
                 if self._names_the_catalogue(exc):
                     raise self._withheld(exc) from None

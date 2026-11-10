@@ -16,6 +16,10 @@ class ConfigError(ValueError):
     pass
 
 
+# company-corpus's TTM Q4 rules (company_corpus.financials.Q4Rule)
+Q4_RULES = ("ytd9", "sum_of_quarters")
+
+
 def _get(env: Mapping[str, str], name: str) -> str | None:
     value = env.get(name)
     return None if value is None or value.strip() == "" else value.strip()
@@ -65,6 +69,9 @@ class Settings:
     companies_query_timeout_s: int = 20  # MOF_COMPANIES_QUERY_TIMEOUT_S: time budget per store call
     companies_max_companies: int = 10  # MOF_COMPANIES_MAX_COMPANIES: companies per call
     companies_max_concurrency: int = 2  # MOF_COMPANIES_MAX_CONCURRENCY: store reads running at once
+    # MOF_COMPANIES_Q4_RULE: how TTM derives Q4 — ytd9 (FY - 9-month YTD, company-corpus's rule) |
+    # sum_of_quarters (FY - Q1 - Q2 - Q3)
+    companies_q4_rule: str = "ytd9"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -93,7 +100,11 @@ class Settings:
             companies_query_timeout_s=_int(env, "MOF_COMPANIES_QUERY_TIMEOUT_S", 20, maximum=3600),
             companies_max_companies=_int(env, "MOF_COMPANIES_MAX_COMPANIES", 10, maximum=100),
             companies_max_concurrency=_int(env, "MOF_COMPANIES_MAX_CONCURRENCY", 2, maximum=16),
+            companies_q4_rule=_get(env, "MOF_COMPANIES_Q4_RULE") or "ytd9",
         )
+        if settings.companies_q4_rule not in Q4_RULES:
+            raise ConfigError(f"MOF_COMPANIES_Q4_RULE must be one of {', '.join(Q4_RULES)}, "
+                              f"got {settings.companies_q4_rule!r}")
         if bool(settings.companies_catalog) != bool(settings.companies_data_root):
             missing = "MOF_COMPANIES_DATA_ROOT" if settings.companies_catalog else "MOF_COMPANIES_CATALOG"
             raise ConfigError(f"{missing} is required with the other MOF_COMPANIES_* store variable")

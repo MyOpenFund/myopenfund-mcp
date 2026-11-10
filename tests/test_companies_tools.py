@@ -386,3 +386,19 @@ async def test_an_unpublished_dataset_reads_as_empty(empty_store):
 async def test_an_empty_store_gives_no_entities_and_no_concept_rows(empty_store):
     assert empty_store.entities() == []
     assert empty_store.concept_rows(AAPL, parse_as_of(None)) == ([], [])
+
+
+def test_server_passes_the_configured_q4_rule_to_the_store(tmp_path, monkeypatch):
+    import myopenfund_mcp.companies.store as store_mod
+
+    made = []
+
+    class Recording(store_mod.CompaniesStore):
+        def __init__(self, *args, **kwargs):
+            made.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(store_mod, "CompaniesStore", Recording)
+    build_server(Settings(companies_catalog="x", companies_data_root=str(tmp_path),
+                          companies_q4_rule="sum_of_quarters"))
+    assert made and made[0]["q4_rule"] == "sum_of_quarters"

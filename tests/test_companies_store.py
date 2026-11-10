@@ -649,3 +649,44 @@ def test_a_discard_mid_call_on_the_real_store(cfg):
     finally:
         go_on.set()
         s.close()
+
+
+def _spy_summaries(monkeypatch):
+    import company_corpus.concepts.store_summaries as mod
+
+    seen = []
+    real = mod.summaries_from_rows
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("q4_rule"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "summaries_from_rows", spy)
+    return seen
+
+
+def test_summaries_use_the_corpus_q4_rule_by_default(cfg, monkeypatch):
+    seen = _spy_summaries(monkeypatch)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    try:
+        rows, vint = s.concept_rows(AAPL, LATER)
+        s.summaries(AAPL, "Apple Inc.", rows, vint)
+    finally:
+        s.close()
+    assert seen == ["ytd9"]
+
+
+def test_summaries_use_the_configured_q4_rule(cfg, monkeypatch):
+    seen = _spy_summaries(monkeypatch)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog, q4_rule="sum_of_quarters")
+    try:
+        rows, vint = s.concept_rows(AAPL, LATER)
+        s.summaries(AAPL, "Apple Inc.", rows, vint)
+    finally:
+        s.close()
+    assert seen == ["sum_of_quarters"]
+
+
+def test_an_unknown_q4_rule_is_refused_at_construction(tmp_path):
+    with pytest.raises(ValueError, match="q4_rule"):
+        CompaniesStore(str(tmp_path), "x", q4_rule="annual")
