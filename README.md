@@ -178,7 +178,11 @@ The `companies_*` and `datasets_*` tools (read-only, over the published my-open-
 (from a checkout, `pip install ".[vault,companies]"`, or from the git URL,
 `pip install "myopenfund-mcp[companies] @ git+https://github.com/MyOpenFund/myopenfund-mcp"`; the extra pins two
 git dependencies, so git must be available). The
-store is read-only (as the `lake_reader` role); nothing is ever written. Configuration:
+store is read-only (as the `lake_reader` role); nothing is ever written. In a hardened container, DuckDB
+downloads and loads its `ducklake` and `postgres` extensions under `$HOME/.duckdb` at each start: `HOME` must be
+writable, a tmpfs holding it must allow exec (`/tmp:exec`), and the container needs outbound HTTPS to
+`extensions.duckdb.org`. The process must also be able to read the store's `lake/` files (my-open-data creates
+them `0700` for its own uid). Configuration:
 `MOF_COMPANIES_CATALOG`, `MOF_COMPANIES_DATA_ROOT`, `MOF_COMPANIES_QUERY_TIMEOUT_S`,
 `MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY` (see [Configuration and limits](#configuration-and-limits)).
 
