@@ -25,8 +25,8 @@ NOW = datetime(2026, 11, 9, 8, 0, tzinfo=UTC)
 AAPL, JPM, NWG, APPLE_LIKE = "0000320193", "0000019617", "0000844150", "0000999999"
 REV = "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
 AAPL_10K_2024, AAPL_10K_2025 = "0000320193-24-000123", "0000320193-25-000079"
-#: fundamentals rows latest per key at 2026-01-01: 10 facts, the restated one counts once
-N_FUNDAMENTALS_LATEST = 9
+#: fundamentals rows latest per key at 2026-01-01: 11 facts, the restated one counts once
+N_FUNDAMENTALS_LATEST = 10
 
 
 def _ts(s: str) -> datetime:
@@ -90,6 +90,9 @@ def seed(tmp_path) -> StoreConfig:
              start=date(2024, 1, 1), accn=jpm_10k, known="2025-02-14T20:00:00"),
         fact(JPM, "us-gaap:Revenues", date(2025, 3, 31), 45310000000, start=date(2025, 1, 1),
              freq="quarterly", accn=jpm_10q, known="2025-05-01T20:00:00"),
+        # the 9-month year-to-date of the Q3 10-Q: stored as 'ytd9', only there to derive a Q4
+        fact(JPM, "us-gaap:Revenues", date(2025, 9, 30), 135000000000, start=date(2025, 1, 1),
+             freq="ytd9", accn="0000019617-25-000700", known="2025-11-04T20:00:00"),
         fact(JPM, "us-gaap:Assets", date(2025, 3, 31), 4357856000000, freq="instant",
              accn=jpm_10q, known="2025-05-01T20:00:00"),
     ]
