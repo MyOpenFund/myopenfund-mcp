@@ -69,7 +69,8 @@ class Settings:
     companies_query_timeout_s: int = 20  # MOF_COMPANIES_QUERY_TIMEOUT_S: time budget per store call
     companies_max_companies: int = 10  # MOF_COMPANIES_MAX_COMPANIES: companies per call
     companies_max_concurrency: int = 2  # MOF_COMPANIES_MAX_CONCURRENCY: store reads running at once
-    # MOF_COMPANIES_Q4_RULE: how TTM derives Q4 — ytd9 (FY - 9-month YTD, company-corpus's rule) |
+    # MOF_COMPANIES_Q4_RULE: how TTM derives an unreported Q4 — ytd9 (FY - 9-month YTD, the rule of
+    # company-corpus's published outputs) |
     # sum_of_quarters (FY - Q1 - Q2 - Q3)
     companies_q4_rule: str = "ytd9"
 

@@ -1,5 +1,6 @@
 import threading
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 from companies_fixture import AAPL, AAPL_10K_2024, JPM, N_FUNDAMENTALS_LATEST, NWG, REV, seed
@@ -690,3 +691,51 @@ def test_summaries_use_the_configured_q4_rule(cfg, monkeypatch):
 def test_an_unknown_q4_rule_is_refused_at_construction(tmp_path):
     with pytest.raises(ValueError, match="q4_rule"):
         CompaniesStore(str(tmp_path), "x", q4_rule="annual")
+
+
+def _flow_rows(*, with_ytd9: bool) -> list[dict]:
+    """Selection rows of one issuer, September year-end: FY2024 Q1-Q3, FY2024, FY2025 Q1, no
+    standalone Q4. Revenue 100 a quarter, FY 420 (Q1-Q3 sum 300, 9-month YTD 310); net income 10
+    a quarter, FY 46 (Q1-Q3 sum 30, 9-month YTD 31). The two Q4 rules disagree on purpose."""
+    def row(concept, tag, start, end, freq, value):
+        return {"concept": concept, "entity_scheme": "cik", "entity_value": "0000000001",
+                "valid_date": end, "frequency": freq, "basis": "consolidated", "source_code": "sec",
+                "period_start": start, "value": Decimal(value), "unit": "USD", "original_tag": tag,
+                "filing_ref": f"acc-{end}", "source_doc_id": None,
+                "known_at": datetime(end.year + (end.month > 10), (end.month + 1) % 12 + 1, 1, tzinfo=UTC),
+                "location": None, "conflict": False, "review_status": None, "on_statement": True}
+    periods = [(date(2023, 10, 1), date(2023, 12, 30), "quarterly", 100, 10),
+               (date(2023, 12, 31), date(2024, 3, 30), "quarterly", 100, 10),
+               (date(2024, 3, 31), date(2024, 6, 29), "quarterly", 100, 10),
+               (date(2023, 10, 1), date(2024, 9, 28), "annual", 420, 46),
+               (date(2024, 9, 29), date(2024, 12, 28), "quarterly", 100, 10)]
+    if with_ytd9:
+        periods.append((date(2023, 10, 1), date(2024, 6, 29), "ytd9", 310, 31))
+    return [r for start, end, freq, rev, ni in periods
+            for r in (row("revenue", "us-gaap:Revenues", start, end, freq, rev),
+                      row("net_income", "us-gaap:NetIncomeLoss", start, end, freq, ni))]
+
+
+def _q1_fy2025_net_margin_ttm(store, rows):
+    s = store.summaries("0000000001", "X", rows, None)
+    q = next(x for x in s if x.frequency == "quarterly" and x.period_end == date(2024, 12, 28))
+    return (q.ttm.get("net_margin_ttm") or {}).get("value")
+
+
+@pytest.mark.parametrize(("rule", "with_ytd9", "expected"), [
+    ("ytd9", False, None),                        # no 9-month value: absent, never sum_of_quarters
+    ("ytd9", True, 100 * 45 / 410),               # Q4 = FY - 9-month YTD: 15 / 110
+    ("sum_of_quarters", False, 100 * 46 / 420),   # Q4 = FY - (Q1+Q2+Q3): 16 / 120
+    ("sum_of_quarters", True, 100 * 46 / 420),    # the 9-month row changes nothing
+])
+def test_quarterly_ttm_follows_the_q4_rule(tmp_path, rule, with_ytd9, expected):
+    s = CompaniesStore(str(tmp_path), "x", q4_rule=rule)
+    got = _q1_fy2025_net_margin_ttm(s, _flow_rows(with_ytd9=with_ytd9))
+    assert got == expected if expected is None else got == pytest.approx(expected, rel=1e-9)
+
+
+def test_q4_rules_match_company_corpus():
+    from company_corpus.financials import Q4_RULES as CORPUS_Q4_RULES
+
+    from myopenfund_mcp.config import Q4_RULES
+    assert Q4_RULES == CORPUS_Q4_RULES
