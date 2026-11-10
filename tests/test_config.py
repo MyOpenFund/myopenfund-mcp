@@ -132,3 +132,17 @@ def test_companies_catalog_needs_a_data_root():
 def test_companies_data_root_alone_is_refused():
     with pytest.raises(ConfigError, match="MOF_COMPANIES_CATALOG"):
         Settings.from_env({"MOF_COMPANIES_DATA_ROOT": "/d"})
+
+
+def test_companies_q4_rule_defaults_to_the_corpus_rule():
+    assert Settings.from_env({}).companies_q4_rule == "ytd9"
+
+
+def test_companies_q4_rule_accepts_sum_of_quarters():
+    assert Settings.from_env({"MOF_COMPANIES_Q4_RULE": "sum_of_quarters"}).companies_q4_rule == "sum_of_quarters"
+
+
+@pytest.mark.parametrize("bad", ["YTD9", "sum", "ytd9,sum_of_quarters", "annual"])
+def test_companies_q4_rule_refuses_other_values(bad):
+    with pytest.raises(ConfigError, match="MOF_COMPANIES_Q4_RULE"):
+        Settings.from_env({"MOF_COMPANIES_Q4_RULE": bad})

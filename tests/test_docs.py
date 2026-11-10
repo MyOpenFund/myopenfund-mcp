@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER_VARS = sorted(set(re.findall(r'"(MOF_[A-Z_]+)"', (ROOT / "src/myopenfund_mcp/config.py").read_text())))
+SERVER_VARS = sorted(set(re.findall(r'"(MOF_[A-Z0-9_]+)"', (ROOT / "src/myopenfund_mcp/config.py").read_text())))
 
 
 def test_config_reads_variables():
@@ -33,12 +33,13 @@ FIELDS = {
     "MOF_COMPANIES_QUERY_TIMEOUT_S": "companies_query_timeout_s",
     "MOF_COMPANIES_MAX_COMPANIES": "companies_max_companies",
     "MOF_COMPANIES_MAX_CONCURRENCY": "companies_max_concurrency",
+    "MOF_COMPANIES_Q4_RULE": "companies_q4_rule",
 }
-COMMENTED = re.findall(r"^# (MOF_[A-Z_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
+COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
 
 
 def test_every_env_example_variable_is_read_by_the_server():
-    named = set(re.findall(r"\bMOF_[A-Z_]+\b", ENV_EXAMPLE)) - DEPLOYMENT_ONLY
+    named = set(re.findall(r"\bMOF_[A-Z0-9_]+\b", ENV_EXAMPLE)) - DEPLOYMENT_ONLY
     assert sorted(named - set(SERVER_VARS)) == []
 
 

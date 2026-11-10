@@ -184,7 +184,7 @@ writable, a tmpfs holding it must allow exec (`/tmp:exec`), and the container ne
 `extensions.duckdb.org`. The process must also be able to read the store's `lake/` files (my-open-data creates
 them `0700` for its own uid). Configuration:
 `MOF_COMPANIES_CATALOG`, `MOF_COMPANIES_DATA_ROOT`, `MOF_COMPANIES_QUERY_TIMEOUT_S`,
-`MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY` (see [Configuration and limits](#configuration-and-limits)).
+`MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY`, `MOF_COMPANIES_Q4_RULE` (see [Configuration and limits](#configuration-and-limits)).
 
 | Tool | What it does |
 |---|---|
@@ -200,8 +200,12 @@ them `0700` for its own uid). Configuration:
   offset is read as UTC) returns what was publicly known at that moment, so a restatement filed later
   does not leak into an earlier view. Results echo the `as_of` used. Datetimes are UTC.
 - **Concepts and ratios are company-corpus's.** The server computes none: it calls company-corpus for the
-  concept catalogue and the ratios. The one quarterly derivation, TTM, is company-corpus's too: it takes Q4 as
-  FY minus (Q1 + Q2 + Q3), computed from the store's own values, not by this server.
+  concept catalogue and the ratios. The one quarterly derivation, TTM, is company-corpus's too: by default
+  (`MOF_COMPANIES_Q4_RULE=ytd9`) a fourth quarter the company did not report on its own is FY minus the
+  9-month year-to-date, the rule of company-corpus's published outputs, computed from the store's own values,
+  not by this server. A TTM window needing such a quarter is absent (no row), never computed another way.
+  The store does not hold 9-month values yet, so today quarterly TTM ratios appear only for companies that
+  report a standalone fourth quarter (JPMorgan, for one, gets none); `sum_of_quarters` returns them whenever the three prior quarters are in the store.
 - **`frequency`.** In `companies_fundamentals`, `annual`, `quarterly` and `semiannual` also return the
   balance-sheet values (frequency `instant`) dated at the ends of the included periods, as the ratios use
   them; `instant` alone returns balance-sheet values only. In `companies_facts`, `frequency` filters the
@@ -280,6 +284,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_COMPANIES_QUERY_TIMEOUT_S` | `20` | Seconds before a store call stops waiting (1-3600). |
 | `MOF_COMPANIES_MAX_COMPANIES` | `10` | Most companies a single call may name (1-100). |
 | `MOF_COMPANIES_MAX_CONCURRENCY` | `2` | Store reads running at once (1-16); a read abandoned at its time budget keeps its slot until it ends, so the next callers may also get `[timeout]` for a while. |
+| `MOF_COMPANIES_Q4_RULE` | `ytd9` | How TTM derives a fourth quarter the company did not report on its own: `ytd9` = FY minus the 9-month year-to-date (the rule of company-corpus's published outputs; a TTM needing a 9-month value the store lacks is absent, and the store holds none yet), `sum_of_quarters` = FY minus Q1, Q2 and Q3 (present whenever those three quarters are, some differ from company-corpus's). |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

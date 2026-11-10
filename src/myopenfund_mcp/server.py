@@ -69,7 +69,8 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None)
             from .companies.store import CompaniesStore
 
             companies_store = CompaniesStore(settings.companies_data_root, settings.companies_catalog,
-                                             max_concurrency=settings.companies_max_concurrency)
+                                             max_concurrency=settings.companies_max_concurrency,
+                                             q4_rule=settings.companies_q4_rule)
         except ImportError:
             companies_store = None
         if companies_store is None:

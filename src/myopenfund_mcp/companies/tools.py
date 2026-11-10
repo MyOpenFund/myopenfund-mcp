@@ -170,7 +170,8 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
     ) -> dict:
         """Standard financials of companies as publicly known at `as_of`: one row per company,
         period and concept (with the filing it comes from), plus ratios on request (`metrics`,
-        computed by company-corpus, TTM included; `ttm` says which). An annual, quarterly or
+        computed by company-corpus, TTM included; `ttm` says which; a quarterly TTM that would need
+        a fourth quarter the company did not report on its own may be absent). An annual, quarterly or
         semiannual `frequency` includes the balance-sheet values ('instant') dated at those period
         ends, the ones the ratios use. Call companies_resolve first
         if you only have a name. Banks and insurers: the sector is unknown to the store, so judge
