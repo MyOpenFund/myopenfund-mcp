@@ -92,12 +92,12 @@ def test_invalid_dsn_raised_while_parsing_never_leaks(pg):
 
 def test_invalid_query_becomes_invalid_argument_and_closes_the_connection(pg, monkeypatch):
     def recent_runs(conn, **kwargs):
-        raise vault_query.InvalidQuery("since must be an ISO-8601 timestamp")
+        raise vault_query.InvalidQuery("sort_by must be one of [...]")
 
     monkeypatch.setattr(vault_query, "recent_runs", recent_runs)
     with pytest.raises(ToolError) as info:
         _reader().recent_runs(corpus=None, since="yesterday", limit=5)
-    assert str(info.value) == "[invalid_argument] since must be an ISO-8601 timestamp"
+    assert str(info.value) == "[invalid_argument] sort_by must be one of [...]"
     assert info.value.__context__ is None
     assert pg["conns"][0].closed
 

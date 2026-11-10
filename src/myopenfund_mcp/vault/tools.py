@@ -33,8 +33,12 @@ TEXT_DESCRIPTION = "Case-insensitive substring of the title, matched literally (
 SORT_BY_DESCRIPTION = "Field the rows are ordered by"
 SORT_DIR_DESCRIPTION = "asc (oldest / smallest first) or desc (newest / largest first)"
 GROUP_BY_DESCRIPTION = "Field the live documents are counted by"
-SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset); keeps runs FINISHED at or after it; runs still "
+SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset; an offset is whole minutes, at most +/-15:59); "
+                     "keeps runs FINISHED at or after it; runs still "
                      "in flight are left out when since is given; applies to `runs` and `source_runs` only")
+# The largest UTC offset Postgres's timestamptz accepts (16:00 and beyond raise
+# InvalidTimeZoneDisplacementValue); vault-query refuses the rest with a message naming its own grammar.
+MAX_SINCE_OFFSET = dt.timedelta(hours=15, minutes=59)
 
 RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first:
 - `runs`: one row per run (run grain), with its outcome and totals. A run with no per-source detail
@@ -84,6 +88,8 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped)."""
         page = clamp_limit(limit, settings)
         offset = decode_cursor(cursor)
+        if text is not None and "\x00" in text:  # vault-query would name it `q`, its own name
+            raise tool_error(INVALID_ARGUMENT, "text must not contain a NUL character")
         if date_from is not None and date_to is not None and date_from > date_to:
             raise tool_error(INVALID_ARGUMENT, "date_from is after date_to")
         filters = {"corpus": corpus, "source_code": source_code, "doc_type": doc_type,
@@ -128,6 +134,11 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         page = clamp_limit(limit, settings)
         if since is not None and since.tzinfo is None:
             since = since.replace(tzinfo=dt.UTC)  # a naive since is UTC (SINCE_DESCRIPTION)
+        if since is not None:
+            utc_offset = since.utcoffset()
+            if abs(utc_offset) > MAX_SINCE_OFFSET or utc_offset % dt.timedelta(minutes=1):
+                raise tool_error(INVALID_ARGUMENT, "since: the UTC offset must be whole minutes, at most "
+                                                   "+/-15:59 (the database's limit)")
         runs = await _call(reader.recent_runs, corpus=corpus, since=since, limit=page)
         source_runs = await _call(reader.runs_status, corpus=corpus, source_code=source_code, since=since,
                                   limit=page, max_error_samples=settings.max_error_samples,
