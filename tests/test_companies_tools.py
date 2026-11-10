@@ -145,7 +145,10 @@ async def test_fundamentals_concepts_and_metrics(store):
                        "ttm", "sector_relevant"}
     assert nm["ttm"] is False and nm["unit"] == "%" and abs(nm["value"] - 23.97) < 0.01
     assert next(r for r in res["rows"] if r["key"] == "net_margin_ttm")["ttm"] is True
-    assert res["sector"].startswith("unknown") and res["dictionary_version"] == "1.0.0"
+    from company_corpus.concepts.dictionary import load_dictionary
+
+    # the version company-corpus's selection stamps, whichever release is installed
+    assert res["sector"].startswith("unknown") and res["dictionary_version"] == load_dictionary().version
 
 
 async def test_fundamentals_sort_concepts_before_metrics_newest_first(store):
@@ -402,3 +405,16 @@ def test_server_passes_the_configured_q4_rule_to_the_store(tmp_path, monkeypatch
     build_server(Settings(companies_catalog="x", companies_data_root=str(tmp_path),
                           companies_q4_rule="sum_of_quarters"))
     assert made and made[0]["q4_rule"] == "sum_of_quarters"
+
+
+async def test_facts_accept_the_nine_month_frequency(store):
+    # fundamentals 3.1.0 stores 9-month year-to-date facts as 'ytd9'; facts filter them as filed
+    res = await _call(store, "companies_facts", {"companies": [JPM], "frequency": "ytd9"})
+    assert res["rows"] == []  # the fixture holds none; the filter is accepted
+
+
+async def test_fundamentals_have_no_nine_month_periods(store):
+    # 9-month values only derive an unreported Q4 (as in company-corpus); never a period here
+    async with _client(store) as c:
+        with pytest.raises(ToolError):
+            await c.call_tool("companies_fundamentals", {"companies": [AAPL], "frequency": "ytd9"})
