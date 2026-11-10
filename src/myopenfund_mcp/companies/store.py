@@ -399,7 +399,7 @@ class CompaniesStore:
 
         return self._run(go)
 
-    def summaries(self, cik: str, name: str, rows: list[dict], vintages: list[dict]) -> list:
+    def summaries(self, cik: str, name: str, rows: list[dict], vintages: list[dict] | None) -> list:
         """company-corpus period summaries (values, ratios, TTM) of ``concept_rows``' output.
 
         The store has no SIC, so the sector is unknown: ``sector_relevant`` is None on the

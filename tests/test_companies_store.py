@@ -1,5 +1,5 @@
 import threading
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
 import pytest
@@ -702,7 +702,7 @@ def _flow_rows(*, with_ytd9: bool) -> list[dict]:
                 "valid_date": end, "frequency": freq, "basis": "consolidated", "source_code": "sec",
                 "period_start": start, "value": Decimal(value), "unit": "USD", "original_tag": tag,
                 "filing_ref": f"acc-{end}", "source_doc_id": None,
-                "known_at": datetime(end.year + (end.month > 10), (end.month + 1) % 12 + 1, 1, tzinfo=UTC),
+                "known_at": datetime.combine(end + timedelta(days=35), time(20), tzinfo=UTC),  # filed after
                 "location": None, "conflict": False, "review_status": None, "on_statement": True}
     periods = [(date(2023, 10, 1), date(2023, 12, 30), "quarterly", 100, 10),
                (date(2023, 12, 31), date(2024, 3, 30), "quarterly", 100, 10),
@@ -731,7 +731,7 @@ def _q1_fy2025_net_margin_ttm(store, rows):
 def test_quarterly_ttm_follows_the_q4_rule(tmp_path, rule, with_ytd9, expected):
     s = CompaniesStore(str(tmp_path), "x", q4_rule=rule)
     got = _q1_fy2025_net_margin_ttm(s, _flow_rows(with_ytd9=with_ytd9))
-    assert got == expected if expected is None else got == pytest.approx(expected, rel=1e-9)
+    assert got == (None if expected is None else pytest.approx(expected, rel=1e-9))
 
 
 def test_q4_rules_match_company_corpus():
