@@ -14,6 +14,10 @@ services:
     # no Linux capabilities, no privilege escalation. Remove a line only if your setup needs it.
     read_only: true
     tmpfs: [/tmp]
+    # With the companies/datasets toolsets: DuckDB downloads and loads its ducklake and postgres
+    # extensions under $HOME/.duckdb at each start, so HOME must be writable (e.g. HOME=/tmp) and
+    # /tmp must allow exec (tmpfs: ["/tmp:exec"]); this needs outbound HTTPS to extensions.duckdb.org.
+    # Mount the store's lake/ read-only, as a uid that can read it (my-open-data files may be 0700).
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     # To reach a vault Postgres on the same Docker host without publishing its port, join its network
