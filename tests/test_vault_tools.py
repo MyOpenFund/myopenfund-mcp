@@ -250,7 +250,7 @@ async def test_parameter_descriptions_are_present():
         assert search[name].get("description"), name
     assert "refused" in search["limit"]["description"]
     assert search["text"]["description"] == (
-        "Case-insensitive substring of the title (% and _ act as wildcards)")
+        "Case-insensitive substring of the title, matched literally (% and _ are ordinary characters)")
     stats = tools["vault_corpus_stats"].input_schema["properties"]
     assert "maximum number of groups returned" in stats["limit"]["description"]
     assert "refused" in stats["limit"]["description"] and stats["corpus"].get("description")
@@ -337,3 +337,46 @@ async def test_resource_body_is_the_compact_json_the_cap_measures():
     text = contents[0].text
     assert text == json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":"))
     assert "Décision" in text
+
+
+async def test_a_nul_in_text_is_refused_naming_text_not_the_library_name():
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        with pytest.raises(ToolError, match=r"^\[invalid_argument\] text must not contain a NUL"):
+            await c.call_tool("vault_search_documents", {"text": "a\x00b"})
+    assert not reader.calls
+
+
+@pytest.mark.parametrize("since", ["2026-10-01T00:00:00+16:00", "2026-10-01T00:00:00-23:59"])
+async def test_runs_status_refuses_an_offset_postgres_cannot_take(since):
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        with pytest.raises(ToolError, match=r"^\[invalid_argument\] since: the UTC offset"):
+            await c.call_tool("vault_runs_status", {"since": since})
+    assert not reader.calls
+
+
+@pytest.mark.parametrize("since", ["2026-10-01T00:00:00+15:59", "2026-10-01T00:00:00-15:59"])
+async def test_runs_status_accepts_the_largest_offsets(since):
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        await c.call_tool("vault_runs_status", {"since": since})
+    assert any(call[0] == "recent_runs" for call in reader.calls)
+
+
+async def test_since_and_text_descriptions_state_the_bound_and_literal_match():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    since = tools["vault_runs_status"].input_schema["properties"]["since"]["description"]
+    assert "15:59" in since
+    text = tools["vault_search_documents"].input_schema["properties"]["text"]["description"]
+    assert "literally" in text
+
+
+async def test_runs_status_refuses_an_offset_with_seconds():
+    """Refused before any read, by the argument parser or by the offset check."""
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        with pytest.raises(ToolError):
+            await c.call_tool("vault_runs_status", {"since": "2026-10-01T00:00:00+05:00:30"})
+    assert not reader.calls

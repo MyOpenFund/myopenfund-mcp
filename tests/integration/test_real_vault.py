@@ -52,6 +52,23 @@ async def test_real_vault_read_path():
         assert all(len(runs[k]) <= 5 for k in ("runs", "source_runs", "open_discovery_errors"))
 
 
+
+async def test_real_vault_query_contract():
+    """Behaviours of the pinned vault-query a pin regression would break, on any non-empty vault."""
+    async with Client(build_server(Settings(vault_database_url=URL))) as c:
+        # Title search is literal: % and _ are ordinary characters.
+        for needle in ("%", "_"):
+            page = (await c.call_tool("vault_search_documents", {"text": needle, "limit": 50})).data
+            assert all(needle in (d["title"] or "") for d in page["documents"]), needle
+        # The database's own limits come back as invalid_argument, never as a backend error.
+        for args in ({"since": "2026-10-01T00:00:00+16:00"},):
+            r = await c.call_tool("vault_runs_status", args, raise_on_error=False)
+            assert r.is_error and r.content[0].text.startswith("[invalid_argument]")
+        r = await c.call_tool("vault_search_documents", {"text": "a\x00b"}, raise_on_error=False)
+        assert r.is_error and r.content[0].text.startswith("[invalid_argument] text")
+        r = await c.call_tool("vault_search_documents", {"corpus": "a\x00b"}, raise_on_error=False)
+        assert r.is_error and r.content[0].text.startswith("[invalid_argument] corpus")
+
 def test_connection_is_read_only():
     """The server-side guard (default_transaction_read_only) holds whatever the role may do."""
     import psycopg2.errors
