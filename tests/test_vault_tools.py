@@ -250,7 +250,7 @@ async def test_parameter_descriptions_are_present():
         assert search[name].get("description"), name
     assert "refused" in search["limit"]["description"]
     assert search["text"]["description"] == (
-        "Case-insensitive substring of the title (% and _ act as wildcards)")
+        "Case-insensitive substring of the title, matched literally (% and _ are ordinary characters)")
     stats = tools["vault_corpus_stats"].input_schema["properties"]
     assert "maximum number of groups returned" in stats["limit"]["description"]
     assert "refused" in stats["limit"]["description"] and stats["corpus"].get("description")
