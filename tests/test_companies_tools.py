@@ -145,8 +145,8 @@ async def test_fundamentals_concepts_and_metrics(store):
                        "ttm", "sector_relevant"}
     assert nm["ttm"] is False and nm["unit"] == "%" and abs(nm["value"] - 23.97) < 0.01
     assert next(r for r in res["rows"] if r["key"] == "net_margin_ttm")["ttm"] is True
-    # the dictionary version company-corpus 43a27ed ships
-    assert res["sector"].startswith("unknown") and res["dictionary_version"] == "2.0.0"
+    # the dictionary version company-corpus 06c619d ships
+    assert res["sector"].startswith("unknown") and res["dictionary_version"] == "2.1.0"
 
 
 async def test_fundamentals_sort_concepts_before_metrics_newest_first(store):
