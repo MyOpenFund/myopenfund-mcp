@@ -15,7 +15,7 @@ dependencies = ["fastmcp>=4.1.4,<5"]
 vault = ["vault-query @ git+https://github.com/MyOpenFund/vault@119a3366ae984b528779d2921eb4e4ebeef62a4f#subdirectory=query"]
 companies = [
   "my-open-data[reader] @ git+https://github.com/MyOpenFund/my-open-data@3252e97dd6808290895cc4e117685388e6d4e354",
-  "company-corpus @ git+https://github.com/MyOpenFund/company-corpus@43a27ed2bd6699f846452a3d81de3d570aad7148",
+  "company-corpus @ git+https://github.com/MyOpenFund/company-corpus@06c619d7d216d230b92ea62394672f8dd443830f",
 ]
 dev = ["pytest>=8.3", "ruff>=0.6"]
 
