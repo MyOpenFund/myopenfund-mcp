@@ -286,6 +286,17 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_COMPANIES_MAX_COMPANIES` | `10` | Most companies a single call may name (1-100). |
 | `MOF_COMPANIES_MAX_CONCURRENCY` | `2` | Store reads running at once (1-16); a read abandoned at its time budget keeps its slot until it ends, so the next callers may also get `[timeout]` for a while. |
 | `MOF_COMPANIES_Q4_RULE` | `ytd9` | How TTM derives a fourth quarter the company did not report on its own: `ytd9` = FY minus the 9-month year-to-date (the rule of company-corpus's published outputs; a TTM needing a 9-month value the store lacks is absent), `sum_of_quarters` = FY minus Q1, Q2 and Q3 (present whenever those three quarters are, some differ from company-corpus's). |
+| `MOF_RAG_QDRANT_HOST` | unset | Qdrant host name or address (no scheme, port or path); unset = no rag toolset. Needs `MOF_RAG_COLLECTION` and `MOF_RAG_MODEL_CACHE` too. |
+| `MOF_RAG_QDRANT_PORT` | `6333` | Qdrant HTTP port (1-65535). |
+| `MOF_RAG_QDRANT_API_KEY` | unset | Qdrant API key; a **read-only** key is enough and recommended. Never logged, shown or put in an error. |
+| `MOF_RAG_QDRANT_HTTPS` | `false` | Connect to Qdrant over TLS (`true` / `false`). Without TLS the key travels in clear: private network only. |
+| `MOF_RAG_QDRANT_TIMEOUT` | `10` | Seconds one request to Qdrant may take (1-300); beyond it the call answers `[rag_unavailable]`. |
+| `MOF_RAG_COLLECTION` | unset | Collection searched (768-dimension cosine vectors of `intfloat/multilingual-e5-base`). Needs `MOF_RAG_QDRANT_HOST` too. |
+| `MOF_RAG_MODEL_CACHE` | unset | Directory holding the embedding model files (about 1.1 GB). Required with the rag toolset, for every transport: the model is never kept in a temporary directory. Fill it once, then mount it read-only. |
+| `MOF_RAG_ONNX_THREADS` | unset | Threads of the ONNX runtime (1-256). Unset = one per core of the host; in a container with a CPU limit, set it to the limit. |
+| `MOF_RAG_DEFAULT_LIMIT` | `8` | Passages `rag_search` returns when the caller gives no `limit`; at most `MOF_RAG_MAX_LIMIT`. |
+| `MOF_RAG_MAX_LIMIT` | `20` | Largest `limit` a caller may ask `rag_search` for (1-1000); a larger one is refused with `[limit_exceeded]`. |
+| `MOF_RAG_CODES_TTL_S` | `300` | Seconds the collection's filter values (source codes, doc types, languages) are kept before being read again (1-86400). |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

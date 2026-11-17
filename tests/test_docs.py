@@ -34,6 +34,12 @@ FIELDS = {
     "MOF_COMPANIES_MAX_COMPANIES": "companies_max_companies",
     "MOF_COMPANIES_MAX_CONCURRENCY": "companies_max_concurrency",
     "MOF_COMPANIES_Q4_RULE": "companies_q4_rule",
+    "MOF_RAG_QDRANT_HOST": "rag_qdrant_host", "MOF_RAG_QDRANT_PORT": "rag_qdrant_port",
+    "MOF_RAG_QDRANT_API_KEY": "rag_qdrant_api_key", "MOF_RAG_QDRANT_HTTPS": "rag_qdrant_https",
+    "MOF_RAG_QDRANT_TIMEOUT": "rag_qdrant_timeout", "MOF_RAG_COLLECTION": "rag_collection",
+    "MOF_RAG_MODEL_CACHE": "rag_model_cache", "MOF_RAG_ONNX_THREADS": "rag_onnx_threads",
+    "MOF_RAG_DEFAULT_LIMIT": "rag_default_limit", "MOF_RAG_MAX_LIMIT": "rag_max_limit",
+    "MOF_RAG_CODES_TTL_S": "rag_codes_ttl_s",
 }
 COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
 
@@ -59,6 +65,8 @@ def test_env_example_defaults_match_settings(name, value):
     default = getattr(Settings(), FIELDS[name])
     if default is None:  # no default: the example shows a placeholder value
         assert "<" in value, f"{name} has no default; its example must be a <placeholder>"
+    elif isinstance(default, bool):  # written as the server reads it: true / false
+        assert value == str(default).lower()
     else:
         assert value == str(default)
 
