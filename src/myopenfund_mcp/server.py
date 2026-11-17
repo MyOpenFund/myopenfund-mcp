@@ -24,6 +24,9 @@ MISSING_VAULT_EXTRA = ("MOF_VAULT_DATABASE_URL is set but the [vault] extra is n
 MISSING_COMPANIES_EXTRA = ("MOF_COMPANIES_CATALOG is set but the [companies] extra is not installed: "
                            "pip install 'myopenfund-mcp[companies]'")
 
+MISSING_RAG_EXTRA = ("MOF_RAG_QDRANT_HOST is set but the [rag] extra is not installed: "
+                     "pip install 'myopenfund-mcp[rag]'")
+
 INSTRUCTIONS = (
     "MyOpenFund: official primary sources only (central banks and SEC company filings). "
     "Call server_info first to see which toolsets this deployment enables. Results carry doc_id, "
@@ -32,7 +35,7 @@ INSTRUCTIONS = (
 )
 
 
-def build_server(settings: Settings, *, vault_reader=None, companies_store=None) -> FastMCP:
+def build_server(settings: Settings, *, vault_reader=None, companies_store=None, rag_backend=None) -> FastMCP:
     auth_enabled = settings.transport == "http"
     if auth_enabled and not settings.tokens:
         raise ConfigError(
@@ -85,6 +88,25 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None)
         root.mount(build_companies_toolset(companies_store, settings, auth_enabled=auth_enabled),
                    namespace="companies")
 
+    if rag_backend is None and settings.rag_qdrant_host:
+        # Same rule as the vault: configured but not installed refuses to start. The ImportError is the
+        # rag-engine package itself, or its ONNX backend when the embedding model is loaded in start().
+        try:
+            from .rag.backend import EngineRagBackend
+
+            rag_backend = EngineRagBackend(settings)
+            rag_backend.start()
+        except ImportError:
+            rag_backend = None
+        if rag_backend is None:
+            raise ConfigError(MISSING_RAG_EXTRA)
+    elif rag_backend is not None:
+        rag_backend.start()
+    if rag_backend is not None:
+        from .rag.tools import build_rag_toolset
+
+        root.mount(build_rag_toolset(rag_backend, settings, auth_enabled=auth_enabled), namespace="rag")
+
     companies_status = "enabled" if companies_store is not None else "not configured"
 
     # Open to any authenticated caller (no tier check): it is how a client learns its tier.
@@ -93,6 +115,8 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None)
         """What this deployment offers: enabled toolsets, your tier, version, data freshness.
 
         If the vault cannot be read, `freshness` is null and `freshness_error` says why; the rest still answers.
+        With the rag toolset: `rag` (collection, embedding model, engine version, default and maximum
+        limit, and `status`: ready, or unavailable with a `reason`).
         With the company store: `companies_freshness` (last publication, UTC; batch count), or
         `companies_freshness_error` if the store cannot be read.
         """
@@ -100,9 +124,14 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None)
             "version": __version__,
             "tier": caller_tier(get_access_token(), auth_enabled=auth_enabled),
             "toolsets": {"vault": "enabled" if vault_reader is not None else "not configured",
-                         "rag": "not configured", "companies": companies_status, "datasets": companies_status},
+                         "rag": "enabled" if rag_backend is not None else "not configured",
+                         "companies": companies_status, "datasets": companies_status},
             "freshness": None,
         }
+        if rag_backend is not None:
+            # The state recorded at start and by the last calls: no request to Qdrant from here.
+            info["rag"] = {**rag_backend.info(), "default_limit": settings.rag_default_limit,
+                           "max_limit": settings.rag_max_limit}
         if vault_reader is not None:
             try:
                 info["freshness"] = jsonable(await anyio.to_thread.run_sync(partial(vault_reader.freshness)))
