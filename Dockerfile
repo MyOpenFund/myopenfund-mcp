@@ -1,5 +1,5 @@
 # Host-agnostic image: everything deployment-specific comes from MOF_* environment variables.
-# Build stage: git is needed only to fetch the pinned vault-query dependency, never at runtime.
+# Build stage: git is needed only to fetch the pinned git dependencies of the extras, never at runtime.
 FROM python:3.13-slim AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git \
@@ -9,11 +9,16 @@ ENV PATH=/opt/venv/bin:$PATH
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[vault]"
+# Toolset extras installed in the image, comma-separated: vault (default), companies, rag.
+ARG MOF_EXTRAS=vault
+RUN pip install --no-cache-dir ".[${MOF_EXTRAS}]"
 
 FROM python:3.13-slim
 RUN groupadd --gid 10001 mcp && useradd --uid 10001 --gid 10001 --create-home mcp
 COPY --from=build /opt/venv /opt/venv
+# Mount point of the rag toolset's model cache (MOF_RAG_MODEL_CACHE=/models). It exists and belongs to
+# the service user so that a new named volume mounted here is writable for the one-off fill.
+RUN mkdir /models && chown 10001:10001 /models
 # MOF_MCP_HOST=0.0.0.0 is inside the container only: what is published on the host is the
 # deployment's choice (compose.example.yaml binds 127.0.0.1 by default).
 ENV PATH=/opt/venv/bin:$PATH \

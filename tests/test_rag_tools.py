@@ -606,3 +606,13 @@ async def test_the_blocking_search_runs_off_the_event_loop():
     async with _client(backend) as c:
         await c.call_tool("rag_search", {"query": "q"})
     assert backend.threads and backend.threads[0] is not threading.main_thread()
+
+
+def test_the_readme_documents_the_codes_every_reason_and_every_argument():
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    for needle in ("`rag_unavailable`", "`limit_exceeded`", "`rag_search`", *(f"`{r}`" for r in backend_module.REASONS),
+                   "`source_codes`", "`doc_types`", "`languages`", "`date_from`, `date_to`", "`limit`", "`citation`",
+                   "the first page is 1"):
+        assert needle in readme, needle

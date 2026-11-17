@@ -3,6 +3,11 @@
 services:
   mcp:
     build: .
+    # The image installs the vault extra only. For other toolsets, replace `build: .` with:
+    # build:
+    #   context: .
+    #   args:
+    #     MOF_EXTRAS: vault,rag
     image: myopenfund-mcp
     env_file: .env
     ports:
@@ -18,6 +23,16 @@ services:
     # extensions under $HOME/.duckdb at each start, so HOME must be writable (e.g. HOME=/tmp) and
     # /tmp must allow exec (tmpfs: ["/tmp:exec"]); this needs outbound HTTPS to extensions.duckdb.org.
     # Mount the store's lake/ read-only, as a uid that can read it (my-open-data files may be 0700).
+    # With the rag toolset (MOF_EXTRAS with rag; MOF_RAG_* in .env, MOF_RAG_MODEL_CACHE=/models and a
+    # READ-ONLY Qdrant key in MOF_RAG_QDRANT_API_KEY): the embedding model (about 1.1 GB) lives in a named
+    # volume. Fill it once with the command of the README ("Deploying the rag toolset"; it mounts the volume
+    # read-write and needs outbound HTTPS to huggingface.co), then mount it read-only here: the running
+    # server never downloads or writes a model file. Give the container at least 2 GB of memory (about
+    # 1.9 GB while the model loads, 1.5 GB afterwards); with a CPU limit, set MOF_RAG_ONNX_THREADS to it.
+    # Uncomment these two blocks and the `volumes:` block at the end of the file:
+    # volumes:
+    #   - rag-models:/models:ro
+    # mem_limit: 3g
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     # To reach a vault Postgres on the same Docker host without publishing its port, join its network
@@ -27,3 +42,6 @@ services:
 #   vault:
 #     external: true
 #     name: ${MOF_VAULT_DOCKER_NETWORK}
+# volumes:
+#   rag-models:
+#     name: myopenfund-mcp-rag-models

@@ -1,11 +1,12 @@
 # myopenfund-mcp
 
 One [MCP](https://modelcontextprotocol.io) server over the MyOpenFund bricks: official documents and
-pipeline health today, RAG and company data next.
+pipeline health, cited passage search over the embedded corpus, and company data.
 
 Any MCP client (a desktop assistant, a coding agent, your own agent, a local model) gets outcome-oriented
 tools over MyOpenFund's data: find official primary-source documents, read their facts with provenance
-(`doc_id`, dates, source URLs), count the corpus, check the ingestion pipeline's health. Toolsets are
+(`doc_id`, dates, source URLs), search the text of the documents by meaning and get passages to cite, count
+the corpus, check the ingestion pipeline's health. Toolsets are
 enabled per deployment: a toolset whose environment variables are not set is not configured, so it is not
 mounted, and `server_info` says so. A toolset whose variables are set but whose extra is not installed
 stops the server at start with a clear configuration error (it never runs silently without it).
@@ -22,6 +23,7 @@ stops the server at start with a clear configuration error (it never runs silent
 
 - [Quick start (stdio)](#quick-start-stdio)
 - [HTTP deployment](#http-deployment)
+- [Deploying the rag toolset](#deploying-the-rag-toolset)
 - [Tools](#tools)
 - [Errors](#errors)
 - [Tiers and tokens](#tiers-and-tokens)
@@ -143,6 +145,51 @@ A home server, a NAS or an office machine reachable only over a VPN or a private
 - Restrict who can reach the HTTPS endpoint (IP allow-list, private load balancer) wherever you can: the
   bearer token is the only authentication in v1.
 
+## Deploying the rag toolset
+
+The `rag_search` tool needs a Qdrant collection already filled by the ingestion (rag-engine through the
+data-orchestrator) and the embedding model `intfloat/multilingual-e5-base` as an ONNX file. The server only
+reads: it never creates a collection, an index or a point.
+
+1. **A read-only Qdrant API key.** On the Qdrant stack, set a read-only key next to the main one
+   (`QDRANT__SERVICE__READ_ONLY_API_KEY`) and give the MCP that key only, as `MOF_RAG_QDRANT_API_KEY`.
+2. **Payload indexes, once, from the data side.** The filters and the list of valid filter values use
+   Qdrant's payload indexes. Whoever owns the collection creates them with a key that can write, once per
+   collection (running it again does nothing):
+
+   ```bash
+   QDRANT_HOST=<qdrant-host> QDRANT_API_KEY=<key-that-can-write> python -c "from rag_engine.store import QdrantStore; print(QdrantStore().ensure_payload_indexes('<collection>'))"
+   ```
+
+   The MCP never does this (its key cannot). Without the indexes `rag_search` still answers, more slowly:
+   filters read every point, and the valid values are read by scrolling the collection (up to 100,000
+   points; beyond that, filter values are no longer checked).
+3. **The image with the extra.** Build with `MOF_EXTRAS=vault,rag` (see `compose.example.yaml`; from a
+   checkout without Docker, `pip install ".[vault,rag]"`). No PyTorch is installed: queries are embedded on
+   the ONNX runtime, on CPU.
+4. **Fill the model cache, once.** The model is about 1.1 GB. It is pinned to one revision and every file is
+   hash-checked at each start, so a changed or damaged file is refused. Download it into the volume with
+   this one-off command, on a host that can reach `huggingface.co`:
+
+   ```bash
+   docker run --rm -v myopenfund-mcp-rag-models:/models myopenfund-mcp python -c "from rag_engine.config import Settings; from rag_engine.embedding import make_embedder; make_embedder(Settings(backend='onnx', model_cache='/models')).release()"
+   ```
+
+   Without Docker, run the same `python -c "..."` in the server's venv with your own directory in place of
+   `/models`. A filled directory can also be copied as it is from another host. Run again on a filled
+   cache, the command downloads nothing and only verifies the files.
+5. **Set the variables** in `.env`: `MOF_RAG_QDRANT_HOST`, `MOF_RAG_QDRANT_PORT`, `MOF_RAG_QDRANT_API_KEY`,
+   `MOF_RAG_COLLECTION`, `MOF_RAG_MODEL_CACHE=/models` (and `MOF_RAG_QDRANT_HTTPS=true` when Qdrant is
+   behind TLS). In `compose.yaml`, uncomment the rag blocks: the volume **read-only**, and at least 2 GB of
+   memory for the container (the model takes about 1.9 GB while it loads, about 1.5 GB afterwards). With a
+   CPU limit, set `MOF_RAG_ONNX_THREADS` to it.
+6. **Restart**, then call `server_info`: `toolsets.rag` is `enabled` and `rag.status` is `ready` (the model
+   loads at start, in about 5 to 7 seconds on 4 cores with a warm disk; a first read of the file from a
+   cold disk takes longer). Then call `rag_search` with a short query.
+
+Once the cache is filled the server makes no outbound connection for the model. If `rag.status` is
+`unavailable`, `rag.reason` and the server log say why (see [Passage search](#passage-search-rag)).
+
 ## Tools
 
 Tool names carry their toolset prefix. All v1 tools are read-only (`readOnlyHint`). Only
@@ -170,6 +217,89 @@ extra is not installed`). Timestamps in results are UTC: the server's database s
 
 If the vault database is down, `server_info` still answers (version, tier, toolsets) with `freshness`
 null and `"freshness_error": "backend_unavailable"`; the server log names the exception class only.
+
+### Passage search (rag)
+
+`rag_search` exists only when `MOF_RAG_QDRANT_HOST`, `MOF_RAG_COLLECTION` and `MOF_RAG_MODEL_CACHE` are set;
+the `[rag]` extra must then be installed, or the server refuses to start (`MOF_RAG_QDRANT_HOST is set but
+the [rag] extra is not installed`). It searches the text of the embedded central-bank documents by meaning
+(one dense search over the chunks, with rag-engine) and returns passages, best first. It does not write an
+answer: the client's model reads the passages and cites them. Read tier.
+
+| Argument | Meaning |
+|---|---|
+| `query` (required) | What to look for, in plain language, in any language; at most 2000 characters (the model reads the first 512 tokens). |
+| `source_codes` | List of central-bank codes, exact: `ecb`, `us` (Federal Reserve), `gb`, `au`, `ca`, `jp`. |
+| `doc_types` | List of document-type codes, exact: `A1` rate-decision press release, `A2` policy statement, `A3` minutes or accounts, `B1` press conference, `E1` monetary policy report, `F1` projections. |
+| `languages` | List of language codes as stored, e.g. `en`. |
+| `date_from`, `date_to` | Publication date bounds, `YYYY-MM-DD`, both inclusive. As soon as one is set, a document without a full date is left out. |
+| `limit` | Number of passages; default `MOF_RAG_DEFAULT_LIMIT` (8), at most `MOF_RAG_MAX_LIMIT` (20). |
+
+The values of one list are alternatives (OR), the arguments combine (AND). An omitted argument does not
+restrict; an empty list is refused. The codes above are those of the corpus today; the server reads the
+valid values from the collection itself.
+
+Example call and result (text shortened):
+
+```json
+{"query": "Why did the ECB raise interest rates in July 2022?", "source_codes": ["ecb"], "date_from": "2022-07-01", "limit": 1}
+```
+
+```json
+{
+  "query": "Why did the ECB raise interest rates in July 2022?",
+  "filters": {"source_codes": ["ecb"], "doc_types": null, "languages": null, "date_from": "2022-07-01", "date_to": null},
+  "count": 1,
+  "hits": [
+    {
+      "rank": 1,
+      "score": 0.8189,
+      "text": "The Governing Council decided to raise the three key ECB interest rates by 50 basis points. ...",
+      "doc_id": "ecb/A1/2022-07-21",
+      "title": "Monetary policy decisions",
+      "date": "2022-07-21",
+      "source_code": "ecb",
+      "doc_type": "A1",
+      "language": "en",
+      "page": 1,
+      "chunk_number": 0,
+      "citation": "Monetary policy decisions (ecb A1, 2022-07-21), p. 1"
+    }
+  ]
+}
+```
+
+- **Hits.** `score` is the cosine between the query and the passage (4 decimals; higher is closer). Several
+  hits may come from one document; nothing is grouped. `filters` echoes the filters as applied. The point id
+  and the rest of the stored payload are not returned.
+- **Pages.** `page` is the page the passage starts on **as a reader counts it: the first page is 1** (the
+  collection stores pages from 0; the server adds one). It is `null` for a document without pages, and the
+  `citation` then has no page part. `citation` is `<title> (<source_code> <doc_type>, <date>), p. <page>`,
+  each missing part left out (the `doc_id` stands for a missing title).
+- **Unknown filter values are refused, never corrected.** The server reads the distinct `source_code`,
+  `doc_type` and `language` values from the collection (Qdrant's facet API on the keyword indexes; a full
+  scroll when the collection has no such index) and keeps them `MOF_RAG_CODES_TTL_S` seconds. A value that
+  is not among them is `[invalid_argument]` listing the valid values, with a hint for a near miss (`ECB`:
+  did you mean `ecb`?), instead of an empty result. If the values cannot be read, they are not checked (one
+  warning in the log) and an unknown value simply finds nothing.
+- **Limits and size.** A `limit` above `MOF_RAG_MAX_LIMIT` is `[limit_exceeded]`, never lowered. A result
+  larger than `MOF_MCP_MAX_RESULT_CHARS` is refused with `[result_too_large]`, never cut; the message names
+  the largest `limit` that fits. Passages are 200 to 400 words: the default 8 are a few thousand tokens.
+- **Start-up.** The embedding model is loaded and the collection is checked when the server starts, not at
+  the first call, and a model is never loaded or downloaded by a tool call. If Qdrant cannot be reached,
+  refuses the key, or does not hold the collection, **the server still starts** (as it does when the vault
+  database is down): `rag_search` answers `[rag_unavailable]` with the reason, the collection is checked
+  again at the next call, and the tool works as soon as the check passes. If the model cannot be loaded
+  (files missing with no way to download them, or a file that is not the pinned one), the server starts
+  too, logs the cause as an error, and `rag_search` answers `[rag_unavailable]` until the cache is fixed
+  and the server restarted.
+- **`server_info`** adds a `rag` object: `status` (`ready`, or `unavailable` with a `reason`), `collection`,
+  `model`, `engine_version`, `default_limit`, `max_limit`. It reports the state recorded at start and by
+  the last calls, without a request to Qdrant.
+- **Privacy.** As for every tool, the audit line holds the tool name, the client, the outcome and the
+  duration, never the arguments: the text of a query is not logged, at any level.
+- **Concurrency.** One embedder and one Qdrant client are shared by the process; inference runs one query
+  at a time (about 20 ms for a short query on 4 cores) off the event loop, so other tools keep answering.
 
 ### Companies and datasets
 
@@ -224,11 +354,13 @@ branch on the code and show the message.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics. | Fix the argument; pass `next_cursor` unchanged. |
+| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a date not written `YYYY-MM-DD`, an empty list, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
 | `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
-| `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit`. |
+| `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (no answer within `MOF_RAG_QDRANT_TIMEOUT`), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`. It never holds the host, the key or Qdrant's response. | Retry later for `qdrant_unreachable` and `qdrant_error`; the others need the deployment fixed. |
+| `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |
+| `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit` (`rag_search` names the largest that fits). |
 | `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
 | `unknown_company` | No company matches the reference. | Use `companies_resolve`. |
 | `unknown_concept` | A concept key is not in the catalogue. | The message lists valid keys. |
@@ -314,8 +446,8 @@ schema, to help small models call them correctly.
 
 - **v1** (this release): `server_info` and the `vault_*` toolset over the central-bank corpus, read-only;
   tiers, tokens, Docker image.
-- **v1.1**: `rag_*` (cited passage search over the embedded corpus, embedding as an `act` job) and
-  `jobs_*` to follow long actions.
+- **v1.1**: `rag_search` (cited passage search over the embedded corpus, delivered); embedding as an `act`
+  job and `jobs_*` to follow long actions are still to come.
 - **v2**: `companies_*` (identity resolution, filings fetched on demand, reported fundamentals) and
   `datasets_*` over the MyOpenFund data library.
 - **Later**: `graph_*` and more sources.
@@ -324,7 +456,7 @@ schema, to help small models call them correctly.
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[vault,dev]"
+.venv/bin/pip install -e ".[vault,companies,rag,dev]"
 .venv/bin/ruff check .
 .venv/bin/python -m pytest -q
 ```
@@ -334,6 +466,7 @@ with an explicit marker:
 
 - `pytest -m integration`: against a real vault database, with `MOF_MCP_IT_DATABASE_URL` set.
 - `pytest -m integration tests/integration/test_real_store.py`: against a real company store, with `MOF_MCP_IT_COMPANIES_CATALOG` and `MOF_MCP_IT_COMPANIES_DATA_ROOT` set (optional: `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, default 120; `MOF_MCP_IT_ASSERT_LATENCY=1` to enforce the 5 s criterion, on the NAS only; add `-s` or `-rP` to see the printed fundamentals latency).
+- `pytest -m integration tests/integration/test_real_qdrant.py`: `rag_search` against a **throwaway** Qdrant, with `MOF_MCP_IT_QDRANT_URL` set (e.g. `http://127.0.0.1:6333`). The test creates, seeds (through rag-engine, with its model-free `FakeEmbedder`) and deletes collections named `mof-mcp-it-*`. Optional, for a Qdrant with keys: `MOF_MCP_IT_QDRANT_API_KEY` (can write) and `MOF_MCP_IT_QDRANT_READ_ONLY_API_KEY` (given to the server).
 - `pytest -m llm`: a scripted session with a local model, with `MOF_MCP_IT_OLLAMA_URL` set.
 
 Build the image with `docker build -t myopenfund-mcp .`; `docker run --rm myopenfund-mcp myopenfund-mcp
