@@ -508,6 +508,13 @@ them `0700` for its own uid). Configuration:
 - **CSV.** `datasets_export_csv` takes the same arguments as `datasets_read_asof`; decimals are written
   exactly (a column's decimals share the widest scale, so `1.5` can appear as `1.500000`). With no rows, the
   header alone if `columns` is given, else an empty string.
+- **Time budget, and a store read over SMB.** One call, all its store reads together, gets
+  `MOF_COMPANIES_QUERY_TIMEOUT_S` seconds (default 20) and then answers `[timeout]`. The default is sized
+  for the NAS, where the server runs next to the store and reads `lake/` from local disk. Read over SMB
+  instead (measured from a Mac, 2026-11), `companies_fundamentals` took 42 to 51 s cold and about 17 s
+  warm, so the default fails cold calls. A deployment that reads the store over SMB (or another network
+  share) should raise `MOF_COMPANIES_QUERY_TIMEOUT_S`, e.g. to 90; the client's own tool-call timeout must
+  then be longer than that too.
 
 ## Errors
 
