@@ -498,10 +498,15 @@ Example call and result (text shortened):
   run one), without a request to Qdrant: a search that failed does not change it, the check that follows
   does.
 - **Privacy.** As for every tool, the audit line holds the tool name, the client, the outcome and the
-  duration, never the arguments, and the tool's own log lines never contain the query. rag-engine's own
-  logger `rag_engine.store` writes, when the read of the payload schema fails (see
-  [Dates](#dates-in-rag_search)), the class and the text of the client's error: for an HTTP error, the
-  status and Qdrant's response body; never the API key.
+  duration, never the arguments, and the tool's own log lines never contain the query. No log line holds
+  the Qdrant host, the API key or a response body, rag-engine's included: the server routes every record
+  of the `rag_engine` loggers (present and future modules) through a filter. A record that carries an
+  error (an exception among its arguments or attached to it) or whose text holds the configured host or
+  key is written with its logger, its level and a fixed message naming the error's class only; the
+  engine's warning on a failed schema read also keeps its collection, the filter used meanwhile and the
+  delay before the next try. Other engine lines (the collection and the filter in use) are written as
+  they are. The error's text is dropped because it can hold the host, a TLS host name, a proxy's error
+  page naming an upstream host or an internal address, or the engine's hint about its own key variable.
 - **Concurrency.** One embedder and one Qdrant client are shared by the process; inference runs one query
   at a time (about 20 ms for a short query on 4 cores) off the event loop.
 
@@ -542,7 +547,7 @@ and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH` a
   the call has already answered `[rag_unavailable] timeout`.
 - **A failed read refuses no call and is not an outage.** When the read fails or times out, the engine
   answers with the last answer it read, or with the `date` field when it never read one, logs one
-  warning (logger `rag_engine.store`, with the class and the text of the client's error), and reads
+  warning (logger `rag_engine.store`, naming the error's class only: see Privacy above), and reads
   again `MOF_RAG_DATE_FILTER_RETRY` seconds later (30) at the earliest; the calls made meanwhile ask
   nothing. The toolset does not remember that failure: no `[rag_unavailable]` follows from it,
   `server_info` stays `ready`, and only the search itself says whether Qdrant answers. So with Qdrant

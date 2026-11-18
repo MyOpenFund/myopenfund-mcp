@@ -56,7 +56,9 @@ Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown
   `rag_codes_retry_s` seconds.
 
 No error message and no `info()` holds the Qdrant host, the API key, a raw response body or the text
-of a query, and neither does a log line of this module (logger `myopenfund_mcp.rag`). The HTTP
+of a query, and neither does a log line of this module (logger `myopenfund_mcp.rag`) nor of rag-engine
+(loggers `rag_engine` and `rag_engine.*`): building the backend routes the engine's records through
+`EngineLogFilter`, which writes those that carry an error without its text (see there). The HTTP
 libraries under the Qdrant client are another matter: `httpx` logs one INFO line per request with
 the server's address, which is why the CLI raises that logger to WARNING, and `httpcore` logs the
 host and port of each connection at DEBUG, a level the CLI never turns on.
@@ -131,6 +133,97 @@ REASONS = {
     "busy": "too many searches are running and none finished within the time allowed for one call; "
             "retry later",
 }
+
+
+#: The engine's warning when the payload schema of a collection cannot be read (rag_engine.store,
+#: `uses_date_intervals`): its arguments are (collection, error class, error, mode used meanwhile,
+#: seconds before the next try). Rewritten without the error itself.
+_SCHEMA_WARNING = ("The payload schema of Qdrant collection %r could not be read (%s: %s): date filters in auto "
+                   "mode use %s until it can; next try in %g seconds at the earliest")
+class EngineLogFilter(logging.Filter):
+    """Keeps the server's log free of what rag-engine's records may carry from a failed request: the
+    Qdrant host (in the client's error, a TLS error), a response body (a proxy's error page naming an
+    upstream host or an internal address), the engine's hint naming `QDRANT_API_KEY`.
+
+    A record of an engine logger is reduced when an exception is among its arguments, when it carries
+    an exception (`logger.exception`, `exc_info`), or when its text holds the configured Qdrant host or
+    API key. What is kept: the logger, the level, and a fixed message naming the class of each
+    exception. The engine's warning on a schema read that failed keeps, besides, its collection, the
+    filter used meanwhile and the delay before the next try. A record without any of these (the INFO
+    lines naming a collection and the filter in use) is written as the engine wrote it. Never drops a
+    record."""
+
+    def __init__(self):
+        super().__init__()
+        self._secrets: set[str] = set()
+
+    def protect(self, *values: str | None) -> None:
+        """Values that must never be written (the configured host, the API key)."""
+        self._secrets.update(value for value in values if value)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        errors = [arg for arg in args if isinstance(arg, BaseException)]
+        if record.exc_info and isinstance(record.exc_info, tuple) and record.exc_info[1] is not None:
+            errors.append(record.exc_info[1])
+        if not errors:
+            try:
+                text = record.getMessage()
+            except Exception:  # noqa: BLE001 -- a malformed record: reduced rather than written
+                text = None
+            if text is not None and not any(secret in text for secret in self._secrets):
+                return True
+        classes = ", ".join(dict.fromkeys(type(error).__name__ for error in errors)) or "none"
+        if record.msg == _SCHEMA_WARNING and len(args) == 5:
+            record.msg = ("The payload schema of Qdrant collection %r could not be read (%s; its text is "
+                          "not logged): date filters in auto mode use %s until it can; next try in %g "
+                          "seconds at the earliest")
+            record.args = (args[0], classes, args[3] if isinstance(args[3], str) else "the last known answer",
+                           args[4] if isinstance(args[4], (int, float)) else 0)
+        else:
+            record.msg = ("rag-engine logged a message about an error (%s); its text is not logged: it may "
+                          "hold the vector database's address, a response body or a credential hint")
+            record.args = (classes,)
+        record.exc_info = record.exc_text = record.stack_info = None
+        return True
+
+
+ENGINE_LOG_FILTER = EngineLogFilter()
+
+
+class _EngineLogRelay(logging.Handler):
+    """The first handler of the `rag_engine` logger, which no longer propagates: every record of the
+    engine, from `rag_engine` or any `rag_engine.*` logger, existing or created later, goes through
+    `ENGINE_LOG_FILTER` here, then on to the root logger's handlers, as it would have propagated (a
+    handler attached to both loggers, as pytest attaches its own, is left to get it from `rag_engine`)."""
+
+    def __init__(self):
+        super().__init__(level=logging.NOTSET)
+        self.addFilter(ENGINE_LOG_FILTER)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        engine = logging.getLogger("rag_engine").handlers
+        for handler in logging.getLogger().handlers:
+            if handler not in engine and record.levelno >= handler.level:
+                handler.handle(record)
+
+
+def install_engine_log_filter(*secrets: str | None) -> None:
+    """Route the engine's records through `ENGINE_LOG_FILTER` (once), and protect `secrets` too. The
+    filter is also put on the engine's loggers that exist already: a record is reduced before any handler
+    sees it, whatever the order of the handlers."""
+    ENGINE_LOG_FILTER.protect(*secrets)
+    engine = logging.getLogger("rag_engine")
+    # By name: a module imported again (tests do) defines the class again, and one relay is enough.
+    if not any(type(handler).__name__ == _EngineLogRelay.__name__ for handler in engine.handlers):
+        engine.handlers.insert(0, _EngineLogRelay())
+    engine.propagate = False
+    for name in [name for name in list(logging.root.manager.loggerDict) if name.startswith("rag_engine.")]:
+        logger = logging.getLogger(name)
+        if ENGINE_LOG_FILTER not in logger.filters:
+            logger.addFilter(ENGINE_LOG_FILTER)
+    if ENGINE_LOG_FILTER not in engine.filters:
+        engine.addFilter(ENGINE_LOG_FILTER)
 
 
 class RagBackend(Protocol):
@@ -216,6 +309,7 @@ class EngineRagBackend:
     a deployment builds both from the settings."""
 
     def __init__(self, settings: Settings, *, store: Any = None, embedder: Any = None):
+        install_engine_log_filter(settings.rag_qdrant_host, settings.rag_qdrant_api_key)
         self._collection = settings.rag_collection
         self._ttl_s = settings.rag_codes_ttl_s
         self._codes_retry_s = settings.rag_codes_retry_s
@@ -575,7 +669,8 @@ class EngineRagBackend:
     def _date_filter_mode(self) -> str:
         """`interval` or `legacy` for `auto` mode: the engine's own reading of the collection, at most
         one request (none while its answer is fresh or a failed read is recent). It never raises for
-        Qdrant: a failed read gives the last answer, or `legacy`, and is the engine's to log."""
+        Qdrant: a failed read gives the last answer, or `legacy`, and is the engine's to log (one
+        warning, written without the error's text by `EngineLogFilter`)."""
         uses = self._store.uses_date_intervals(self._collection, max_age=self._date_refresh,
                                                retry_after=self._date_retry)
         return "interval" if uses else "legacy"

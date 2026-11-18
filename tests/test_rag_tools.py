@@ -1379,6 +1379,111 @@ async def test_a_failed_schema_read_refuses_no_call_and_is_not_remembered_as_an_
     assert not [r for r in caplog.records if r.name == "myopenfund_mcp.rag" and r.levelno >= logging.WARNING]
 
 
+# What a proxy or a TLS layer in front of Qdrant answers when the schema read fails: each names a host,
+# an address or a hint that must reach no log record, whatever the logger.
+PROXY_BODY = b'{"status":{"error":"upstream qdrant-prod.internal:6333 refused the connection"}}'
+NGINX_502 = b"<html><head><title>502 Bad Gateway</title></head><body>upstream 10.0.4.17:6333</body></html>"
+SCHEMA_FAILURES = [
+    UnexpectedResponse(500, "Internal Server Error", PROXY_BODY, httpx.Headers()),
+    UnexpectedResponse(502, "Bad Gateway", NGINX_502, httpx.Headers()),
+    ResponseHandlingException(httpx.ConnectError(
+        f"[SSL: CERTIFICATE_VERIFY_FAILED] hostname '{HOST}' doesn't match 'qdrant-prod.internal'")),
+    UnexpectedResponse(401, "Unauthorized", b'{"status":{"error":"Invalid api-key k-hunter2"}}', httpx.Headers()),
+]
+LEAKS = (HOST, KEY, "qdrant-prod.internal", "10.0.4.17", "6333", "upstream", "<html", "Raw response", "api-key",
+         "QDRANT_API_KEY", "secret-term", "council")
+
+
+def _record_texts(records) -> list[str]:
+    """Everything a handler could write of each record: the message, the exception and the stack."""
+    texts = []
+    for record in records:
+        texts.append(record.getMessage())
+        if record.exc_info:
+            texts.append(logging.Formatter().formatException(record.exc_info))
+        texts.extend(filter(None, (record.exc_text, record.stack_info)))
+    return texts
+
+
+@pytest.mark.parametrize("failure", SCHEMA_FAILURES, ids=["proxy-500", "nginx-502", "tls", "auth-401"])
+async def test_a_failed_schema_read_leaves_no_host_body_or_key_in_any_log_record(seeded, monkeypatch, caplog,
+                                                                                 failure):
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    schema.schema.failure = failure
+    caplog.set_level(logging.DEBUG)
+    backend = EngineRagBackend(_settings(), store=schema, embedder=fake)
+    async with _client(backend) as c:
+        data = (await c.call_tool("rag_search", {"query": "secret-term what did the council decide",
+                                                 "date_from": "2022-01-01"})).data
+    assert data["count"] > 0
+    engine = [r for r in caplog.records if r.name.startswith("rag_engine")]
+    warned = [r for r in engine if r.levelno == logging.WARNING]
+    assert len(warned) == 1  # the engine's warning is kept, at its level, with the class of the error
+    assert type(failure).__name__ in warned[0].getMessage() or "QdrantAuthError" in warned[0].getMessage()
+    assert COLLECTION in warned[0].getMessage() and "legacy" in warned[0].getMessage()
+    for text in _record_texts(caplog.records):
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
+
+
+def test_any_engine_record_carrying_an_error_is_reduced_to_its_class(seeded, caplog):
+    """Not only the known warning: any record of an engine logger with an exception among its arguments, an
+    attached exception, or the server's host or key in its text, is written without them."""
+    import rag_engine.embedding
+
+    store, fake = seeded
+    EngineRagBackend(_settings(), store=store, embedder=fake)  # installs the filter
+    caplog.set_level(logging.DEBUG)
+    error = UnexpectedResponse(502, "Bad Gateway", NGINX_502, httpx.Headers())
+    for logger in (logging.getLogger("rag_engine.store"), logging.getLogger(rag_engine.embedding.__name__),
+                   logging.getLogger("rag_engine"), logging.getLogger("rag_engine.some_future_module")):
+        logger.error("something failed: %s", error)
+        try:
+            raise error
+        except UnexpectedResponse:
+            logger.exception("something failed")
+        logger.warning("could not reach %s with %s", HOST, KEY)
+        logger.info("Qdrant collection %r has no datetime index", COLLECTION)  # nothing to hide: kept as it is
+    records = [r for r in caplog.records if r.name.startswith("rag_engine")]
+    assert len(records) == 16 and {r.levelno for r in records} == {logging.ERROR, logging.WARNING, logging.INFO}
+    for text in _record_texts(records):
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
+    assert all("UnexpectedResponse" in r.getMessage() for r in records if r.levelno == logging.ERROR)
+    kept = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    assert kept == [f"Qdrant collection {COLLECTION!r} has no datetime index"] * 4
+
+
+def test_an_engine_record_reaches_the_root_handlers_once_reduced_whatever_its_logger(seeded):
+    """As in a deployment: one handler on the root logger (the CLI's). A logger of the engine created after
+    the filter was installed is covered too, and nothing is written twice or dropped."""
+    store, fake = seeded
+    EngineRagBackend(_settings(), store=store, embedder=fake)
+    EngineRagBackend(_settings(), store=store, embedder=fake)  # built twice: still one relay
+
+    class Collect(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    collect, root = Collect(), logging.getLogger()
+    root.addHandler(collect)
+    try:
+        logging.getLogger("rag_engine.created_later").warning("failed: %s", _response(502))
+        logging.getLogger("rag_engine.created_later").warning("plain line")
+    finally:
+        root.removeHandler(collect)
+    assert [r.getMessage() for r in collect.records] == [
+        ("rag-engine logged a message about an error (UnexpectedResponse); its text is not logged: it may hold "
+         "the vector database's address, a response body or a credential hint"), "plain line"]
+    relays = [h for h in logging.getLogger("rag_engine").handlers if type(h).__name__ == "_EngineLogRelay"]
+    assert len(relays) == 1 and logging.getLogger("rag_engine").handlers[0] is relays[0]
+
+
 async def test_a_filter_the_collection_refuses_for_a_missing_index_is_search_refused(seeded, monkeypatch, caplog):
     """rag-engine raises its own MissingIndexError for the HTTP 400 of a collection in strict mode."""
     store, fake = seeded
