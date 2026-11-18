@@ -21,8 +21,11 @@ COPY --from=build /opt/venv /opt/venv
 RUN mkdir /models && chown 10001:10001 /models
 # MOF_MCP_HOST=0.0.0.0 is inside the container only: what is published on the host is the
 # deployment's choice (compose.example.yaml binds 127.0.0.1 by default).
+# ORT_DISABLE_TELEMETRY=1: the ONNX runtime of the rag extra sends usage events to its publisher
+# unless told not to. The server sets it for itself too; here it also covers `docker run ... python`.
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
+    ORT_DISABLE_TELEMETRY=1 \
     MOF_MCP_TRANSPORT=http \
     MOF_MCP_HOST=0.0.0.0 \
     MOF_MCP_PORT=8000
