@@ -63,8 +63,7 @@ title, date, date_precision, date_kind, source_code, doc_type, language, page, c
 written as its first day. `date_kind` (such as publication or meeting, or null) says what the date marks. \
 `page`, where the passage starts, is counted from 1 (null without pages). Quote `text` and cite each \
 passage with its `citation`, a ready-made reference: title, then source and document-type codes and date \
-in brackets, then the page, each part the document lacks left out. Several hits may come from the same \
-document."""
+in brackets, then the page, each part the document lacks left out. Several hits may share a document."""
 
 QUERY_DESCRIPTION = "What to look for, in plain language (a question or a topic). Required."
 # No example value on purpose: a small model sends a placeholder as it is written.
@@ -79,7 +78,7 @@ LANGUAGES_DESCRIPTION = ("Languages to keep: JSON array of strings, each an exac
 DATE_MATCHING = {
     "auto": "a document known only to the month or the year matches any range overlapping its period",
     "interval": "a document known only to the month or the year matches any range overlapping its period",
-    "legacy": "a document known only to the month or the year is found only at the first day of its period",
+    "legacy": "a document known only to the month or the year is found only on its period's first day",
 }
 DATE_FROM_DESCRIPTION = "Earliest date, YYYY-MM-DD, inclusive"
 DATE_TO_DESCRIPTION = "Latest date, YYYY-MM-DD, inclusive"

@@ -161,9 +161,21 @@ async def test_the_description_says_how_a_bound_treats_a_month_or_a_year_in_the_
     async with _client(backend, rag_date_filter_mode=mode) as c:
         description = {t.name: t for t in await c.list_tools()}["rag_search"].description
     assert (DATES_SENTENCE in description) is overlap
-    legacy = ("With a bound set, a document known only to the month or the year is found only at the first day of "
-              "its period; documents without a date are left out unless include_undated is true.")
+    legacy = ("With a bound set, a document known only to the month or the year is found only on its period's first "
+              "day; documents without a date are left out unless include_undated is true.")
     assert (legacy in description) is not overlap
+
+
+@pytest.mark.parametrize("mode", ["auto", "interval", "legacy"])
+def test_the_description_stays_under_its_cap_in_the_worst_case(mode):
+    """The longest limits the settings accept (MOF_RAG_MAX_LIMIT and MOF_RAG_DEFAULT_LIMIT at 1000), in every
+    date filter mode, without notes: under the 1800 characters the README states."""
+    from myopenfund_mcp.rag.tools import search_description
+
+    worst = Settings.from_env({"MOF_RAG_MAX_LIMIT": "1000", "MOF_RAG_DEFAULT_LIMIT": "1000",
+                               "MOF_RAG_DATE_FILTER_MODE": mode})
+    assert "from 1 to 1000; omitted = 1000." in search_description(worst)
+    assert len(search_description(worst)) < 1800
 
 
 async def test_a_hit_carries_the_passage_its_document_and_a_citation_and_nothing_else(backend):
