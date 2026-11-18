@@ -1131,6 +1131,19 @@ def test_the_readme_documents_the_codes_every_reason_and_every_argument():
     readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
     for needle in ("`rag_unavailable`", "`limit_exceeded`", "`rag_search`", *(f"`{r}`" for r in backend_module.REASONS),
                    "`source_codes`", "`doc_types`", "`languages`", "`date_from`, `date_to`", "`limit`", "`citation`",
-                   "the first page is 1"):
+                   "the first page is 1", "`ORT_DISABLE_TELEMETRY`", "`HF_HUB_OFFLINE=1`", "`mem_limit: 3g`",
+                   "no outbound connection", "MOF_RAG_DESCRIPTION_NOTES="):
         assert needle in readme, needle
 
+
+def test_the_suggested_notes_of_the_readme_fit_the_setting():
+    """The value the README suggests for the central-bank collection is accepted as it is written."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    line = next(line for line in readme.splitlines() if line.startswith("MOF_RAG_DESCRIPTION_NOTES="))
+    settings = Settings.from_env({"MOF_RAG_DESCRIPTION_NOTES": line.split("=", 1)[1]})
+    for needle in ('"A2" policy statement (for the ECB: the press-conference page, with its questions and answers)',
+                   ('"B1" press-conference material (Federal Reserve: transcript; ECB: the combined decision and '
+                    "statement, without the Q&A)"), '"E1" monetary policy report or staff projections',
+                   '"F1" economic projections', '"A1" rate-decision press release',
+                   '"A3" minutes or accounts of the meeting'):
+        assert needle in settings.rag_description_notes, needle

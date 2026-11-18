@@ -32,10 +32,12 @@ services:
       HF_HUB_OFFLINE: "1"
     # With the rag toolset (MOF_EXTRAS with rag; MOF_RAG_* in .env, MOF_RAG_MODEL_CACHE=/models and a
     # READ-ONLY Qdrant key in MOF_RAG_QDRANT_API_KEY): the embedding model (about 1.1 GB) lives in a named
-    # volume. Fill it once with the command of the README ("Deploying the rag toolset"; it mounts the volume
-    # read-write and needs outbound HTTPS to huggingface.co), then mount it read-only here: the running
-    # server never downloads or writes a model file. Give the container at least 2 GB of memory (about
-    # 1.9 GB while the model loads, 1.5 GB afterwards); with a CPU limit, set MOF_RAG_ONNX_THREADS to it.
+    # volume. Fill it once (README, "Deploying the rag toolset": the fill mounts the volume read-write and
+    # needs outbound HTTPS to huggingface.co), then mount it read-only here: the running server never
+    # downloads or writes a model file.
+    # Memory: give the container AT LEAST 3 GB. The process peaks at about 2 GB at every start, while the
+    # model loads, and stays around 1.5 GB afterwards; with less it is killed at start. With a CPU limit,
+    # set MOF_RAG_ONNX_THREADS to it.
     # Uncomment these two blocks and the `volumes:` block at the end of the file:
     # volumes:
     #   - rag-models:/models:ro
@@ -50,5 +52,99 @@ services:
 #     external: true
 #     name: ${MOF_VAULT_DOCKER_NETWORK}
 # volumes:
+#   rag-models:
+#     name: myopenfund-mcp-rag-models
+
+# --- Variant: no locally built image ---------------------------------------------------------------
+# Where an image cannot be built (a compose-only UI, no build context), replace the `mcp` service above
+# with the services below. `install` runs once as root at each start of the stack: it installs the
+# package, at a commit you pin, into a named volume. `mcp` then serves from that volume, mounted
+# read-only, with the same hardening as above. A restart of `mcp` alone needs no network.
+# `rag-model-fill` is for the FIRST start with the rag toolset only: it downloads the embedding model
+# into its volume (outbound HTTPS to huggingface.co and the hosts it redirects to, a writable HOME) and
+# verifies it. Check its log, then delete the service and the `rag-model-fill` entry of `depends_on`.
+# (`install` gives the model volume to the service user: a new named volume belongs to root.)
+# services:
+#   install:
+#     image: python:3.13-slim
+#     restart: "no"
+#     volumes:
+#       - venv:/opt/venv
+#       - rag-models:/models
+#     command:
+#       - sh
+#       - -c
+#       - >-
+#         chown 10001:10001 /models &&
+#         apt-get update -qq &&
+#         apt-get install -y -qq --no-install-recommends git &&
+#         python -m venv --clear /opt/venv &&
+#         /opt/venv/bin/pip install -q --no-cache-dir
+#         'myopenfund-mcp[vault,rag] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'
+#   rag-model-fill:
+#     image: python:3.13-slim
+#     restart: "no"
+#     depends_on:
+#       install:
+#         condition: service_completed_successfully
+#     user: "10001:10001"
+#     tmpfs: [/tmp]
+#     environment:
+#       HOME: /tmp
+#       ORT_DISABLE_TELEMETRY: "1"
+#     volumes:
+#       - venv:/opt/venv:ro
+#       - rag-models:/models
+#     command:
+#       - /opt/venv/bin/python
+#       - -c
+#       - >-
+#         from rag_engine.config import Settings;
+#         from rag_engine.embedding import make_embedder;
+#         make_embedder(Settings(backend='onnx', model_cache='/models')).release()
+#   mcp:
+#     image: python:3.13-slim
+#     restart: unless-stopped
+#     depends_on:
+#       install:
+#         condition: service_completed_successfully
+#       rag-model-fill:
+#         condition: service_completed_successfully
+#     user: "10001:10001"
+#     read_only: true
+#     tmpfs: [/tmp]
+#     cap_drop: [ALL]
+#     security_opt: [no-new-privileges:true]
+#     mem_limit: 3g
+#     env_file: .env
+#     environment:
+#       HOME: /tmp
+#       PYTHONUNBUFFERED: "1"
+#       MOF_MCP_TRANSPORT: http
+#       MOF_MCP_HOST: 0.0.0.0
+#       MOF_MCP_PORT: "8000"
+#       ORT_DISABLE_TELEMETRY: "1"
+#       HF_HUB_OFFLINE: "1"
+#     volumes:
+#       - venv:/opt/venv:ro
+#       - rag-models:/models:ro
+#     ports:
+#       - "${MOF_MCP_BIND_ADDR:-127.0.0.1}:${MOF_MCP_BIND_PORT:-8000}:8000"
+#     command: [/opt/venv/bin/myopenfund-mcp, serve]
+#     healthcheck:
+#       test:
+#         - CMD
+#         - /opt/venv/bin/python
+#         - -c
+#         - import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8000/health', timeout=4)
+#       interval: 30s
+#       timeout: 5s
+#       start_period: 60s
+#       retries: 3
+#     # Qdrant on the same Docker host: join its network and use its service name and INTERNAL port in
+#     # MOF_RAG_QDRANT_HOST / MOF_RAG_QDRANT_PORT (uncomment, and declare the network as `vault` is above).
+#     # networks: [qdrant]
+# volumes:
+#   venv:
 #   rag-models:
 #     name: myopenfund-mcp-rag-models
