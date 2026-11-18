@@ -151,8 +151,8 @@ class EngineLogFilter(logging.Filter):
 
     A record of an engine logger is reduced when an exception is among its arguments, when it carries
     an exception (`logger.exception`, `exc_info`), or when its text holds the configured Qdrant host
-    (with or without a port) or API key as a whole token (`_sensitive`; the configured collection, as
-    the engine quotes it, never counts). What is kept: the logger, the level, and a fixed message naming the class of each
+    (as a whole token, as configured or lowercased, with or without a port) or API key (anywhere) (`_sensitive`; the
+    configured collection, as the engine quotes it, never counts unless it is also the host). What is kept: the logger, the level, and a fixed message naming the class of each
     exception. The engine's warning on a schema read that failed keeps, besides, its collection, the
     filter used meanwhile and the delay before the next try. A record without any of these (the INFO
     lines naming a collection and the filter in use) is written as the engine wrote it. Never drops a
@@ -161,33 +161,44 @@ class EngineLogFilter(logging.Filter):
     def __init__(self):
         super().__init__()
         self._protecting = threading.Lock()  # one change at a time
-        # (protected values, collections, the pattern of the values): replaced whole, never changed, so
-        # a thread that logs reads one consistent state without a lock while another backend is built.
-        self._state: tuple[frozenset[str], frozenset[str], re.Pattern | None] = (frozenset(), frozenset(), None)
+        # (hosts, keys, collections, the pattern of the hosts): replaced whole, never changed, so a thread
+        # that logs reads one consistent state without a lock while another backend is built.
+        self._state: tuple[frozenset[str], frozenset[str], frozenset[str], re.Pattern | None] = (
+            frozenset(), frozenset(), frozenset(), None)
 
     def protect(self, host: str | None, key: str | None, collection: str | None = None) -> None:
         """The configured host and API key must never be written; the collection is not sensitive."""
         with self._protecting:
-            secrets, collections, _ = self._state
-            secrets = secrets | {value for value in (host, key) if value}
+            hosts, keys, collections, _ = self._state
+            if host:
+                # As configured and lowercased (the HTTP client writes it lowercased in its errors), bare
+                # too when it was configured as a bracketed IPv6 literal. Not matched without case: the
+                # engine's own lines start with the word "Qdrant", a usual host name.
+                hosts = hosts | {host, host.lower(), host.strip("[]"), host.strip("[]").lower()}
+            keys = keys | ({key} if key else set())
             collections = collections | ({collection} if collection else set())
-            # Not inside a longer name: no name character before, none after (a dot ending a sentence is
-            # no part of a name, a dot followed by a name character is). Longest first.
-            alternatives = "|".join(re.escape(value) for value in sorted(secrets, key=len, reverse=True))
+            # A host is not inside a longer name: no name character before, none after (a dot ending a
+            # sentence is no part of a name, a dot followed by a name character is). Longest first.
+            alternatives = "|".join(re.escape(value) for value in sorted(hosts, key=len, reverse=True))
             pattern = (re.compile(rf"(?<![A-Za-z0-9._-])(?:{alternatives})(?::[0-9]+)?(?![A-Za-z0-9_-]|\.[A-Za-z0-9])")
-                       if secrets else None)
-            self._state = (frozenset(secrets), frozenset(collections), pattern)
+                       if hosts else None)
+            self._state = (frozenset(hosts), frozenset(keys), frozenset(collections), pattern)
 
     def _sensitive(self, text: str) -> bool:
-        """Whether `text` holds a protected value as a whole token: the host (with or without `:port`) or
-        the key, bounded by characters a host name or a key cannot hold. `qdrant` is found in
-        `http://qdrant:6333/`, not in `qdrant-docs` nor in `qdrant.example.org`. A configured collection
-        written as the engine writes it, quoted (`'qdrant'`), is taken out first."""
-        _, collections, pattern = self._state
+        """Whether `text` holds a protected value. The key anywhere, as a plain substring (a false alarm
+        on a key costs one reduced line). The host as a whole token, as configured or lowercased, with or
+        without `:port`: `Qdrant-Prod` is found in `http://qdrant-prod:6333/`, `qdrant` is not found in
+        `qdrant-docs`, `qdrant.example.org` nor the engine's word "Qdrant". A configured collection written as the engine writes it, quoted
+        (`'qdrant-docs'`), is taken out first, unless it is also a protected host."""
+        hosts, keys, collections, pattern = self._state
+        if any(key in text for key in keys):
+            return True
         if pattern is None:
             return False
+        lowered = {host.lower() for host in hosts}
         for collection in collections:
-            text = text.replace(repr(collection), "")
+            if collection.lower() not in lowered:
+                text = text.replace(repr(collection), "")
         return pattern.search(text) is not None
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -391,6 +402,9 @@ class EngineRagBackend:
         # A search was refused as a request: the next call checks the collection before it searches
         # (a collection recreated with another vector size refuses every search). Refuses nobody.
         self._recheck = False
+        # The class of the last unexpected search error logged at ERROR: one line per new class, not per
+        # call, until a search is served again.
+        self._unexpected_logged: str | None = None
         self._checking = False  # a call is running the collection check
         self._logged: tuple[str, str] | None = None  # the failure last logged: (what failed, reason)
         self._values: dict[str, frozenset[str] | None] | None = None  # None: not known (yet)
@@ -496,6 +510,7 @@ class EngineRagBackend:
     def _served(self) -> None:
         """A search succeeded: Qdrant answers, whatever a search that failed meanwhile recorded."""
         with self._lock:
+            self._unexpected_logged = None
             if self._collection_reason is None or self._from_search:
                 # A failure remembered from a search (not from a check) is disproved the same way.
                 self._collection_reason = self._failed_at = None
@@ -780,10 +795,14 @@ class EngineRagBackend:
                     # Not raised on: FastMCP would log the text and the traceback of the exception, which
                     # may hold the host, the key or a response body. A developer gets them at DEBUG level,
                     # which the CLI never turns on.
-                    log.error("rag: a search failed with an unexpected error (%s); rag_search answered "
-                              "[rag_unavailable] internal_error. Its text and traceback, which may hold the "
-                              "vector database's address or a response body, are logged at DEBUG level only",
-                              type(exc).__name__)
+                    with self._lock:
+                        first = self._unexpected_logged != type(exc).__name__
+                        self._unexpected_logged = type(exc).__name__
+                    log.log(logging.ERROR if first else logging.DEBUG,
+                            "rag: a search failed with an unexpected error (%s); rag_search answered "
+                            "[rag_unavailable] internal_error. Its text and traceback, which may hold the "
+                            "vector database's address or a response body, are logged at DEBUG level only",
+                            type(exc).__name__)
                     log.debug("rag: the unexpected error of a search", exc_info=exc)
                     error = unavailable("internal_error")
                 else:

@@ -1514,25 +1514,79 @@ def test_an_engine_record_reaches_the_root_handlers_once_reduced_whatever_its_lo
 
 @pytest.mark.parametrize("collection", ["qdrant-docs", "qdrant"])
 def test_the_host_and_the_key_are_matched_as_whole_tokens_never_the_collection(seeded, caplog, collection):
-    """A host named `qdrant` and a collection `qdrant-docs` (or `qdrant` itself): the engine's ordinary
-    lines naming the collection are kept; the host itself, alone or with a port, is not written. The
-    collection is exempt as the engine writes it, quoted (`%r`): `'qdrant'`."""
+    """A host named `qdrant` and a collection `qdrant-docs`: the engine's ordinary lines naming the
+    collection are kept; the host itself, alone, with a port or in capitals, is not written; the key is
+    not written anywhere, even inside a longer word. A collection named like the host gives no exemption
+    to the host: the engine's line naming it is reduced too."""
     store, fake = seeded
     EngineRagBackend(_settings(rag_qdrant_host="qdrant", rag_qdrant_api_key="k1", rag_collection=collection),
                      store=store, embedder=fake)
     caplog.set_level(logging.DEBUG)
     engine = logging.getLogger("rag_engine.store")
-    kept = [(f"Qdrant collection {collection!r} has datetime indexes on date_start and date_end: date filters "
-             "in auto mode use the intervals"), "talking to qdrant.example.org and qdrant-backup", "token k10 or xk1"]
+    named = (f"Qdrant collection {collection!r} has datetime indexes on date_start and date_end: date filters "
+             "in auto mode use the intervals")
+    kept = ([named] if collection != "qdrant" else []) + ["talking to qdrant.example.org and qdrant-backup"]
     for line in kept:
         engine.info(line)
-    for line in ("could not reach qdrant", "could not reach qdrant:6333", "url http://qdrant:6333/collections",
-                 'host "qdrant" refused', "api-key=k1", "key k1."):
+    reduced = ["could not reach qdrant", "could not reach qdrant:6333", "url http://qdrant:6333/collections",
+               'host "qdrant" refused', "api-key=k1", "key k1.", "token k10 or xk1",
+               "KEY_k1-next"] + ([named] if collection == "qdrant" else [])
+    for line in reduced:
         engine.warning(line)
     messages = [r.getMessage() for r in caplog.records if r.name == "rag_engine.store"]
-    assert messages[:3] == kept
-    assert all(m.startswith("rag-engine logged a message about an error") for m in messages[3:]), messages[3:]
-    assert len(messages) == 9
+    assert messages[:len(kept)] == kept
+    assert all(m.startswith("rag-engine logged a message about an error") for m in messages[len(kept):]), messages
+    assert len(messages) == len(kept) + len(reduced)
+
+
+def test_a_host_configured_with_capitals_is_matched_as_the_client_writes_it(seeded, caplog):
+    store, fake = seeded
+    EngineRagBackend(_settings(rag_qdrant_host="Qdrant-Prod.Internal"), store=store, embedder=fake)
+    caplog.set_level(logging.DEBUG)
+    engine = logging.getLogger("rag_engine.store")
+    engine.warning("url http://qdrant-prod.internal:6333/collections")
+    engine.warning("host Qdrant-Prod.Internal refused")
+    engine.info("Qdrant collection 'c' is ready")  # the engine's word, not the host
+    messages = [r.getMessage() for r in caplog.records if r.name == "rag_engine.store"]
+    assert [m.startswith("rag-engine logged a message about an error") for m in messages] == [True, True, False]
+
+
+def test_a_host_configured_as_a_bracketed_ipv6_literal_is_also_matched_bare(seeded, caplog):
+    store, fake = seeded
+    EngineRagBackend(_settings(rag_qdrant_host="[fd00::17]"), store=store, embedder=fake)
+    caplog.set_level(logging.DEBUG)
+    engine = logging.getLogger("rag_engine.store")
+    engine.warning("could not reach fd00::17 port 6333")
+    engine.warning("url http://[fd00::17]:6333/collections")
+    engine.info("collection 'c' is ready")
+    messages = [r.getMessage() for r in caplog.records if r.name == "rag_engine.store"]
+    assert [m.startswith("rag-engine logged a message about an error") for m in messages] == [True, True, False]
+
+
+def test_an_unexpected_error_repeated_is_logged_at_error_once_until_a_search_is_served(backend, monkeypatch,
+                                                                                       caplog):
+    real = backend_module.search
+    failing = {"on": True}
+
+    def search(*args, **kwargs):
+        if failing["on"]:
+            raise RuntimeError("bug")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(backend_module, "search", search)
+    caplog.set_level(logging.INFO, logger="myopenfund_mcp.rag")
+    for _ in range(5):
+        with pytest.raises(ToolError, match="internal_error"):
+            backend.search(query="x", filters={}, limit=1, max_limit=5)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name == "myopenfund_mcp.rag"]
+    assert len(errors) == 1
+    failing["on"] = False
+    backend.search(query="x", filters={}, limit=1, max_limit=5)
+    failing["on"] = True
+    with pytest.raises(ToolError, match="internal_error"):
+        backend.search(query="x", filters={}, limit=1, max_limit=5)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name == "myopenfund_mcp.rag"]
+    assert len(errors) == 2  # served in between: the next one is logged again
 
 
 def test_the_engine_log_filter_can_be_given_values_while_threads_log():
