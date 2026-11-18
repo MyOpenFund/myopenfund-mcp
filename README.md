@@ -163,6 +163,8 @@ into a volume at each start of the stack.
    shell history.
 
    ```bash
+   # Run this first line alone and type the key: pasted with the lines below, some shells
+   # (bash before 5.1, the bash of macOS) take the next pasted line as the key.
    printf 'read-only key: '; read -rs MOF_KEY_CHECK; echo
    curl -s -o /dev/null -w '%{http_code}\n' -H "api-key: $MOF_KEY_CHECK" http://<qdrant-host>:<qdrant-port>/collections/<collection>
    curl -s -o /dev/null -w '%{http_code}\n' -H "api-key: $MOF_KEY_CHECK" -H 'Content-Type: application/json' -X PUT -d '{"vectors":{"size":4,"distance":"Cosine"}}' http://<qdrant-host>:<qdrant-port>/collections/mof-key-check
@@ -192,6 +194,7 @@ into a volume at each start of the stack.
    The key is typed at a prompt here too:
 
    ```bash
+   # Alone first, as in step 1.
    printf 'key that can write: '; read -rs QDRANT_API_KEY; echo; export QDRANT_API_KEY
    QDRANT_HOST=<qdrant-host> QDRANT_PORT=<qdrant-port> python -c "from rag_engine.store import QdrantStore; print(QdrantStore().ensure_payload_indexes('<collection>'))"
    unset QDRANT_API_KEY
@@ -424,6 +427,9 @@ Example call and result (text shortened):
   - **A failed search refuses nobody else.** It only makes the next call check the collection before
     its own search. With a healthy Qdrant (one slow request, one caller's timeout) that check takes a
     few milliseconds and the call is served; a search that succeeds meanwhile cancels the check.
+    When the check passes and the search that follows fails again before any search is served (Qdrant
+    answers the check and no search), that failure is remembered like a failed check: one call per
+    retry period pays for a request timeout, the others are answered at once.
   - **A failed collection check** (at start, or the one that follows a failed search) is remembered
     `MOF_RAG_CHECK_RETRY_S` seconds (5): the calls made meanwhile get its reason **at once**, without a
     request, and so do the calls that arrive while a check is running. Then one call checks again. So
@@ -433,7 +439,9 @@ Example call and result (text shortened):
     after Qdrant does.
   - **A search that Qdrant refuses as a request** (HTTP 4xx, other than a refused key, a missing
     collection, 408 and 429) is the error of that call alone: `[rag_unavailable] search_refused`,
-    nothing is remembered, nothing is checked, `server_info` stays `ready`. The usual cause is a
+    nobody else is refused and `server_info` stays `ready`. The next call checks the collection before
+    its search (a few milliseconds): when it is the collection that changed (recreated with another
+    vector size, every search is refused), that check says so with `collection_mismatch`. The usual cause is a
     collection in strict mode asked to filter on a field that has no payload index (a date bound without
     the datetime index on `date`): the filter cannot be served by the collection as it is indexed. Step 2
     of [Deploying the rag toolset](#deploying-the-rag-toolset) creates the indexes.

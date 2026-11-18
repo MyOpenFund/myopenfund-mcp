@@ -28,7 +28,7 @@ When Qdrant does not answer, a call pays for ONE request timeout at most:
 - a read of the filter values that fails for an outage ends the call: the search is not tried after it.
 A search that Qdrant refuses as a request (HTTP 4xx other than a refused key, a missing collection,
 408 and 429: a filter on a field without a payload index under strict mode, for instance) is the
-matter of that call alone: it answers `[rag_unavailable] search_refused`, and nothing is recorded.
+matter of that call alone: it answers `[rag_unavailable] search_refused`, and refuses nobody else (the next call checks the collection first).
 No lock is held during a request to Qdrant.
 
 Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown code:
@@ -213,6 +213,13 @@ class EngineRagBackend:
         # Why a search or a read of the values failed since the last check or successful search:
         # the next call checks the collection before it searches. It refuses nobody by itself.
         self._suspected: str | None = None
+        # When a check passed after such a failure, until a search is served: a search that fails
+        # again meanwhile is remembered like a failed check (searches hang while the check answers).
+        self._passed_at: float | None = None
+        self._from_search = False  # the remembered failure is such a search, not a check
+        # A search was refused as a request: the next call checks the collection before it searches
+        # (a collection recreated with another vector size refuses every search). Refuses nobody.
+        self._recheck = False
         self._checking = False  # a call is running the collection check
         self._logged: tuple[str, str] | None = None  # the failure last logged: (what failed, reason)
         self._values: dict[str, frozenset[str] | None] | None = None  # None: not known (yet)
@@ -267,16 +274,23 @@ class EngineRagBackend:
                     changed = ("check", reason) != self._logged
                     self._collection_reason, self._logged = reason, ("check", reason)
                     self._failed_at, self._suspected = monotonic(), None
+                    self._passed_at, self._from_search = None, False
                 if changed:  # once per change of state, not once per call
                     log.warning("rag: collection check failed (%s, %s); rag_search answers [rag_unavailable] "
                                 "until a collection check passes", reason, type(exc).__name__)
                 return reason
             with self._lock:
-                back = self._collection_reason is not None or self._suspected == "collection_missing"
+                doubted = self._suspected is not None or self._from_search
+                back = ((self._collection_reason is not None and not self._from_search)
+                        or self._suspected == "collection_missing")
                 if back:
                     # Back after a failure: the collection may have been recreated with other codes.
                     self._values = self._values_due_at = self._values_tried_at = None
-                self._collection_reason = self._logged = self._failed_at = self._suspected = None
+                    self._logged = None
+                # After a failed search the check proves little: `_logged` is kept until a search is
+                # served, so a search that keeps failing is logged once, not once per check.
+                self._collection_reason = self._failed_at = self._suspected = None
+                self._passed_at, self._from_search = (monotonic() if doubted else None), False
             if back:  # not one line per check that follows a failed search
                 log.info("rag: collection %s checked, searches are served", self._collection)
             return None
@@ -291,7 +305,14 @@ class EngineRagBackend:
             changed = False
             if self._collection_reason is None:  # else a failed check already says more
                 changed = (what, reason) != self._logged
-                self._suspected, self._logged = reason, (what, reason)
+                self._logged = (what, reason)
+                if self._passed_at is not None:
+                    # The check passed and nothing was served since: the check answers, searches do
+                    # not. Remembered like a failed check, so one call per retry period pays for it.
+                    self._collection_reason, self._failed_at = reason, monotonic()
+                    self._suspected, self._passed_at, self._from_search = None, None, True
+                else:
+                    self._suspected = reason
         if changed:  # once per change of state, not once per call
             log.warning("rag: %s (%s, %s); the next call checks the collection before it searches",
                         what, reason, type(exc).__name__)
@@ -299,8 +320,8 @@ class EngineRagBackend:
     def _served(self) -> None:
         """A search succeeded: Qdrant answers, whatever a search that failed meanwhile recorded."""
         with self._lock:
-            if self._suspected is not None:
-                self._suspected = self._logged = None
+            if self._collection_reason is None:
+                self._suspected = self._logged = self._passed_at = None
 
     def _require_collection(self) -> None:
         """Return when searches are served; `_Outage` otherwise.
@@ -308,16 +329,18 @@ class EngineRagBackend:
         After a failed check, the check is run again by one call at a time, and not before
         `rag_check_retry_s` seconds: the other calls are answered at once with the recorded reason.
         After a failed search (or read of the values), the first call to come runs the check at
-        once; the calls that arrive while it runs are answered at once with the reason of that failure."""
+        once; the calls that arrive while it runs are answered at once with the reason of that failure.
+        After a refused search the first call to come runs the check too, and the others are served."""
         with self._lock:
             reason = self._collection_reason or self._suspected
-            if reason is None:
+            if reason is None and (not self._recheck or self._checking):
                 return
-            # `_failed_at` is set by a failed check only, and cleared by the check that passes.
+            # `_failed_at` is set by a failed check, or by a search that failed right after a check
+            # passed; it is cleared by the check that passes.
             recent = self._failed_at is not None and monotonic() - self._failed_at < self._check_retry_s
             if self._checking or recent:
                 raise _Outage(reason)
-            self._checking = True
+            self._checking, self._recheck = True, False
         reason = self._check_collection()
         if reason is not None:
             raise _Outage(reason)
@@ -526,7 +549,7 @@ class EngineRagBackend:
         Raises the tool errors itself: `[invalid_argument]` with the engine's own message for an
         argument the engine refuses or a filter value the collection does not hold,
         `[rag_unavailable]` with a reason for an outage or for a search Qdrant refuses (`search_refused`:
-        the error of this call alone, never recorded). Anything else is left to the server's masking.
+        the error of this call alone; the next call checks the collection before it searches). Anything else is left to the server's masking.
         """
         error = None
         try:
@@ -545,7 +568,10 @@ class EngineRagBackend:
             error = unavailable(exc.reason)
         except Exception as exc:  # mapped below, or re-raised as it is
             if _refused(exc):
-                # The request is refused, not the service: nothing is recorded, the other calls are served.
+                # The request is refused, not the service: the other calls are served. The next one
+                # checks the collection first, in case it is the collection that changed.
+                with self._lock:
+                    self._recheck = True
                 log.info("rag: a search was refused by the vector database (HTTP %d)", exc.status_code)
                 error = unavailable("search_refused")
             else:

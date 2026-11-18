@@ -707,7 +707,8 @@ async def test_a_search_that_succeeds_clears_the_failure_of_another(seeded, monk
 @pytest.mark.parametrize("status", [400, 422, 409])
 async def test_a_search_qdrant_refuses_is_the_error_of_that_call_alone(seeded, monkeypatch, caplog, status):
     """HTTP 400 is what Qdrant in strict mode answers to a filter on a field without an index: nothing is
-    wrong with the deployment for the other callers, and nothing is remembered."""
+    wrong with the deployment for the other callers, and nobody is refused. The next call only checks
+    the collection before its search (one cheap request), in case it is the collection that changed."""
     store, fake = seeded
     healthy = _Store(store, store.client)
     backend = EngineRagBackend(_settings(), store=healthy, embedder=fake)
@@ -720,10 +721,72 @@ async def test_a_search_qdrant_refuses_is_the_error_of_that_call_alone(seeded, m
             assert (await c.call_tool("rag_search", {"query": "another caller"})).data["count"] == CHUNKS
             info = (await c.call_tool("server_info", {})).data
             assert info["rag"]["status"] == "ready" and "reason" not in info["rag"]
-        assert healthy.checks == 1 and backend._suspected is None  # no check either: nothing was recorded
+        # One check after each refusal, by the next call, and no failure recorded.
+        assert healthy.checks == 4 and backend._suspected is None and backend._collection_reason is None
     for text in [message] + [r.getMessage() for r in caplog.records]:
         assert HOST not in text and KEY not in text and "secret-term" not in text, text
     assert not any(r.levelno >= logging.WARNING for r in caplog.records if r.name == "myopenfund_mcp.rag")
+
+
+async def test_a_collection_that_no_longer_matches_the_model_is_found_after_a_refused_search(seeded, monkeypatch):
+    """A collection recreated with another vector size refuses EVERY search with HTTP 400: the call
+    after the first refusal checks the collection and says what is wrong, to everyone."""
+    store, fake = seeded
+    changed = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(), store=changed, embedder=fake)
+    monkeypatch.setattr(backend_module, "search", lambda query, **kwargs: (_ for _ in ()).throw(_response(400)))
+    async with _client(backend) as c:
+        changed.failure = CollectionMismatchError("vector size 4, expected 32")
+        assert await _error(c, {"query": "x"}) == REFUSED
+        expected = "[rag_unavailable] collection_mismatch: " + backend_module.REASONS["collection_mismatch"]
+        for _ in range(3):
+            assert await _error(c, {"query": "y"}) == expected
+        assert changed.checks == 2  # the failed check is remembered
+        info = (await c.call_tool("server_info", {})).data["rag"]
+        assert info["status"] == "unavailable" and info["reason"] == "collection_mismatch"
+
+
+async def test_searches_that_fail_while_the_check_passes_are_remembered_like_a_failed_check(
+        seeded, monkeypatch, clock, caplog):
+    """Qdrant answers the collection check and no search: without a memory every call would pay a whole
+    request timeout. One call per retry period pays; the others are answered at once."""
+    store, fake = seeded
+    half = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(rag_check_retry_s=5), store=half, embedder=fake)
+    real, searches, hung = backend_module.search, [0], [True]
+
+    def search(query, **kwargs):
+        searches[0] += 1
+        if hung[0]:
+            raise _timed_out()
+        return real(query, **kwargs)
+
+    monkeypatch.setattr(backend_module, "search", search)
+    caplog.set_level(logging.WARNING, logger="myopenfund_mcp.rag")
+    async with _client(backend) as c:
+        assert await _error(c, {"query": "a"}) == UNREACHABLE  # fails: the next call checks
+        assert await _error(c, {"query": "b"}) == UNREACHABLE  # check passes, search fails again
+        assert (half.checks, searches[0]) == (2, 2)
+        for _ in range(20):  # remembered: no request at all
+            assert await _error(c, {"query": "c"}) == UNREACHABLE
+        assert (half.checks, searches[0]) == (2, 2)
+        info = (await c.call_tool("server_info", {})).data["rag"]
+        assert info["status"] == "unavailable" and info["reason"] == "qdrant_unreachable"
+        for cycle in (1, 2):  # each retry period: one check, one search that pays, the rest at once
+            clock[0] += 6
+            for _ in range(10):
+                assert await _error(c, {"query": "d"}) == UNREACHABLE
+            assert (half.checks, searches[0]) == (2 + cycle, 2 + cycle)
+        hung[0] = False
+        clock[0] += 6
+        assert (await c.call_tool("rag_search", {"query": "e"})).data["count"] == CHUNKS
+        assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+        # Served again: a later single failure is a suspicion once more, not a remembered outage.
+        hung[0] = True
+        assert await _error(c, {"query": "f"}) == UNREACHABLE
+        assert backend._collection_reason is None and backend._suspected == "qdrant_unreachable"
+    warnings = [r.getMessage() for r in caplog.records if "search failed" in r.getMessage()]
+    assert len(warnings) == 2, warnings  # once for the outage, once after the recovery: not once per call
 
 
 async def test_after_an_outage_the_collection_is_checked_again_and_the_toolset_recovers(seeded, monkeypatch, clock):
