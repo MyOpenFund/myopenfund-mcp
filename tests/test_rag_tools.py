@@ -17,7 +17,13 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from rag_engine.embedding import ModelDownloadError, ModelIntegrityError
-from rag_engine.store import CollectionMismatchError, CollectionNotFoundError, QdrantAuthError
+from rag_engine.store import (
+    CollectionMismatchError,
+    CollectionNotFoundError,
+    MissingIndexError,
+    QdrantAuthError,
+    QdrantStore,
+)
 from rag_fixture import (
     BOE,
     BOJ,
@@ -1091,6 +1097,185 @@ def test_the_read_before_a_refusal_is_not_waited_for_beyond_the_calls_deadline(s
         _settled(backend)
 
 
+# -- date bounds: the engine's date filter mode -----------------------------------------------------
+
+
+class _SchemaClient:
+    """The fixture's Qdrant client, but the payload schema it reports (are `date_start` and `date_end`
+    indexed?) is the test's: `indexed`, or a `failure` raised after waiting for `release` while `hold`
+    is set. The collection check of the store sees the real collection."""
+
+    def __init__(self, client, indexed):
+        self._client, self.indexed, self.failure, self.hold = client, indexed, None, False
+        self.release, self.reads, self.threads, self.checking = threading.Event(), 0, [], threading.local()
+
+    def get_collection(self, collection_name):
+        info = self._client.get_collection(collection_name=collection_name)
+        if getattr(self.checking, "active", False):
+            return info
+        self.reads += 1
+        self.threads.append(threading.current_thread().name)
+        if self.hold:
+            assert self.release.wait(10)
+        if self.failure is not None:
+            raise self.failure
+        from types import SimpleNamespace as NS
+
+        schema = {field: NS(data_type="datetime") for field in ("date_start", "date_end")} if self.indexed else {}
+        return info.model_copy(update={"payload_schema": schema})
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+class _Schema(QdrantStore):
+    """rag-engine's own store (its cache of the answer, its fallback and retry delay) over that client."""
+
+    def __init__(self, client, indexed=False):
+        self.schema = _SchemaClient(client, indexed)
+        super().__init__(client=self.schema)
+        self.asked, self.checks, self.done = [], 0, threading.Event()
+
+    def check_collection(self, name, dim):
+        self.checks += 1
+        self.schema.checking.active = True
+        try:
+            return super().check_collection(name, dim)
+        finally:
+            self.schema.checking.active = False
+
+    def uses_date_intervals(self, collection, *, max_age=None, retry_after=None):
+        self.asked.append((max_age, retry_after))
+        try:
+            return super().uses_date_intervals(collection, max_age=max_age, retry_after=retry_after)
+        finally:
+            self.done.set()
+
+
+def _spied(monkeypatch) -> list[dict]:
+    """The keyword arguments of every search sent to the engine (which is really run)."""
+    real, seen = backend_module.search, []
+
+    def search(query, **kwargs):
+        seen.append({"query": query, **kwargs})
+        return real(query, **kwargs)
+
+    monkeypatch.setattr(backend_module, "search", search)
+    return seen
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+async def test_auto_mode_reads_the_collection_for_a_date_bound_and_hands_its_answer_to_the_engine(
+        seeded, monkeypatch, indexed):
+    store, fake = seeded
+    for refresh, reads in ((0, 3), (300, 1)):  # 0: read before every date-bounded search
+        schema = _Schema(store.client, indexed=indexed)
+        backend = EngineRagBackend(_settings(rag_date_filter_refresh=refresh, rag_date_filter_retry=11),
+                                   store=schema, embedder=fake)
+        sent = _spied(monkeypatch)
+        async with _client(backend) as c:
+            assert schema.schema.reads == 1  # once at start, after the collection check passed
+            await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})
+            assert schema.schema.reads == 1  # no date bound: nothing to ask
+            await c.call_tool("rag_search", {"query": "x", "date_from": "2022-01-01"})
+            await c.call_tool("rag_search", {"query": "x", "date_to": "2022-12-31"})
+            assert schema.schema.reads == reads
+        # The settings, never the engine's defaults or its environment.
+        assert schema.asked == [(refresh, 11)] * 3
+        assert [(s["date_filter_mode"], s["date_filter_refresh"], s["date_filter_retry"]) for s in sent] == [
+            ("auto", refresh, 11)] + [("interval" if indexed else "legacy", refresh, 11)] * 2
+
+
+@pytest.mark.parametrize("mode", ["interval", "legacy"])
+async def test_a_fixed_mode_never_reads_the_collection_and_is_passed_as_it_is(seeded, monkeypatch, mode):
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    backend = EngineRagBackend(_settings(rag_date_filter_mode=mode), store=schema, embedder=fake)
+    sent = _spied(monkeypatch)
+    async with _client(backend) as c:
+        found = (await c.call_tool("rag_search", {"query": "x", "date_from": "2022-06-15",
+                                                  "date_to": "2022-07-21"})).data
+    assert schema.schema.reads == 0 and schema.asked == [] and [s["date_filter_mode"] for s in sent] == [mode]
+    assert sorted({h["doc_id"] for h in found["hits"]}) == ["ecb/A1/2022-07-21", "us/A3/2022-06-15"]
+
+
+async def test_the_schema_read_runs_in_the_calls_slot_and_within_its_budget(seeded, monkeypatch):
+    """The read hangs like a frozen Qdrant: the call answers `timeout` at the end of its budget, the slot
+    stays taken (another call is `busy`), and no search is started once the budget is spent."""
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    backend = EngineRagBackend(_settings(rag_date_filter_refresh=0), store=schema, embedder=fake)
+    sent = _spied(monkeypatch)
+    async with _client(backend, rag_call_timeout_s=0.4, rag_max_concurrency=1) as c:
+        reads = schema.schema.reads
+        schema.schema.hold, schema.schema.failure = True, _timed_out()
+        schema.done.clear()
+        try:
+            bounded = asyncio.create_task(_timed(_error(c, {"query": "x", "date_from": "2022-01-01"})))
+            await asyncio.sleep(0.1)
+            assert schema.schema.reads == reads + 1 and schema.schema.threads[-1].startswith("mof-rag")
+            assert await _error(c, {"query": "x"}) == BUSY  # the read holds the only slot
+            message, took = await bounded
+            assert message == TIMEOUT and 0.3 <= took < 3
+        finally:
+            schema.schema.release.set()
+        assert await asyncio.to_thread(schema.done.wait, 10)
+        await asyncio.sleep(0.05)  # the worker ends its call (deadline check) after the read
+        assert sent == []  # the read failed late: the deadline had passed, no search was started
+        # A failed read is not an outage: no failure is remembered, no collection check follows.
+        assert (backend._collection_reason, backend._suspected, backend._recheck) == (None, None, False)
+        checks, schema.schema.hold = schema.checks, False
+        data = (await c.call_tool("rag_search", {"query": "x", "date_from": "2022-01-01"})).data
+        assert data["count"] > 0 and schema.checks == checks
+        assert schema.schema.reads == reads + 1  # within the retry delay the engine does not read again
+        assert sent[-1]["date_filter_mode"] == "interval"  # the last answer it read (at start)
+
+
+@pytest.mark.parametrize("failure", [_timed_out(), _response(500), _response(403),
+                                     QdrantAuthError("Qdrant refused the request (HTTP 401)")],
+                         ids=["timeout", "500", "403", "auth"])
+async def test_a_failed_schema_read_refuses_no_call_and_is_not_remembered_as_an_outage(seeded, monkeypatch,
+                                                                                       caplog, failure):
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    schema.schema.failure = failure  # from the start: no answer was ever read
+    backend = EngineRagBackend(_settings(), store=schema, embedder=fake)
+    sent = _spied(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+    async with _client(backend) as c:
+        for _ in range(3):
+            data = (await c.call_tool("rag_search", {"query": FOMC, "date_from": "2022-06-15",
+                                                     "date_to": "2022-06-15"})).data
+            assert [h["doc_id"] for h in data["hits"]] == ["us/A3/2022-06-15"]
+        info = (await c.call_tool("server_info", {})).data["rag"]
+    assert info["status"] == "ready" and schema.checks == 1  # the start's check only
+    assert schema.schema.reads == 1  # the start's read; the calls within the retry delay ask nothing
+    assert [s["date_filter_mode"] for s in sent] == ["legacy"] * 3  # never read: the filter on `date`
+    assert (backend._collection_reason, backend._suspected) == (None, None)
+    assert not [r for r in caplog.records if r.name == "myopenfund_mcp.rag" and r.levelno >= logging.WARNING]
+
+
+async def test_a_filter_the_collection_refuses_for_a_missing_index_is_search_refused(seeded, monkeypatch, caplog):
+    """rag-engine raises its own MissingIndexError for the HTTP 400 of a collection in strict mode."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(rag_date_filter_mode="interval"), store=healthy, embedder=fake)
+    try:
+        raise _response(400)
+    except UnexpectedResponse as cause:
+        refusal = MissingIndexError(f"collection {COLLECTION!r} refuses a filter on 'date_start'")
+        refusal.__cause__ = cause
+    _failing_for(monkeypatch, {QUERY: refusal})
+    caplog.set_level(logging.DEBUG)
+    async with _client(backend) as c:
+        assert await _error(c, {"query": QUERY, "date_from": "2016-01-01"}) == REFUSED
+        assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+        assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
+        assert healthy.checks == 2  # the next call checked the collection first, and was served
+    logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.rag"]
+    assert "rag: a search was refused by the vector database (HTTP 400, a filtered field has no index)" in logged
+
+
 async def test_an_unexpected_error_is_masked(backend, monkeypatch, caplog):
     def failing(*args, **kwargs):
         raise RuntimeError(f"http://{HOST}:6333 api-key={KEY}")
@@ -1215,13 +1400,16 @@ async def test_the_model_is_loaded_at_start_from_mof_settings_only(seeded, monke
     store, fake = seeded
     for name, value in {"QDRANT_HOST": "elsewhere", "QDRANT_API_KEY": "other", "RAG_ENGINE_BACKEND": "torch",
                         "RAG_ENGINE_MODEL_CACHE": "/elsewhere", "RAG_ENGINE_QDRANT_TIMEOUT": "60",
-                        "RAG_ENGINE_ONNX_THREADS": "64", "RAG_ENGINE_MODEL": "other/model"}.items():
+                        "RAG_ENGINE_ONNX_THREADS": "64", "RAG_ENGINE_MODEL": "other/model",
+                        "RAG_ENGINE_DATE_FILTER_MODE": "legacy", "RAG_ENGINE_DATE_FILTER_REFRESH": "1",
+                        "RAG_ENGINE_DATE_FILTER_RETRY": "2"}.items():
         monkeypatch.setenv(name, value)
     seen = []
     monkeypatch.setattr(backend_module, "make_embedder", lambda s, **k: seen.append(("embedder", s)) or fake)
     monkeypatch.setattr(backend_module, "QdrantStore", lambda **k: seen.append(("store", k["settings"])) or store)
     settings = _settings(rag_qdrant_port=6334, rag_qdrant_https=True, rag_qdrant_timeout=7, rag_onnx_threads=3,
-                         rag_default_limit=5, rag_max_limit=9)
+                         rag_default_limit=5, rag_max_limit=9, rag_date_filter_mode="interval",
+                         rag_date_filter_refresh=60, rag_date_filter_retry=9)
     backend = EngineRagBackend(settings)
     assert [kind for kind, _ in seen] == ["store"]  # nothing is loaded before start()
     build_server(settings, rag_backend=backend)
@@ -1233,6 +1421,7 @@ async def test_the_model_is_loaded_at_start_from_mof_settings_only(seeded, monke
     assert (engine.qdrant_timeout, engine.backend, engine.model_cache, engine.onnx_threads) == (
         7, "onnx", "/models", 3)
     assert (engine.search_limit, engine.search_max_limit) == (5, 9)
+    assert (engine.date_filter_mode, engine.date_filter_refresh, engine.date_filter_retry) == ("interval", 60, 9)
     assert (engine.model_name, engine.model_dim) == ("intfloat/multilingual-e5-base", 768)
 
 

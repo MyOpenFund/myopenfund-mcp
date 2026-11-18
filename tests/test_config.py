@@ -159,6 +159,26 @@ def test_rag_defaults():
     assert (s.rag_default_limit, s.rag_max_limit, s.rag_onnx_threads, s.rag_codes_ttl_s) == (8, 20, None, 300)
     assert (s.rag_call_timeout_s, s.rag_max_concurrency, s.rag_check_retry_s, s.rag_codes_retry_s) == (15, 4, 5, 5)
     assert s.rag_description_notes == ""
+    assert (s.rag_date_filter_mode, s.rag_date_filter_refresh, s.rag_date_filter_retry) == ("auto", 300, 30)
+
+
+def test_rag_date_filter_settings_from_env():
+    for mode in ("auto", "interval", "legacy"):
+        assert Settings.from_env({**RAG_ENV, "MOF_RAG_DATE_FILTER_MODE": mode}).rag_date_filter_mode == mode
+    s = Settings.from_env({**RAG_ENV, "MOF_RAG_DATE_FILTER_REFRESH": "0", "MOF_RAG_DATE_FILTER_RETRY": "1"})
+    assert (s.rag_date_filter_refresh, s.rag_date_filter_retry) == (0, 1)  # 0: the collection is asked every time
+    s = Settings.from_env({**RAG_ENV, "MOF_RAG_DATE_FILTER_REFRESH": "86400", "MOF_RAG_DATE_FILTER_RETRY": "3600"})
+    assert (s.rag_date_filter_refresh, s.rag_date_filter_retry) == (86400, 3600)
+
+
+def test_the_date_filter_modes_are_rag_engines():
+    engine = pytest.importorskip("rag_engine.config")
+    from myopenfund_mcp.config import RAG_DATE_FILTER_MODES
+
+    assert RAG_DATE_FILTER_MODES == engine.DATE_FILTER_MODES
+    assert Settings().rag_date_filter_mode == engine.Settings().date_filter_mode
+    assert Settings().rag_date_filter_refresh == engine.Settings().date_filter_refresh
+    assert Settings().rag_date_filter_retry == engine.Settings().date_filter_retry
 
 
 def test_rag_settings_from_env():
@@ -204,6 +224,15 @@ def test_rag_settings_from_env():
     ({**RAG_ENV, "MOF_RAG_CODES_RETRY_S": "soon"}, "MOF_RAG_CODES_RETRY_S"),
     ({**RAG_ENV, "MOF_RAG_DESCRIPTION_NOTES": "x" * 1501}, "MOF_RAG_DESCRIPTION_NOTES must hold at most 1500"),
     ({**RAG_ENV, "MOF_RAG_MODEL_CACHE": "models"}, "MOF_RAG_MODEL_CACHE must be an absolute path"),
+    ({**RAG_ENV, "MOF_RAG_DATE_FILTER_MODE": "AUTO"},
+     "MOF_RAG_DATE_FILTER_MODE must be one of auto, interval, legacy, got 'AUTO'"),
+    ({**RAG_ENV, "MOF_RAG_DATE_FILTER_MODE": "intervals"}, "MOF_RAG_DATE_FILTER_MODE must be one of"),
+    ({"MOF_RAG_DATE_FILTER_MODE": "off"}, "MOF_RAG_DATE_FILTER_MODE must be one of"),
+    ({**RAG_ENV, "MOF_RAG_DATE_FILTER_REFRESH": "-1"}, "MOF_RAG_DATE_FILTER_REFRESH must be an integer"),
+    ({**RAG_ENV, "MOF_RAG_DATE_FILTER_REFRESH": "1.5"}, "MOF_RAG_DATE_FILTER_REFRESH must be an integer"),
+    ({**RAG_ENV, "MOF_RAG_DATE_FILTER_REFRESH": "86401"}, "MOF_RAG_DATE_FILTER_REFRESH must be <= 86400"),
+    ({**RAG_ENV, "MOF_RAG_DATE_FILTER_RETRY": "0"}, "MOF_RAG_DATE_FILTER_RETRY must be >= 1"),
+    ({**RAG_ENV, "MOF_RAG_DATE_FILTER_RETRY": "3601"}, "MOF_RAG_DATE_FILTER_RETRY must be <= 3600"),
     ({**RAG_ENV, "MOF_RAG_MODEL_CACHE": "./models"}, "MOF_RAG_MODEL_CACHE must be an absolute path"),
 ])
 def test_rag_bad_values_fail_at_start_with_the_variable_named(env, match):

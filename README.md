@@ -189,7 +189,7 @@ into a volume at each start of the stack.
 2. **Payload indexes, once, from the data side.** The filters and the list of valid filter values use
    Qdrant's payload indexes. Whoever owns the collection creates them, once per collection, with a key
    that can write, from an environment where `rag-engine` is installed (the ingestion's own, or any venv
-   with `pip install "rag-engine @ git+https://github.com/MyOpenFund/rag-engine@fbbe09b789828a67c28beadca1f2a95d611158a8"`,
+   with `pip install "rag-engine @ git+https://github.com/MyOpenFund/rag-engine@6be21ac393d82d7c5c1a058dcad8204ae15c7289"`,
    the commit this server is built on). Give the host AND the port: the engine's default port is 6333.
    The key is typed at a prompt here too:
 
@@ -420,7 +420,9 @@ Example call and result (text shortened):
 - **Time budget, and what happens when Qdrant hangs.** One call never takes longer than
   `MOF_RAG_CALL_TIMEOUT_S` (15 s), its wait included. `MOF_RAG_QDRANT_TIMEOUT` (10 s) is the limit of
   **one request** to Qdrant, and a call makes several: the search, before it the read of the filter
-  values when it is due, and the collection check after a failure.
+  values when it is due, the collection check after a failure, and, for a call with a date bound in
+  `auto` mode, the read of the collection's payload schema when it is due (see
+  [Dates](#dates-in-rag_search)).
   - A request that fails (no answer in time, connection refused, key refused, collection gone, server
     error) ends its call with `[rag_unavailable]` and the reason: a call pays for one request timeout at
     most, never for two in a row (a failed read of the filter values is not followed by a search).
@@ -462,6 +464,35 @@ Example call and result (text shortened):
   duration, never the arguments, and the tool's own log lines never contain the query.
 - **Concurrency.** One embedder and one Qdrant client are shared by the process; inference runs one query
   at a time (about 20 ms for a short query on 4 cores) off the event loop.
+
+#### Dates in `rag_search`
+
+How a date bound is applied is rag-engine's `date_filter_mode`, set here by `MOF_RAG_DATE_FILTER_MODE`
+and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH` and
+`MOF_RAG_DATE_FILTER_RETRY` (the engine's own `RAG_ENGINE_DATE_FILTER_*` variables are never read).
+
+- **Mode `auto` (the default) follows the collection.** A call with a date bound asks the collection
+  whether `date_start` and `date_end` both have a datetime index (one read request, which the read-only
+  key may send), and the answer is kept `MOF_RAG_DATE_FILTER_REFRESH` seconds (300). Indexed: the bound
+  is applied to the intervals; not indexed: to the `date` field, as before. A call without a date bound
+  never asks. The read is also made once at start, after the collection check, so the log says which
+  filter is in use (a line of the `rag_engine.store` logger: `... date filters in auto mode use the
+  intervals`, or `... use the date field (legacy)`), and it is made again by the first date-bounded call
+  after the refresh delay: a collection upgraded while the server runs is followed without a restart.
+- **The read is part of the call.** It runs in the call's own slot (one of `MOF_RAG_MAX_CONCURRENCY`) and
+  within its budget (`MOF_RAG_CALL_TIMEOUT_S`); when it ends after the budget, the search is not sent and
+  the call has already answered `[rag_unavailable] timeout`.
+- **A failed read refuses no call and is not an outage.** When the read fails or times out, the engine
+  answers with the last answer it read, or with the `date` field when it never read one, logs one
+  warning (logger `rag_engine.store`, with the class and the text of the client's error), and reads
+  again `MOF_RAG_DATE_FILTER_RETRY` seconds later (30) at the earliest; the calls made meanwhile ask
+  nothing. The toolset does not remember that failure: no `[rag_unavailable]` follows from it,
+  `server_info` stays `ready`, and only the search itself says whether Qdrant answers. So with Qdrant
+  frozen, a date-bounded call may spend one request timeout on that read before its search, once per
+  retry delay: its budget still bounds it.
+- **Modes `interval` and `legacy`** never read the collection: always the intervals, or always the `date`
+  field. `interval` on a collection in strict mode without the two indexes is refused by Qdrant
+  (`[rag_unavailable] search_refused`, the error of that call alone).
 
 ### Companies and datasets
 
@@ -584,7 +615,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_QDRANT_PORT` | `6333` | Qdrant HTTP port (1-65535). |
 | `MOF_RAG_QDRANT_API_KEY` | unset | Qdrant API key; a **read-only** key is enough and recommended. Never logged, shown or put in an error. |
 | `MOF_RAG_QDRANT_HTTPS` | `false` | Connect to Qdrant over TLS (`true` / `false`). Without TLS the key travels in clear: private network only. |
-| `MOF_RAG_QDRANT_TIMEOUT` | `10` | Seconds **one request** to Qdrant may take (1-300, at most `MOF_RAG_CALL_TIMEOUT_S`); a call makes several (collection check after a failure, read of the filter values when due, search). A request that takes longer fails, and the call that made it answers `[rag_unavailable] qdrant_unreachable`. |
+| `MOF_RAG_QDRANT_TIMEOUT` | `10` | Seconds **one request** to Qdrant may take (1-300, at most `MOF_RAG_CALL_TIMEOUT_S`); a call makes several (collection check after a failure, read of the filter values when due, read of the payload schema for a date bound in `auto` mode when due, search). A request that takes longer fails, and the call that made it answers `[rag_unavailable] qdrant_unreachable`. |
 | `MOF_RAG_CALL_TIMEOUT_S` | `15` | Time budget of one `rag_search` call in seconds, its wait for a free slot included (1-3600, at least `MOF_RAG_QDRANT_TIMEOUT`). At its end the call answers `[rag_unavailable]` with `timeout` or `busy`. |
 | `MOF_RAG_MAX_CONCURRENCY` | `4` | Searches running at once (1-64), in threads of the toolset's own. The calls in excess wait without holding a thread. |
 | `MOF_RAG_CHECK_RETRY_S` | `5` | Seconds a failed collection check is remembered (1-3600): calls made meanwhile answer `[rag_unavailable]` at once. Also the longest the toolset takes to notice that Qdrant is back. A failed search is not remembered: it makes the next call run the check. |
@@ -596,6 +627,9 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_CODES_TTL_S` | `300` | Seconds the collection's filter values (source codes, doc types, languages) are kept before being read again (1-86400). |
 | `MOF_RAG_CODES_RETRY_S` | `5` | Least seconds between two reads of the filter values that the TTL did not ask for: the read made before a value is refused, and the retry after a failed read (1-3600). |
 | `MOF_RAG_DESCRIPTION_NOTES` | unset | One line of text appended to the description of `rag_search`: what the collection holds, what its codes mean (at most 1500 characters). See [Passage search](#passage-search-rag) for a suggested value. |
+| `MOF_RAG_DATE_FILTER_MODE` | `auto` | How a date bound of `rag_search` is applied (rag-engine's `date_filter_mode`): `auto` (the intervals on a collection where `date_start` and `date_end` both have a datetime index, the `date` field elsewhere), `interval` (always the intervals; a collection in strict mode without the two indexes refuses it: `search_refused`) or `legacy` (always the `date` field). Lower case, exactly. See [Dates](#dates-in-rag_search). |
+| `MOF_RAG_DATE_FILTER_REFRESH` | `300` | `auto` mode: seconds the collection's answer (are the two indexes there?) is kept before a date-bounded call reads it again (0-86400; `0` reads it before every date-bounded search). The longest the server takes to use the intervals once the indexes exist, without a restart. |
+| `MOF_RAG_DATE_FILTER_RETRY` | `30` | `auto` mode: seconds before a collection whose answer could not be read is read again (1-3600). Meanwhile date-bounded calls use the last answer read, or `legacy` when none was. Such a failure refuses no call and is not remembered as an outage. |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

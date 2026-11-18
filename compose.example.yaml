@@ -38,6 +38,9 @@ services:
     # Memory: give the container AT LEAST 3 GB. The process peaks at about 2 GB at every start, while the
     # model loads, and stays around 1.5 GB afterwards; with less it is killed at start. With a CPU limit,
     # set MOF_RAG_ONNX_THREADS to it.
+    # Date bounds: MOF_RAG_DATE_FILTER_MODE (auto by default), MOF_RAG_DATE_FILTER_REFRESH and
+    # MOF_RAG_DATE_FILTER_RETRY go in .env like the other MOF_RAG_* variables; the engine's own
+    # RAG_ENGINE_DATE_FILTER_* variables are never read by the server. No volume of their own.
     # Uncomment these two blocks and the `volumes:` block at the end of the file:
     # volumes:
     #   - rag-models:/models:ro

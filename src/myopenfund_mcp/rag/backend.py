@@ -31,6 +31,19 @@ A search that Qdrant refuses as a request (HTTP 4xx other than a refused key, a 
 matter of that call alone: it answers `[rag_unavailable] search_refused`, and refuses nobody else (the next call checks the collection first).
 No lock is held during a request to Qdrant.
 
+Date bounds (`rag_date_filter_mode`, passed to the engine's `search` with its refresh and retry
+delays: the engine's own `RAG_ENGINE_DATE_FILTER_*` variables are never read). In `auto` mode a call
+with a date bound may need one more request: the read of the collection's payload schema (are
+`date_start` and `date_end` indexed?), at most once every `rag_date_filter_refresh` seconds. It is
+made here, in the call's own thread (its slot) and before the deadline check, by the engine's
+`QdrantStore.uses_date_intervals`, and the mode it gives is handed to `search`: a search is never
+started after the call's deadline because of that read. The read never fails a call: when it fails,
+the engine answers with the last mode it read, or `legacy`, and reads again after
+`rag_date_filter_retry` seconds. It is therefore not an outage for the toolset either: nothing of it
+reaches the collection check's memory, and only the search that follows says whether Qdrant answers.
+It is also made once at start, after a collection check that passed, so the first date-bounded call
+does not pay for it and the log says which filter is in use.
+
 Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown code:
 - with Qdrant's facet API and the keyword indexes, they are read in the calling thread (a few
   milliseconds): at start, then by one call every `rag_codes_ttl_s` seconds;
@@ -62,7 +75,13 @@ from rag_engine.config import ConfigError as EngineConfigError
 from rag_engine.config import Settings as EngineSettings
 from rag_engine.embedding import ModelDownloadError, ModelIntegrityError, make_embedder
 from rag_engine.search import SearchError, SearchFilters, search
-from rag_engine.store import CollectionMismatchError, CollectionNotFoundError, QdrantAuthError, QdrantStore
+from rag_engine.store import (
+    CollectionMismatchError,
+    CollectionNotFoundError,
+    MissingIndexError,
+    QdrantAuthError,
+    QdrantStore,
+)
 
 from ..config import ConfigError, Settings
 from ..errors import INVALID_ARGUMENT, RAG_UNAVAILABLE, tool_error
@@ -161,7 +180,10 @@ def _reason(exc: BaseException) -> str | None:
 
 def _refused(exc: BaseException) -> bool:
     """Whether a search failed because Qdrant refused that request: an error of one call, which says
-    nothing of the next one (see NOT_A_REFUSAL_STATUSES)."""
+    nothing of the next one (see NOT_A_REFUSAL_STATUSES). The engine raises its own `MissingIndexError`
+    for the 400 of a collection in strict mode asked to filter on a field without an index."""
+    if isinstance(exc, MissingIndexError):
+        return True
     return (isinstance(exc, UnexpectedResponse) and 400 <= exc.status_code < 500
             and exc.status_code not in NOT_A_REFUSAL_STATUSES)
 
@@ -180,6 +202,9 @@ def engine_settings(settings: Settings) -> EngineSettings:
             onnx_threads=settings.rag_onnx_threads,
             search_limit=settings.rag_default_limit,
             search_max_limit=settings.rag_max_limit,
+            date_filter_mode=settings.rag_date_filter_mode,
+            date_filter_refresh=settings.rag_date_filter_refresh,
+            date_filter_retry=settings.rag_date_filter_retry,
         )
     except EngineConfigError as exc:  # the engine names its own variables; it never echoes the key
         error = ConfigError(f"the MOF_RAG_* settings were refused by rag-engine ({exc})")
@@ -195,6 +220,9 @@ class EngineRagBackend:
         self._ttl_s = settings.rag_codes_ttl_s
         self._codes_retry_s = settings.rag_codes_retry_s
         self._check_retry_s = settings.rag_check_retry_s
+        self._date_mode = settings.rag_date_filter_mode
+        self._date_refresh = settings.rag_date_filter_refresh
+        self._date_retry = settings.rag_date_filter_retry
         self._embedder = embedder
         self._engine_settings = None
         if store is None or embedder is None:
@@ -261,6 +289,8 @@ class EngineRagBackend:
                     self._read_values()
                 except _Outage:
                     pass  # recorded: the first call checks the collection again
+                if self._date_mode == "auto":
+                    self._date_filter_mode()  # never raises: the engine falls back by itself
 
     def _check_collection(self) -> str | None:
         """Run the engine's read-only collection check and record the outcome: None, or the reason
@@ -540,6 +570,16 @@ class EngineRagBackend:
                              f"{argument}: unknown value{'' if len(parts) == 1 else 's'} {', '.join(parts)}; "
                              f"valid values: {', '.join(quoted(v) for v in listed[:MAX_LISTED_VALUES])}{more}")
 
+    # -- date bounds -------------------------------------------------------------------------
+
+    def _date_filter_mode(self) -> str:
+        """`interval` or `legacy` for `auto` mode: the engine's own reading of the collection, at most
+        one request (none while its answer is fresh or a failed read is recent). It never raises for
+        Qdrant: a failed read gives the last answer, or `legacy`, and is the engine's to log."""
+        uses = self._store.uses_date_intervals(self._collection, max_age=self._date_refresh,
+                                               retry_after=self._date_retry)
+        return "interval" if uses else "legacy"
+
     # -- search ------------------------------------------------------------------------------
 
     def search(self, *, query: str, filters: dict, limit: int, max_limit: int,
@@ -561,10 +601,14 @@ class EngineRagBackend:
                 raise _Outage(self._model_reason)
             self._require_collection()
             self._check_values(applied, deadline)
+            mode = self._date_mode
+            if mode == "auto" and (applied.date_from is not None or applied.date_to is not None):
+                mode = self._date_filter_mode()  # before the deadline check: no search after it
             if deadline is not None and time.monotonic() >= deadline:
                 raise _Outage("timeout")
             hits = search(query, collection=self._collection, store=self._store, embedder=self._embedder,
-                          filters=applied, limit=limit, max_limit=max_limit)
+                          filters=applied, limit=limit, max_limit=max_limit, date_filter_mode=mode,
+                          date_filter_refresh=self._date_refresh, date_filter_retry=self._date_retry)
         except SearchError as exc:
             error = tool_error(INVALID_ARGUMENT, str(exc))
         except _Outage as exc:
@@ -575,7 +619,9 @@ class EngineRagBackend:
                 # checks the collection first, in case it is the collection that changed.
                 with self._lock:
                     self._recheck = True
-                log.info("rag: a search was refused by the vector database (HTTP %d)", exc.status_code)
+                status = getattr(exc, "status_code", None) or getattr(exc.__cause__, "status_code", 400)
+                log.info("rag: a search was refused by the vector database (HTTP %d%s)", status,
+                         ", a filtered field has no index" if isinstance(exc, MissingIndexError) else "")
                 error = unavailable("search_refused")
             else:
                 reason = _reason(exc)

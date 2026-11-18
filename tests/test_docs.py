@@ -42,6 +42,8 @@ FIELDS = {
     "MOF_RAG_CODES_TTL_S": "rag_codes_ttl_s", "MOF_RAG_CODES_RETRY_S": "rag_codes_retry_s",
     "MOF_RAG_CALL_TIMEOUT_S": "rag_call_timeout_s", "MOF_RAG_MAX_CONCURRENCY": "rag_max_concurrency",
     "MOF_RAG_CHECK_RETRY_S": "rag_check_retry_s", "MOF_RAG_DESCRIPTION_NOTES": "rag_description_notes",
+    "MOF_RAG_DATE_FILTER_MODE": "rag_date_filter_mode", "MOF_RAG_DATE_FILTER_REFRESH": "rag_date_filter_refresh",
+    "MOF_RAG_DATE_FILTER_RETRY": "rag_date_filter_retry",
 }
 COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
 
