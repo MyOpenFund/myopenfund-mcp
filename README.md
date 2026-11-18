@@ -538,7 +538,8 @@ and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH` a
   whether `date_start` and `date_end` both have a datetime index (one read request, which the read-only
   key may send), and the answer is kept `MOF_RAG_DATE_FILTER_REFRESH` seconds (300). Indexed: the bound
   is applied to the intervals; not indexed: to the `date` field, as before. A call without a date bound
-  never asks. The read is also made once at start, after the collection check, so the log says which
+  never asks. The read is also made once at start, after the collection check and the read of the filter
+  values (not when either failed: then the first date-bounded call makes it), so the log says which
   filter is in use (a line of the `rag_engine.store` logger: `... date filters in auto mode use the
   intervals`, or `... use the date field (legacy)`), and it is made again by the first date-bounded call
   after the refresh delay: a collection upgraded while the server runs is followed without a restart.

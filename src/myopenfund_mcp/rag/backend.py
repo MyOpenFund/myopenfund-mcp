@@ -41,8 +41,8 @@ started after the call's deadline because of that read. The read never fails a c
 the engine answers with the last mode it read, or `legacy`, and reads again after
 `rag_date_filter_retry` seconds. It is therefore not an outage for the toolset either: nothing of it
 reaches the collection check's memory, and only the search that follows says whether Qdrant answers.
-It is also made once at start, after a collection check that passed, so the first date-bounded call
-does not pay for it and the log says which filter is in use.
+It is also made once at start, after a collection check and a read of the filter values that passed,
+so the first date-bounded call does not pay for it and the log says which filter is in use.
 
 Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown code:
 - with Qdrant's facet API and the keyword indexes, they are read in the calling thread (a few
@@ -383,8 +383,11 @@ class EngineRagBackend:
                     self._read_values()
                 except _Outage:
                     pass  # recorded: the first call checks the collection again
-                if self._date_mode == "auto":
-                    self._date_filter_mode()  # never raises: the engine falls back by itself
+                else:
+                    # After an outage the read could only add a request timeout to the start: the first
+                    # date-bounded call makes it instead.
+                    if self._date_mode == "auto":
+                        self._date_filter_mode()  # never raises: the engine falls back by itself
 
     def _check_collection(self) -> str | None:
         """Run the engine's read-only collection check and record the outcome: None, or the reason

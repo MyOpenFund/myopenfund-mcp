@@ -1322,6 +1322,22 @@ async def test_auto_mode_reads_the_collection_for_a_date_bound_and_hands_its_ans
             ("auto", refresh, 11)] + [("interval" if indexed else "legacy", refresh, 11)] * 2
 
 
+async def test_no_schema_read_at_start_after_a_failed_read_of_the_values(seeded, monkeypatch):
+    """The read of the filter values failed for an outage at start: the schema read could only add one more
+    request timeout to the start. It is made by the first date-bounded call instead."""
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    backend = EngineRagBackend(_settings(), store=schema, embedder=fake)
+    monkeypatch.setattr(backend, "_facet_values", lambda: (_ for _ in ()).throw(_timed_out()))
+    backend.start()
+    assert schema.schema.reads == 0 and backend._suspected == "qdrant_unreachable"
+    monkeypatch.undo()  # Qdrant answers again
+    sent = _spied(monkeypatch)
+    async with _client(backend) as c:
+        assert (await c.call_tool("rag_search", {"query": "x", "date_from": "2022-01-01"})).data["count"] > 0
+    assert schema.schema.reads == 1 and sent[-1]["date_filter_mode"] == "interval"
+
+
 @pytest.mark.parametrize("mode", ["interval", "legacy"])
 async def test_a_fixed_mode_never_reads_the_collection_and_is_passed_as_it_is(seeded, monkeypatch, mode):
     store, fake = seeded
