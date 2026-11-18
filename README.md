@@ -498,15 +498,25 @@ Example call and result (text shortened):
   run one), without a request to Qdrant: a search that failed does not change it, the check that follows
   does.
 - **Privacy.** As for every tool, the audit line holds the tool name, the client, the outcome and the
-  duration, never the arguments, and the tool's own log lines never contain the query. No log line holds
-  the Qdrant host, the API key or a response body, rag-engine's included: the server routes every record
-  of the `rag_engine` loggers (present and future modules) through a filter. A record that carries an
+  duration, never the arguments, and the tool's own log lines never contain the query. At the levels the
+  CLI logs (INFO and above), no line written for a search holds the Qdrant host, the API key or a
+  response body, the framework's and rag-engine's included:
+  - every exception of a search is caught by the toolset and answered with a coded reason, so FastMCP
+    never prints one. An error the toolset maps (an outage, a refusal, an answer that is not JSON, such as
+    a proxy's HTML page sent with status 200: `qdrant_error`) is logged by its class; any other is
+    answered `internal_error` and logged at ERROR by its class only, its text and traceback at DEBUG
+    only, a level the CLI never turns on (a developer who sets it accepts them);
+  - the server routes every record of the `rag_engine` loggers (present and future modules) through a
+    filter. A record that carries an
   error (an exception among its arguments or attached to it) or whose text holds the configured host or
   key is written with its logger, its level and a fixed message naming the error's class only; the
   engine's warning on a failed schema read also keeps its collection, the filter used meanwhile and the
   delay before the next try. Other engine lines (the collection and the filter in use) are written as
   they are. The error's text is dropped because it can hold the host, a TLS host name, a proxy's error
   page naming an upstream host or an internal address, or the engine's hint about its own key variable.
+  The HTTP libraries under the Qdrant client are apart: `httpx` logs one INFO line per request with
+  the server's address, which is why the CLI raises its logger to WARNING, and `httpcore` logs the host
+  and port of each connection at DEBUG only.
 - **Concurrency.** One embedder and one Qdrant client are shared by the process; inference runs one query
   at a time (about 20 ms for a short query on 4 cores) off the event loop.
 
@@ -621,7 +631,7 @@ branch on the code and show the message.
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
 | `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
-| `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
+| `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free), `internal_error` (the search failed with an error the server does not expect; the log names its class). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `internal_error`, retry and report it if it lasts; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
 | `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |
 | `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit` (`rag_search` names the largest that fits). |
 | `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
@@ -634,7 +644,9 @@ branch on the code and show the message.
 
 Arguments that do not match a tool's input schema (wrong type, string too long, e.g. an over-long company
 id) are rejected by the MCP framework before a tool runs, without a `[code]`. An unexpected internal failure reaches the client as a generic error
-without details (they may hold connection strings); the server log has the rest. Over HTTP, a missing or
+without details (they may hold connection strings); the server log has the rest. `rag_search` is the
+exception: every error of its search is answered with a coded `[rag_unavailable]` reason, so nothing of
+an exception reaches the framework (see Privacy in [Passage search](#passage-search-rag)). Over HTTP, a missing or
 unknown token is rejected with HTTP `401` before any tool runs.
 
 ## Tiers and tokens

@@ -1533,16 +1533,69 @@ async def test_a_filter_the_collection_refuses_for_a_missing_index_is_search_ref
     assert "rag: a search was refused by the vector database (HTTP 400, a filtered field has no index)" in logged
 
 
-async def test_an_unexpected_error_is_masked(backend, monkeypatch, caplog):
+INTERNAL = ("[rag_unavailable] internal_error: the server failed on this search for a reason of its own (its "
+            "log names the error's class); retry, and tell the operator if it lasts")
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.WARNING])
+async def test_an_unexpected_error_is_coded_and_only_its_class_is_logged(seeded, monkeypatch, caplog, capfd,
+                                                                          level):
+    """A programming error, or anything the backend does not know: nothing of its text reaches the client, a
+    log record of any logger, or stderr (FastMCP prints the traceback of an exception it receives)."""
+    store, fake = seeded
+    backend = EngineRagBackend(_settings(), store=_Store(store, store.client), embedder=fake)
+
     def failing(*args, **kwargs):
         raise RuntimeError(f"http://{HOST}:6333 api-key={KEY}")
 
     monkeypatch.setattr(backend_module, "search", failing)
-    caplog.set_level(logging.INFO, logger="myopenfund_mcp")
+    caplog.set_level(level)
     async with _client(backend) as c:
-        message = await _error(c, {"query": "x"})
-    assert HOST not in message and KEY not in message and not message.startswith("[")
-    assert not any(HOST in r.getMessage() or KEY in r.getMessage() for r in caplog.records)
+        message = await _error(c, {"query": "secret-term what did the council decide"})
+        assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"  # not an outage
+    assert message == INTERNAL
+    texts = _record_texts(caplog.records) + list(capfd.readouterr())
+    for text in texts:
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
+    # FastMCP's own line for any tool error ("Error calling tool ...") holds the coded message only.
+    errors = [r.getMessage() for r in caplog.records
+              if r.levelno >= logging.ERROR and r.name.startswith("myopenfund")]
+    assert errors == [("rag: a search failed with an unexpected error (RuntimeError); rag_search answered "
+                       "[rag_unavailable] internal_error. Its text and traceback, which may hold the vector "
+                       "database's address or a response body, are logged at DEBUG level only")]
+
+
+def test_at_debug_level_a_developer_gets_the_traceback_of_an_unexpected_error(backend, monkeypatch, caplog):
+    def failing(*args, **kwargs):
+        raise RuntimeError("a programming error")
+
+    monkeypatch.setattr(backend_module, "search", failing)
+    caplog.set_level(logging.DEBUG, logger="myopenfund_mcp.rag")
+    with pytest.raises(ToolError, match="internal_error"):
+        backend.search(query="x", filters={}, limit=1, max_limit=5)
+    debug = [r for r in caplog.records if r.levelno == logging.DEBUG and r.exc_info]
+    assert len(debug) == 1 and "a programming error" in logging.Formatter().formatException(debug[0].exc_info)
+
+
+async def test_a_reply_that_is_not_json_is_qdrant_error(seeded, monkeypatch, caplog, capfd):
+    """A proxy in front of Qdrant answering a search with 200 and an HTML page: the client fails to decode
+    it. Qdrant cannot be read, as with an error status: `qdrant_error`, and the next call checks the
+    collection first."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(), store=healthy, embedder=fake)
+    _failing_for(monkeypatch, {QUERY: json.JSONDecodeError("Expecting value", NGINX_502.decode(), 0)})
+    caplog.set_level(logging.DEBUG)
+    async with _client(backend) as c:
+        assert await _error(c, {"query": QUERY}) == (
+            "[rag_unavailable] qdrant_error: the vector database answered with an error; retry later")
+        assert backend._suspected == "qdrant_error"
+        assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
+        assert healthy.checks == 2  # the next call checked the collection, and was served
+    for text in _record_texts(caplog.records) + list(capfd.readouterr()):
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
 
 
 # -- start-up ----------------------------------------------------------------------------------------

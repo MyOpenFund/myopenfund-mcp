@@ -71,6 +71,7 @@ import threading
 import time
 from typing import Any, Protocol
 
+from fastmcp.exceptions import ToolError
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from rag_engine import __version__ as ENGINE_VERSION
 from rag_engine.config import ConfigError as EngineConfigError
@@ -132,6 +133,8 @@ REASONS = {
     "timeout": "the search did not finish within the time allowed for one call; retry later",
     "busy": "too many searches are running and none finished within the time allowed for one call; "
             "retry later",
+    "internal_error": "the server failed on this search for a reason of its own (its log names the error's "
+                      "class); retry, and tell the operator if it lasts",
 }
 
 
@@ -260,6 +263,10 @@ def _reason(exc: BaseException) -> str | None:
         return "collection_mismatch"
     if isinstance(exc, ResponseHandlingException):  # connection refused, DNS, TLS, timeout
         return "qdrant_unreachable"
+    if isinstance(exc, json.JSONDecodeError):
+        # An answer that is not JSON, such as a proxy's HTML page sent with status 200: the client does
+        # not wrap that one. Qdrant cannot be read, as with an error status.
+        return "qdrant_error"
     if isinstance(exc, UnexpectedResponse):
         # 404 on a search or a scroll: the collection is gone.
         return {401: "qdrant_auth", 403: "qdrant_auth",
@@ -690,7 +697,9 @@ class EngineRagBackend:
         Raises the tool errors itself: `[invalid_argument]` with the engine's own message for an
         argument the engine refuses or a filter value the collection does not hold,
         `[rag_unavailable]` with a reason for an outage or for a search Qdrant refuses (`search_refused`:
-        the error of this call alone; the next call checks the collection before it searches). Anything else is left to the server's masking.
+        the error of this call alone; the next call checks the collection before it searches), and
+        `internal_error` for any other exception, whose class only is logged (its text and traceback at
+        DEBUG level): nothing of an exception reaches the server's masking.
         """
         error = None
         try:
@@ -711,7 +720,9 @@ class EngineRagBackend:
             error = tool_error(INVALID_ARGUMENT, str(exc))
         except _Outage as exc:
             error = unavailable(exc.reason)
-        except Exception as exc:  # mapped below, or re-raised as it is
+        except ToolError:
+            raise  # a coded error of the toolset's own (a filter value the collection does not hold)
+        except Exception as exc:  # mapped below, never re-raised
             if _refused(exc):
                 # The request is refused, not the service: the other calls are served. The next one
                 # checks the collection first, in case it is the collection that changed.
@@ -724,10 +735,19 @@ class EngineRagBackend:
             else:
                 reason = _reason(exc)
                 if reason is None:
-                    raise
-                # The class only: a client error's text holds the URL and the response body.
-                self._suspect(reason, exc, "search failed")
-                error = unavailable(reason)
+                    # Not raised on: FastMCP would log the text and the traceback of the exception, which
+                    # may hold the host, the key or a response body. A developer gets them at DEBUG level,
+                    # which the CLI never turns on.
+                    log.error("rag: a search failed with an unexpected error (%s); rag_search answered "
+                              "[rag_unavailable] internal_error. Its text and traceback, which may hold the "
+                              "vector database's address or a response body, are logged at DEBUG level only",
+                              type(exc).__name__)
+                    log.debug("rag: the unexpected error of a search", exc_info=exc)
+                    error = unavailable("internal_error")
+                else:
+                    # The class only: a client error's text holds the URL and the response body.
+                    self._suspect(reason, exc, "search failed")
+                    error = unavailable(reason)
         if error is not None:
             # Raised outside the handler so the client error (URL, body) is not chained.
             raise error
