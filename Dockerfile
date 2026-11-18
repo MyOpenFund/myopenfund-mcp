@@ -10,12 +10,13 @@ RUN apt-get update \
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 WORKDIR /src
-COPY pyproject.toml README.md LICENSE constraints.txt ./
+COPY pyproject.toml README.md LICENSE constraints.txt build-constraints.txt ./
 COPY src ./src
 # Toolset extras installed in the image, comma-separated: vault (default), companies, rag.
 ARG MOF_EXTRAS=vault
-# -c constraints.txt: every PyPI dependency at the exact version the CI tested (README, "Pinned versions").
-RUN pip install --no-cache-dir -c constraints.txt ".[${MOF_EXTRAS}]"
+# -c constraints.txt: every PyPI runtime dependency at the exact version the CI tested; --build-constraint:
+# the build backends of this package and of the git dependencies, built from source (README, "Pinned versions").
+RUN pip install --no-cache-dir -c constraints.txt --build-constraint build-constraints.txt ".[${MOF_EXTRAS}]"
 
 FROM ${PYTHON_IMAGE}
 RUN groupadd --gid 10001 mcp && useradd --uid 10001 --gid 10001 --create-home mcp

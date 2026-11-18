@@ -37,6 +37,7 @@ jobs:
           cache-dependency-path: |
             pyproject.toml
             constraints.txt
-      - run: pip install -c constraints.txt -e ".[vault,companies,rag,dev]"
+            build-constraints.txt
+      - run: pip install -c constraints.txt --build-constraint build-constraints.txt -e ".[vault,companies,rag,dev]"
       - run: python scripts/check_constraints.py
       - run: python -m pytest -q

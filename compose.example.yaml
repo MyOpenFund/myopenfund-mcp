@@ -64,7 +64,7 @@ services:
 # package, at a commit you pin, into a named volume. `mcp` then serves from that volume, mounted
 # read-only, with the same hardening as above. A restart of `mcp` alone needs no network.
 # Pinned versions: the image below is the Dockerfile's PYTHON_IMAGE (tag and digest), and the same
-# <commit> appears twice in `install`: in the constraints URL and in the package URL. Then every
+# <commit> appears three times in `install`: in the two constraints URLs and in the package URL. Then every
 # Démarrer / `up` installs exactly what the CI tested (README, "Pinned versions").
 # `rag-model-fill` is for the FIRST start with the rag toolset only: it downloads the embedding model
 # into its volume (outbound HTTPS to huggingface.co and the hosts it redirects to, a writable HOME) and
@@ -89,6 +89,7 @@ services:
 #         python -m venv --clear /opt/venv &&
 #         /opt/venv/bin/pip install -q --no-cache-dir
 #         -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/constraints.txt
+#         --build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/build-constraints.txt
 #         'myopenfund-mcp[vault,rag] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'
 #   rag-model-fill:
 #     image: python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
