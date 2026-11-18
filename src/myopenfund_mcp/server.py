@@ -27,6 +27,9 @@ MISSING_COMPANIES_EXTRA = ("MOF_COMPANIES_CATALOG is set but the [companies] ext
 MISSING_RAG_EXTRA = ("MOF_RAG_QDRANT_HOST is set but the [rag] extra is not installed: "
                      "pip install 'myopenfund-mcp[rag]'")
 
+RAG_IMPORT_FAILED = ("MOF_RAG_QDRANT_HOST is set but the rag toolset could not be imported, although the "
+                     "[rag] extra seems installed: see the error logged just before this one")
+
 INSTRUCTIONS = (
     "MyOpenFund: official primary sources only (central banks and SEC company filings). "
     "Call server_info first to see which toolsets this deployment enables. Results carry doc_id, "
@@ -89,17 +92,29 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
                    namespace="companies")
 
     if rag_backend is None and settings.rag_qdrant_host:
-        # Same rule as the vault: configured but not installed refuses to start. The ImportError is the
-        # rag-engine package itself, or its ONNX backend when the embedding model is loaded in start().
+        # Same rule as the vault: configured but not installed refuses to start. A missing module is the
+        # rag-engine package itself, or its ONNX backend when the embedding model is loaded in start()
+        # (the engine then raises an ImportError naming its extra, caused by the missing module).
+        # Any other ImportError (a broken install, a library that cannot be loaded) is not a missing
+        # extra: it is reported as what it is, with its cause in the log.
+        failure = None
         try:
             from .rag.backend import EngineRagBackend
 
             rag_backend = EngineRagBackend(settings)
             rag_backend.start()
-        except ImportError:
+        except ImportError as exc:
             rag_backend = None
-        if rag_backend is None:
-            raise ConfigError(MISSING_RAG_EXTRA)
+            missing = isinstance(exc, ModuleNotFoundError) or isinstance(exc.__cause__, ModuleNotFoundError)
+            if missing:
+                log.error("rag: a module of the [rag] extra is missing (%s)", exc)
+                failure = MISSING_RAG_EXTRA
+            else:
+                log.error("rag: the toolset could not be imported (%s: %s)", type(exc).__name__, exc,
+                          exc_info=exc)
+                failure = RAG_IMPORT_FAILED
+        if failure is not None:
+            raise ConfigError(failure)
     elif rag_backend is not None:
         rag_backend.start()
     if rag_backend is not None:
@@ -116,7 +131,8 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
 
         If the vault cannot be read, `freshness` is null and `freshness_error` says why; the rest still answers.
         With the rag toolset: `rag` (collection, embedding model, engine version, default and maximum
-        limit, and `status`: ready, or unavailable with a `reason`).
+        limit, `status`: ready, or unavailable with a `reason`; and `source_codes`, `doc_types`,
+        `languages`: the exact values rag_search accepts for these filters, null while not known).
         With the company store: `companies_freshness` (last publication, UTC; batch count), or
         `companies_freshness_error` if the store cannot be read.
         """

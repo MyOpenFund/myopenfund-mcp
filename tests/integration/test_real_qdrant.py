@@ -2,14 +2,16 @@
 
     MOF_MCP_IT_QDRANT_URL=http://127.0.0.1:6333 python -m pytest -m integration tests/integration/test_real_qdrant.py
 
-Use a THROWAWAY Qdrant: the test creates collections named `mof-mcp-it-<random>`, seeds them through
-rag-engine (store, schema, payload indexes) and deletes them at the end. The embedder is rag-engine's
+Use a THROWAWAY Qdrant, NEVER a production one: the test creates collections named
+`mof-mcp-it-<random>`, seeds them through rag-engine (store, schema, payload indexes) and deletes them at
+the end. The embedder is rag-engine's
 FakeEmbedder, injected into the backend: the real model (1.1 GB) is not needed.
 
 Optional, for a Qdrant started with API keys: MOF_MCP_IT_QDRANT_API_KEY (a key that can write: seeds and
 cleans up) and MOF_MCP_IT_QDRANT_READ_ONLY_API_KEY (the key the server is then given, as in a
 deployment). No key is ever printed or put in a skip reason.
 """
+import asyncio
 import os
 import uuid
 from urllib.parse import urlsplit
@@ -50,6 +52,20 @@ async def _error(client, arguments) -> str:
     return result.content[0].text
 
 
+def _quoted(values) -> str:
+    return ", ".join(f'"{value}"' for value in values)
+
+
+async def _rag_info(client, *, until=lambda info: True) -> dict:
+    """`server_info`'s rag object, asked again (for 10 s at most) until `until` holds."""
+    for _ in range(100):
+        info = (await client.call_tool("server_info", {})).data["rag"]
+        if until(info):
+            break
+        await asyncio.sleep(0.1)
+    return info
+
+
 @pytest.fixture(scope="module")
 def writer():
     from rag_engine.store import QdrantStore
@@ -77,7 +93,8 @@ async def test_rag_search_end_to_end(seeded):
         info = (await c.call_tool("server_info", {})).data
         assert info["toolsets"]["rag"] == "enabled"
         assert info["rag"] == {"status": "ready", "collection": collection, "model": MODEL,
-                               "engine_version": info["rag"]["engine_version"], "default_limit": 8,
+                               "engine_version": info["rag"]["engine_version"], "source_codes": SOURCE_CODES,
+                               "doc_types": DOC_TYPES, "languages": ["en", "ja"], "default_limit": 8,
                                "max_limit": 20}
 
         data = (await c.call_tool("rag_search", {"query": ECB_RATES})).data
@@ -105,11 +122,14 @@ async def test_rag_search_end_to_end(seeded):
 
         # The valid values are the collection's own (facet API on the keyword indexes).
         assert await _error(c, {"query": "rates", "source_codes": ["ECB"]}) == (
-            "[invalid_argument] source_codes: unknown value 'ECB' (did you mean 'ecb'? values are matched "
-            "exactly); valid values: " + ", ".join(SOURCE_CODES))
+            '[invalid_argument] source_codes: unknown value "ECB" (did you mean "ecb"? values are matched '
+            "exactly); valid values: " + _quoted(SOURCE_CODES))
         assert await _error(c, {"query": "rates", "doc_types": ["minutes"]}) == (
-            "[invalid_argument] doc_types: unknown value 'minutes'; valid values: " + ", ".join(DOC_TYPES))
+            '[invalid_argument] doc_types: unknown value "minutes"; valid values: ' + _quoted(DOC_TYPES))
 
+        assert await _error(c, {"query": "rates", "source_codes": '["ecb"]'}) == (
+            '[invalid_argument] source_codes must be a JSON array of strings, e.g. ["ecb"]; omit it for no '
+            "restriction")
         assert (await _error(c, {"query": "rates", "date_from": "2016"})).startswith("[invalid_argument] date_from")
         assert (await _error(c, {"query": "rates", "limit": 21})).startswith("[limit_exceeded] limit 21 is above")
         assert (await _error(c, {"query": " "})).startswith("[invalid_argument] query")
@@ -120,7 +140,7 @@ async def test_rag_search_end_to_end(seeded):
 
 
 async def test_the_values_are_read_by_a_scroll_when_the_collection_has_no_keyword_index(writer):
-    from rag_fixture import SOURCE_CODES, embedder, seed
+    from rag_fixture import DOC_TYPES, SOURCE_CODES, embedder, seed
 
     collection = f"mof-mcp-it-{uuid.uuid4().hex[:12]}"
     try:
@@ -128,21 +148,53 @@ async def test_the_values_are_read_by_a_scroll_when_the_collection_has_no_keywor
         for field in ("source_code", "doc_type", "language"):
             writer.client.delete_payload_index(collection, field)
         async with _client(collection, embedder()) as c:
-            assert (await _error(c, {"query": "rates", "source_codes": ["ECB"]})).endswith(
-                "valid values: " + ", ".join(SOURCE_CODES))
+            # The scroll runs in the background from the start: a search never waits for it.
             assert (await c.call_tool("rag_search", {"query": "rates", "doc_types": ["E1"]})).data["count"] == 1
+            info = await _rag_info(c, until=lambda info: info["source_codes"] is not None)
+            assert (info["source_codes"], info["doc_types"]) == (SOURCE_CODES, DOC_TYPES)
+            assert (await _error(c, {"query": "rates", "source_codes": ["ECB"]})).endswith(
+                "valid values: " + _quoted(SOURCE_CODES))
+            assert (await c.call_tool("rag_search", {"query": "rates", "doc_types": ["E1"]})).data["count"] == 1
+    finally:
+        writer.client.delete_collection(collection)
+
+
+async def test_a_code_ingested_while_the_server_runs_is_accepted_without_waiting_for_the_ttl(writer):
+    from qdrant_client import models
+    from rag_engine.schema import build_payload, page_for_id, point_id
+    from rag_fixture import SOURCE_CODES, seed
+
+    collection = f"mof-mcp-it-{uuid.uuid4().hex[:12]}"
+    try:
+        fake = seed(writer, collection)
+        # rag_codes_retry_s=0: the read made before a refusal is not held back (5 s by default).
+        async with _client(collection, fake, rag_codes_ttl_s=3600, rag_codes_retry_s=0) as c:
+            assert (await _error(c, {"query": "rates", "source_codes": ["zz"]})).endswith(
+                "valid values: " + _quoted(SOURCE_CODES))
+            text = "A document of a source ingested after the server started."
+            payload = build_payload("zz/A1/new", {"corpus": "central-bank", "source_code": "zz", "doc_type": "A1",
+                                                  "title": "New", "date": "2026-01-01", "language": "en"},
+                                    filename="new.pdf", chunk_number=0, ingestion_date="2026-11-17T00:00:00",
+                                    text=text, page=0)
+            writer.upsert(collection, [models.PointStruct(id=point_id("zz/A1/new", page_for_id(0), 0),
+                                                          vector=fake.encode_passage([text])[0].tolist(),
+                                                          payload=payload)])
+            data = (await c.call_tool("rag_search", {"query": text, "source_codes": ["zz"]})).data
+            assert [h["doc_id"] for h in data["hits"]] == ["zz/A1/new"]
+            assert "zz" in (await _rag_info(c))["source_codes"]
     finally:
         writer.client.delete_collection(collection)
 
 
 async def test_a_collection_that_disappears_is_rag_unavailable_then_served_again(writer):
     """What the engine lets through raw (HTTP 404 on a search) is a coded error; the toolset recovers."""
-    from rag_fixture import CHUNKS, embedder, seed
+    from rag_fixture import CHUNKS, SOURCE_CODES, embedder, seed
 
     collection = f"mof-mcp-it-{uuid.uuid4().hex[:12]}"
     try:
         fake = embedder()
-        async with _client(collection, fake) as c:  # the collection does not exist yet: the server starts
+        # rag_check_retry_s=0: a failure is not remembered, so every call asks Qdrant (5 s by default).
+        async with _client(collection, fake, rag_check_retry_s=0) as c:  # no collection yet: the server starts
             info = (await c.call_tool("server_info", {})).data["rag"]
             assert (info["status"], info["reason"]) == ("unavailable", "collection_missing")
             assert (await _error(c, {"query": "rates"})).startswith("[rag_unavailable] collection_missing: ")
@@ -153,8 +205,29 @@ async def test_a_collection_that_disappears_is_rag_unavailable_then_served_again
             seed(writer, collection)
             assert (await c.call_tool("rag_search", {"query": "rates"})).data["count"] == CHUNKS
             assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+            # The values of the collection as it is now, read after it came back.
+            assert (await _error(c, {"query": "rates", "source_codes": ["ECB"]})).endswith(
+                "valid values: " + _quoted(SOURCE_CODES))
     finally:
         writer.client.delete_collection(collection)
+
+
+async def test_a_failure_is_remembered_and_the_next_calls_answer_at_once(seeded):
+    """An address that drops packets would cost every call a whole timeout: only the first one pays."""
+    import socket
+    import time
+
+    collection, fake = seeded
+    with socket.socket() as silent:  # accepts connections and never answers, as a frozen Qdrant does
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(64)
+        async with _client(collection, fake, rag_qdrant_host="127.0.0.1", rag_qdrant_port=silent.getsockname()[1],
+                           rag_qdrant_https=False, rag_qdrant_timeout=1, rag_check_retry_s=30) as c:
+            started = time.monotonic()
+            answers = await asyncio.gather(*[_error(c, {"query": "rates", "source_codes": ["ecb"]})
+                                             for _ in range(30)])
+            assert time.monotonic() - started < 1  # 30 calls, no request: the check of the start is remembered
+            assert all(a.startswith("[rag_unavailable] qdrant_unreachable: ") for a in answers)
 
 
 async def test_a_collection_of_another_dimension_is_rag_unavailable(seeded):

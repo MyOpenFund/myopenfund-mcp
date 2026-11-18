@@ -3,23 +3,47 @@
 EngineRagBackend runs the `rag_engine` package (the rag-engine repo's one implementation) with one
 shared Qdrant store and one shared ONNX embedder for the process. Its configuration is built from
 the server's `MOF_RAG_*` settings only: the engine never reads `QDRANT_*` / `RAG_ENGINE_*` from the
-environment here.
+environment here. The ONNX runtime's telemetry is turned off by the package's `__init__`, which runs
+before the imports below.
 
 Start-up (`start()`, called once by `build_server`):
 - the embedding model is loaded, which verifies every pinned model file. It is loaded there and
   nowhere else: a tool call never loads or downloads a model. A model that cannot be loaded leaves
   the toolset mounted and answering `[rag_unavailable]` until the server is restarted;
 - the collection is checked (read-only). An unreachable Qdrant, a refused key or a missing
-  collection also leaves the toolset mounted and answering `[rag_unavailable]`; that check is run
-  again at the next call, so the toolset recovers by itself once Qdrant is back.
+  collection also leaves the toolset mounted and answering `[rag_unavailable]`; the check is run
+  again by a later call, so the toolset recovers by itself once Qdrant is back;
+- the collection's filter values are read (see below).
 The other toolsets behave the same way when their backend is down at start: the server starts,
 their tools answer a coded error.
 
-No error message, log line or `info()` ever holds the Qdrant host, the API key, a raw response body
-or the text of a query.
+When Qdrant does not answer, a call pays for ONE request timeout at most:
+- a failed check, or a search that failed for an outage, is remembered `rag_check_retry_s` seconds:
+  calls made meanwhile, and calls made while another one is running the check, are answered at once
+  with the recorded reason;
+- a read of the filter values that fails for an outage ends the call: the search is not tried after it.
+No lock is held during a request to Qdrant.
+
+Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown code:
+- with Qdrant's facet API and the keyword indexes, they are read in the calling thread (a few
+  milliseconds): at start, then by one call every `rag_codes_ttl_s` seconds;
+- without them, ONE scroll of the collection reads the three fields, always in a background thread:
+  searches are served meanwhile with the values already known, or without any check while none is;
+- before a value is refused the values are read once more (not more often than every
+  `rag_codes_retry_s` seconds), so a code that has just been ingested is not refused for a whole TTL;
+- they are dropped when the collection check passes after having failed (the collection may have
+  been recreated); an empty list refuses nothing; a failed read is tried again after
+  `rag_codes_retry_s` seconds.
+
+No error message and no `info()` holds the Qdrant host, the API key, a raw response body or the text
+of a query, and neither does a log line of this module (logger `myopenfund_mcp.rag`). The HTTP
+libraries under the Qdrant client are another matter: `httpx` logs one INFO line per request with
+the server's address, which is why the CLI raises that logger to WARNING, and `httpcore` logs the
+host and port of each connection at DEBUG, a level the CLI never turns on.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -38,6 +62,9 @@ from ..errors import INVALID_ARGUMENT, RAG_UNAVAILABLE, tool_error
 
 log = logging.getLogger("myopenfund_mcp.rag")
 
+#: The clock of the caches (failed check, filter values). Deadlines use `time.monotonic` itself.
+monotonic = time.monotonic
+
 #: filter argument -> payload field whose stored values a requested value is checked against
 CODE_FIELDS = {"source_codes": "source_code", "doc_types": "doc_type", "languages": "language"}
 #: Most distinct values read per field. A field with as many (or more) is not checked: its list
@@ -47,10 +74,14 @@ MAX_FACET_VALUES = 1000
 #: keyword indexes). A larger collection is not checked rather than checked against a partial list.
 MAX_SCROLL_POINTS = 100_000
 SCROLL_PAGE = 2000
-#: Most valid values listed in an error message.
+#: Most valid values listed in an error message and in `info()`.
 MAX_LISTED_VALUES = 60
+#: Answers to a facet request that mean "not here": no keyword index on the field (400), a server
+#: without the facet API (404, 405, 501). A missing collection is a 404 too: the scroll then says so.
+NO_FACET_STATUSES = (400, 404, 405, 422, 501)
 
-# reason -> what the caller is told. Fixed texts: never the host, the key or a response body.
+# reason -> what the caller is told. Fixed texts: never the host, the key, a response body or the
+# text of an engine error.
 REASONS = {
     "qdrant_unreachable": "the vector database cannot be reached or did not answer in time; retry later",
     "qdrant_auth": "the vector database refused the server's API key; the deployment must be fixed",
@@ -62,17 +93,34 @@ REASONS = {
     "model_integrity": "an embedding model file is not the pinned one; the deployment must be fixed",
     "model_unavailable": "the embedding model could not be loaded when the server started; "
                          "the deployment must be fixed",
+    "timeout": "the search did not finish within the time allowed for one call; retry later",
+    "busy": "too many searches are running and none finished within the time allowed for one call; "
+            "retry later",
 }
 
 
 class RagBackend(Protocol):
     def start(self) -> None: ...
     def info(self) -> dict: ...
-    def search(self, *, query: str, filters: dict, limit: int, max_limit: int) -> tuple[dict, list[dict]]: ...
+    def search(self, *, query: str, filters: dict, limit: int, max_limit: int,
+               deadline: float | None = None) -> tuple[dict, list[dict]]: ...
 
 
 def unavailable(reason: str) -> Exception:
     return tool_error(RAG_UNAVAILABLE, f"{reason}: {REASONS[reason]}")
+
+
+class _Outage(Exception):
+    """The call cannot be served, for the `[rag_unavailable]` reason given. Internal."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def quoted(value: str) -> str:
+    """`value` as a JSON string: what the client must send, whatever characters it holds."""
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _reason(exc: BaseException) -> str | None:
@@ -87,7 +135,8 @@ def _reason(exc: BaseException) -> str | None:
         return "qdrant_unreachable"
     if isinstance(exc, UnexpectedResponse):
         # On a search: 404 = the collection is gone, 400 = a vector of another dimension.
-        return {404: "collection_missing", 400: "collection_mismatch"}.get(exc.status_code, "qdrant_error")
+        return {401: "qdrant_auth", 403: "qdrant_auth", 404: "collection_missing",
+                400: "collection_mismatch"}.get(exc.status_code, "qdrant_error")
     if isinstance(exc, ModelIntegrityError):
         return "model_integrity"
     if isinstance(exc, ModelDownloadError):
@@ -122,6 +171,8 @@ class EngineRagBackend:
     def __init__(self, settings: Settings, *, store: Any = None, embedder: Any = None):
         self._collection = settings.rag_collection
         self._ttl_s = settings.rag_codes_ttl_s
+        self._codes_retry_s = settings.rag_codes_retry_s
+        self._check_retry_s = settings.rag_check_retry_s
         self._embedder = embedder
         self._engine_settings = None
         if store is None or embedder is None:
@@ -130,21 +181,28 @@ class EngineRagBackend:
         spec = embedder.spec if embedder is not None else None
         self._model = spec.name if spec else self._engine_settings.model_name
         self._dim = spec.dim if spec else self._engine_settings.model_dim
-        self._lock = threading.Lock()
+        self._start_lock = threading.Lock()
         self._started = False
         self._model_reason: str | None = None  # set at start, kept until restart
+        # Guards everything below. Never held during a request to Qdrant.
+        self._lock = threading.Lock()
         self._collection_reason: str | None = "qdrant_unreachable"  # until the first check passes
+        self._failed_at: float | None = None  # when the last check or search failed for an outage
+        self._checking = False  # a call is running the collection check
         self._logged_reason: str | None = None
-        self._codes: dict[str, frozenset[str] | None] | None = None
-        self._codes_read_at = 0.0
-        self._codes_warned = False
+        self._values: dict[str, frozenset[str] | None] | None = None  # None: not known (yet)
+        self._values_tried_at: float | None = None  # when the last read started
+        self._values_due_at: float | None = None  # when the next read is due; None: at the next filtered call
+        self._reading = False  # a read of the values is running (here or in the background thread)
+        self._read_done = threading.Condition(self._lock)
+        self._values_warned = False
 
     # -- start-up and state ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Load the model (once, here only) and check the collection. Never raises for an outage;
-        an ImportError (the [rag] extra is incomplete) is left to the caller."""
-        with self._lock:
+        """Load the model (once, here only), check the collection, read its filter values. Never
+        raises for an outage; an ImportError (the [rag] extra is incomplete) is left to the caller."""
+        with self._start_lock:
             if self._started:
                 return
             self._started = True
@@ -157,118 +215,245 @@ class EngineRagBackend:
                 except Exception as exc:  # noqa: BLE001 -- the toolset answers [rag_unavailable] instead
                     self._model_reason = _reason(exc) or "model_unavailable"
                     # The engine's text names the file, the directory and the hashes: no secret in it.
-                    log.error("rag: the embedding model could not be loaded (%s): %s: %s; rag_search answers "
-                              "[rag_unavailable] until the server is restarted",
-                              self._model_reason, type(exc).__name__, exc)
+                    # It also names its own cache variable, which this server never reads.
+                    text = str(exc).replace("RAG_ENGINE_MODEL_CACHE", "MOF_RAG_MODEL_CACHE")
+                    log.error("rag: the embedding model could not be loaded from the directory of "
+                              "MOF_RAG_MODEL_CACHE (%s): %s: %s; rag_search answers [rag_unavailable] until "
+                              "the server is restarted", self._model_reason, type(exc).__name__, text)
                 else:
                     log.info("rag: embedding model %s ready in %.1f s", self._model, time.monotonic() - started)
-            self._check_collection()
+            with self._lock:
+                self._checking = True
+            if self._check_collection() is None:
+                try:
+                    self._read_values()
+                except _Outage:
+                    pass  # recorded: the first call checks the collection again
 
-    def _check_collection(self) -> None:
-        """Run the engine's read-only collection check and record the outcome. Lock held."""
+    def _check_collection(self) -> str | None:
+        """Run the engine's read-only collection check and record the outcome: None, or the reason
+        it failed for. The caller has set `_checking`; it is cleared here."""
         try:
             self._store.check_collection(self._collection, self._dim)
         except Exception as exc:  # noqa: BLE001 -- recorded; the class only is logged (no host, no body)
-            reason = _reason(exc)
-            if reason is None:
-                reason = "qdrant_error"
-            if reason != self._logged_reason:  # once per change of state, not once per call
-                log.warning("rag: collection check failed (%s, %s); rag_search answers [rag_unavailable] "
-                            "until a check passes", reason, type(exc).__name__)
-            self._collection_reason = self._logged_reason = reason
-        else:
-            log.info("rag: collection %s checked, searches are served", self._collection)
-            self._collection_reason = self._logged_reason = None
+            reason = _reason(exc) or "qdrant_error"
+            self._failed(reason, exc, "collection check failed")
+            return reason
+        with self._lock:
+            if self._collection_reason is not None:
+                # Back after a failure: the collection may have been recreated with other codes.
+                self._values = self._values_due_at = self._values_tried_at = None
+            self._collection_reason = self._logged_reason = self._failed_at = None
+            self._checking = False
+        log.info("rag: collection %s checked, searches are served", self._collection)
+        return None
 
-    def _status(self) -> str | None:
-        return self._model_reason or self._collection_reason
+    def _failed(self, reason: str, exc: BaseException, what: str) -> None:
+        """Record an outage: calls are answered with `reason` until a check passes."""
+        with self._lock:
+            changed = reason != self._logged_reason
+            self._collection_reason = self._logged_reason = reason
+            self._failed_at = monotonic()
+            self._checking = False
+        if changed:  # once per change of state, not once per call
+            log.warning("rag: %s (%s, %s); rag_search answers [rag_unavailable] until a collection check "
+                        "passes", what, reason, type(exc).__name__)
+
+    def _require_collection(self) -> None:
+        """Return when searches are served; `_Outage` otherwise. After a failure the check is run
+        again by one call at a time, and not before `rag_check_retry_s` seconds: the other calls
+        are answered at once with the recorded reason."""
+        with self._lock:
+            reason = self._collection_reason
+            if reason is None:
+                return
+            recent = self._failed_at is not None and monotonic() - self._failed_at < self._check_retry_s
+            if self._checking or recent:
+                raise _Outage(reason)
+            self._checking = True
+        reason = self._check_collection()
+        if reason is not None:
+            raise _Outage(reason)
 
     def info(self) -> dict:
         """What `server_info` shows. Reads the recorded state only: no request, nothing secret."""
-        reason = self._status()
+        with self._lock:
+            reason, values = self._model_reason or self._collection_reason, self._values or {}
         info = {"status": "ready" if reason is None else "unavailable", "collection": self._collection,
                 "model": self._model, "engine_version": ENGINE_VERSION}
         if reason is not None:
             info["reason"] = reason
+        for argument, field in CODE_FIELDS.items():
+            # The valid values of each filter as last read (at most MAX_LISTED_VALUES); null when unknown.
+            known = values.get(field)
+            info[argument] = None if known is None else sorted(known)[:MAX_LISTED_VALUES]
         return info
 
     # -- valid filter values -----------------------------------------------------------------
 
-    def _read_values(self, field: str) -> frozenset[str] | None:
-        """Distinct stored values of one payload field; None when they cannot be listed in full."""
-        client = self._store.client
-        try:
-            hits = client.facet(self._collection, field, limit=MAX_FACET_VALUES).hits
-        except (AttributeError, UnexpectedResponse):
-            # A client or a server without the facet API, or a field without its keyword index.
-            return self._scroll_values(field)
-        if len(hits) >= MAX_FACET_VALUES:
-            return None
-        return frozenset(hit.value for hit in hits if isinstance(hit.value, str))
+    def _facet_values(self) -> dict[str, frozenset[str] | None] | None:
+        """Distinct stored values of each checked field, by the facet API; None when the server or
+        the collection cannot answer a facet request (the scroll is then the way)."""
+        client, values = self._store.client, {}
+        for field in CODE_FIELDS.values():
+            try:
+                hits = client.facet(self._collection, field, limit=MAX_FACET_VALUES).hits
+            except AttributeError:  # a client without the facet API
+                return None
+            except UnexpectedResponse as exc:
+                if exc.status_code in NO_FACET_STATUSES:
+                    return None
+                raise
+            values[field] = (None if len(hits) >= MAX_FACET_VALUES
+                             else frozenset(hit.value for hit in hits if isinstance(hit.value, str)))
+        return values
 
-    def _scroll_values(self, field: str) -> frozenset[str] | None:
-        client, values, offset, seen = self._store.client, set(), None, 0
+    def _scroll_values(self) -> dict[str, frozenset[str] | None]:
+        """The same values by ONE scroll of the collection reading the three fields; None for every
+        field when the collection is too large to be read in full."""
+        client, fields = self._store.client, list(CODE_FIELDS.values())
+        values: dict[str, set[str]] = {field: set() for field in fields}
+        offset, seen = None, 0
         while True:
             points, offset = client.scroll(self._collection, limit=SCROLL_PAGE, offset=offset,
-                                           with_payload=[field], with_vectors=False)
+                                           with_payload=fields, with_vectors=False)
             for point in points:
-                value = (point.payload or {}).get(field)
-                values.update(v for v in (value if isinstance(value, list) else [value]) if isinstance(v, str))
+                payload = point.payload or {}
+                for field in fields:
+                    value = payload.get(field)
+                    values[field].update(v for v in (value if isinstance(value, list) else [value])
+                                         if isinstance(v, str))
             seen += len(points)
             if offset is None:
-                return frozenset(values)
+                return {field: frozenset(found) for field, found in values.items()}
             if seen >= MAX_SCROLL_POINTS:
-                return None
+                return dict.fromkeys(fields)
 
-    def _known_values(self) -> dict[str, frozenset[str] | None]:
-        """Stored values per checked field, read at most every `rag_codes_ttl_s` seconds.
-
-        A read that fails degrades to no check (None for every field, logged once), never to a failed
-        search; it is tried again after the same delay.
-        """
+    def _read_values(self) -> None:
+        """Read the filter values unless a read is already running. The facet request is made here,
+        in the calling thread; when it cannot be answered, the scroll is handed to a background
+        thread and this returns at once. `_Outage` when the facet request fails for an outage."""
         with self._lock:
-            now = time.monotonic()
-            if self._codes is not None and now - self._codes_read_at < self._ttl_s:
-                return self._codes
-            try:
-                codes = {field: self._read_values(field) for field in CODE_FIELDS.values()}
-                self._codes_warned = False
-            except Exception as exc:  # noqa: BLE001 -- the search itself reports an outage
-                if not self._codes_warned:
-                    log.warning("rag: the collection's filter values could not be read (%s); filter values "
-                                "are not checked until they can", type(exc).__name__)
-                    self._codes_warned = True
-                codes = dict.fromkeys(CODE_FIELDS.values())
-            self._codes, self._codes_read_at = codes, now
-            return codes
+            if self._reading:
+                return
+            self._reading, self._values_tried_at = True, monotonic()
+        try:
+            values = self._facet_values()
+        except Exception as exc:  # noqa: BLE001 -- recorded; the search is served unchecked or not at all
+            self._values_read(None, exc)
+            reason = _reason(exc)
+            if reason is None:
+                return
+            error = _Outage(reason)
+        else:
+            if values is None:
+                threading.Thread(target=self._scroll_in_background, name="mof-rag-values", daemon=True).start()
+            else:
+                self._values_read(values, None)
+            return
+        raise error  # outside the handler: the client error (URL, body) is not chained
 
-    def _check_values(self, filters: SearchFilters) -> None:
-        known = None
-        for argument, field in CODE_FIELDS.items():
-            asked = getattr(filters, argument)
-            if asked is None:
-                continue
-            known = self._known_values() if known is None else known
-            valid = known[field]
-            unknown = [value for value in asked if value not in valid] if valid is not None else []
-            if not unknown:
-                continue
+    def _scroll_in_background(self) -> None:
+        try:
+            values = self._scroll_values()
+        except Exception as exc:  # noqa: BLE001 -- recorded; nothing to answer from a background thread
+            self._values_read(None, exc)
+        else:
+            self._values_read(values, None)
+
+    def _values_read(self, values: dict | None, exc: BaseException | None) -> None:
+        """Record the end of a read: the values, or the failure (the values already known are kept,
+        and the read is tried again after `rag_codes_retry_s` seconds, not after the whole TTL)."""
+        reason = None if exc is None else _reason(exc)
+        with self._lock:
+            now = monotonic()
+            changed = exc is None and values != self._values
+            if exc is None:
+                self._values, self._values_due_at, self._values_warned = values, now + self._ttl_s, False
+            else:
+                self._values_due_at = now + self._codes_retry_s
+            warn = exc is not None and not self._values_warned
+            self._values_warned = exc is not None
+            self._reading = False
+            self._read_done.notify_all()
+        if changed:  # the counts only, and only when they change: not one line per TTL
+            log.info("rag: filter values read from the collection (%s)", ", ".join(
+                f"{argument}: {'not listed, too many' if values[field] is None else len(values[field])}"
+                for argument, field in CODE_FIELDS.items()))
+        if warn:
+            log.warning("rag: the collection's filter values could not be read (%s); filter values are "
+                        "checked against the last values read, if any, until they can", type(exc).__name__)
+        if reason is not None:
+            self._failed(reason, exc, "reading the filter values failed")
+
+    def _known_values(self) -> dict[str, frozenset[str] | None] | None:
+        """The stored values per checked field, read again when due; None while none is known."""
+        with self._lock:
+            due = not self._reading and (self._values_due_at is None or monotonic() >= self._values_due_at)
+        if due:
+            self._read_values()
+        with self._lock:
+            return self._values
+
+    def _reread_values(self, deadline: float | None) -> dict[str, frozenset[str] | None] | None:
+        """Before a value is refused: the values read once more, unless they were read less than
+        `rag_codes_retry_s` seconds ago. Waits for a read that is running (the background scroll),
+        within the call's deadline."""
+        with self._lock:
+            fresh = (self._values_tried_at is not None
+                     and monotonic() - self._values_tried_at < self._codes_retry_s)
+            reading = self._reading
+        if not fresh and not reading:
+            self._read_values()
+        with self._read_done:
+            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._read_done.wait_for(lambda: not self._reading, timeout=wait)
+            return self._values
+
+    @staticmethod
+    def _unknown(asked: dict[str, tuple[str, ...]], known: dict | None) -> dict[str, list[str]]:
+        """argument -> the asked values its field does not hold. A field whose values are not known,
+        or that holds none (an empty collection), refuses nothing."""
+        unknown = {}
+        for argument, wanted in asked.items():
+            valid = (known or {}).get(CODE_FIELDS[argument])
+            missing = [value for value in wanted if value not in valid] if valid else []
+            if missing:
+                unknown[argument] = missing
+        return unknown
+
+    def _check_values(self, filters: SearchFilters, deadline: float | None) -> None:
+        asked = {argument: getattr(filters, argument) for argument in CODE_FIELDS
+                 if getattr(filters, argument) is not None}
+        if not asked:
+            return
+        known = self._known_values()
+        unknown = self._unknown(asked, known)
+        if unknown:
+            known = self._reread_values(deadline)
+            unknown = self._unknown(asked, known)
+        for argument, values in unknown.items():
+            valid = known[CODE_FIELDS[argument]]
             folded = {value.casefold(): value for value in sorted(valid)}
             parts = []
-            for value in unknown:
+            for value in values:
                 near = folded.get(value.strip().casefold())
-                parts.append(f"{value!r} (did you mean {near!r}? values are matched exactly)" if near
-                             else repr(value))
+                parts.append(f"{quoted(value)} (did you mean {quoted(near)}? values are matched exactly)" if near
+                             else quoted(value))
             listed = sorted(valid)
             more = f", ... ({len(listed)} values)" if len(listed) > MAX_LISTED_VALUES else ""
             raise tool_error(INVALID_ARGUMENT,
                              f"{argument}: unknown value{'' if len(parts) == 1 else 's'} {', '.join(parts)}; "
-                             f"valid values: {', '.join(listed[:MAX_LISTED_VALUES])}{more}")
+                             f"valid values: {', '.join(quoted(v) for v in listed[:MAX_LISTED_VALUES])}{more}")
 
     # -- search ------------------------------------------------------------------------------
 
-    def search(self, *, query: str, filters: dict, limit: int, max_limit: int) -> tuple[dict, list[dict]]:
+    def search(self, *, query: str, filters: dict, limit: int, max_limit: int,
+               deadline: float | None = None) -> tuple[dict, list[dict]]:
         """(filters as applied, hits as plain dicts, best first). Blocking: call it off the event loop.
+
+        `deadline` (a `time.monotonic()` value) is when the caller stops waiting: the search is not
+        started after it.
 
         Raises the tool errors itself: `[invalid_argument]` with the engine's own message for an
         argument the engine refuses or a filter value the collection does not hold,
@@ -278,24 +463,23 @@ class EngineRagBackend:
         try:
             applied = SearchFilters.from_mapping(filters)
             if self._model_reason is not None:
-                raise unavailable(self._model_reason)
-            if self._collection_reason is not None:
-                with self._lock:
-                    self._check_collection()
-                if self._collection_reason is not None:
-                    raise unavailable(self._collection_reason)
-            self._check_values(applied)
+                raise _Outage(self._model_reason)
+            self._require_collection()
+            self._check_values(applied, deadline)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _Outage("timeout")
             hits = search(query, collection=self._collection, store=self._store, embedder=self._embedder,
                           filters=applied, limit=limit, max_limit=max_limit)
         except SearchError as exc:
             error = tool_error(INVALID_ARGUMENT, str(exc))
+        except _Outage as exc:
+            error = unavailable(exc.reason)
         except Exception as exc:  # mapped below, or re-raised as it is
             reason = _reason(exc)
             if reason is None:
                 raise
             # The class only: a client error's text holds the URL and the response body.
-            log.warning("rag: search failed (%s, %s)", reason, type(exc).__name__)
-            self._collection_reason = reason  # the next call checks the collection again first
+            self._failed(reason, exc, "search failed")
             error = unavailable(reason)
         if error is not None:
             # Raised outside the handler so the client error (URL, body) is not chained.

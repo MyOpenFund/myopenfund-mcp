@@ -1,6 +1,24 @@
-"""The `rag` toolset: search the passages of the embedded central-bank corpus."""
+"""The `rag` toolset: search the passages of the embedded corpus.
+
+One call has ONE time budget (`rag_call_timeout_s`), its wait for a free slot included. At most
+`rag_max_concurrency` searches run at once, in threads of the toolset's own: the calls in excess wait
+in the event loop, and a hanging Qdrant takes no thread from the other toolsets. A call whose
+budget ends answers `[rag_unavailable]`: `busy` when it never got a slot, `timeout` when its search
+was still running. That search keeps its slot until it really ends (one request to Qdrant never
+outlasts `rag_qdrant_timeout`), so abandoned threads cannot pile up.
+
+The arguments a client gets wrong most often are checked here, before anything else, and refused
+in the terms of the JSON the client must send.
+"""
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
+import json
+import re
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Annotated
 
@@ -12,43 +30,46 @@ from ..auth import tier_check
 from ..config import Settings
 from ..errors import INVALID_ARGUMENT, LIMIT_EXCEEDED, tool_error
 from ..paging import cap_result, jsonable, result_chars
-from .backend import RagBackend
+from .backend import RagBackend, unavailable
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 MAX_QUERY_CHARS = 2000  # longer queries are refused by schema validation (the model reads 512 tokens)
 MAX_CODE_CHARS = 64
 MAX_CODES = 50
 MAX_DATE_CHARS = 40  # room for a malformed date to reach the coded error instead of the schema's
+CODE_ARGUMENTS = ("source_codes", "doc_types", "languages")
+DATE_ARGUMENTS = ("date_from", "date_to")
 
-SEARCH_DESCRIPTION = """Search central-bank monetary-policy documents by meaning and get the most relevant \
+# Corpus-neutral on purpose: what the collection holds and what its codes mean is the deployment's to
+# say, in MOF_RAG_DESCRIPTION_NOTES (appended below) -- the codes themselves are read from the collection.
+SEARCH_DESCRIPTION = """Search the embedded document collection by meaning and get the most relevant \
 PASSAGES (text excerpts), best first. It returns source text only; it does not write an answer.
 
 Arguments:
-- query (required): a question or topic in plain language, e.g. "why did the ECB raise rates in July 2022".
-- source_codes: list of central banks, exact lower-case codes: "ecb" (European Central Bank), "us" (Federal \
-Reserve), "gb" (Bank of England), "au" (Reserve Bank of Australia), "ca" (Bank of Canada), "jp" (Bank of Japan).
-- doc_types: list of document types, exact upper-case codes: "A1" (rate-decision press release), "A2" (policy \
-statement), "A3" (minutes or accounts of the meeting), "B1" (press conference), "E1" (monetary policy report), \
-"F1" (projections).
-- languages: list of language codes as stored, e.g. ["en"].
+- query (required): a question or topic in plain language.
+- source_codes, doc_types, languages: JSON arrays of exact codes (case matters), e.g. \
+source_codes=["<code>"]. The valid codes are listed in server_info (rag.source_codes, rag.doc_types, \
+rag.languages) and in the refusal message: a code the collection does not hold is refused with the valid \
+ones, never corrected.
 - date_from, date_to: publication date bounds, "YYYY-MM-DD", both inclusive. With a bound set, undated \
-documents are left out.
-- limit: number of passages; omit for the server default.
-Lists are JSON arrays, e.g. source_codes=["ecb","us"]. Values of one list are alternatives (OR); different \
-arguments combine (AND). Omit an argument to leave it unrestricted; never send an empty list. A code the \
-collection does not hold is refused with the list of valid codes, never corrected.
+documents are left out. Date precision varies by bank (some documents carry only the year or the month): \
+if a date range returns nothing, retry with whole-year bounds or without dates.
+- limit: number of passages, from 1 to {max_limit}; omitted = {default_limit}.
+Values of one array are alternatives (OR); different arguments combine (AND). Omit an argument to leave it \
+unrestricted; never send an empty array.
 
-Result: {query, filters, count, hits}. Each hit: rank, score (cosine, higher is closer), text, doc_id, \
+Result: {{query, filters, count, hits}}. Each hit: rank, score (cosine, higher is closer), text, doc_id, \
 title, date, source_code, doc_type, language, page, chunk_number, citation. `page` is the page the passage \
 starts on, counted from 1 (null for a document without pages). Quote `text` and cite each passage with \
 its `citation` (title, date, page); several hits may come from the same document."""
 
 QUERY_DESCRIPTION = "What to look for, in plain language (a question or a topic). Required."
-SOURCE_CODES_DESCRIPTION = ('Central banks to keep, exact lower-case codes among "ecb", "us", "gb", "au", "ca", '
-                            '"jp", e.g. ["ecb", "us"]; omitted = all')
-DOC_TYPES_DESCRIPTION = ('Document types to keep, exact upper-case codes among "A1", "A2", "A3", "B1", "E1", '
-                         '"F1", e.g. ["A3"]; omitted = all')
-LANGUAGES_DESCRIPTION = 'Language codes to keep, exact, e.g. ["en"]; omitted = all'
+SOURCE_CODES_DESCRIPTION = ('Sources to keep: JSON array of exact codes among server_info\'s rag.source_codes, '
+                            'e.g. ["<code>"]; omitted = all')
+DOC_TYPES_DESCRIPTION = ('Document types to keep: JSON array of exact codes among server_info\'s rag.doc_types, '
+                         'e.g. ["<code>"]; omitted = all')
+LANGUAGES_DESCRIPTION = ('Languages to keep: JSON array of exact codes among server_info\'s rag.languages, '
+                         'e.g. ["en"]; omitted = all')
 DATE_FROM_DESCRIPTION = "Earliest publication date, YYYY-MM-DD, inclusive"
 DATE_TO_DESCRIPTION = "Latest publication date, YYYY-MM-DD, inclusive"
 LIMIT_DESCRIPTION = ("Number of passages; omitted = server default; a value above the server maximum is "
@@ -56,14 +77,70 @@ LIMIT_DESCRIPTION = ("Number of passages; omitted = server default; a value abov
 
 Code = Annotated[str, Field(max_length=MAX_CODE_CHARS)]
 # Published as an array of strings and nothing else. A bare string (a frequent mistake of small models:
-# "ecb" for ["ecb"]) is still let through to the engine, which refuses it with a coded message saying
-# what to write, instead of the framework's uncoded schema error.
+# "ecb" or '["ecb"]' for ["ecb"]) is still let through to the tool, which refuses it with a coded message
+# saying what to write, instead of the framework's uncoded schema error.
 Codes = Annotated[
     Annotated[list[Code], Field(max_length=MAX_CODES)] | Annotated[str, Field(max_length=MAX_QUERY_CHARS)],
     WithJsonSchema({"type": "array", "items": {"type": "string", "maxLength": MAX_CODE_CHARS},
                     "maxItems": MAX_CODES}),
 ]
 Day = Annotated[str, Field(max_length=MAX_DATE_CHARS)]
+
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_CODE_IN_A_STRING = re.compile(r"""[^\s,\[\]'"]+""")
+MAX_EXAMPLE_CODES = 3
+
+
+def search_description(settings: Settings) -> str:
+    """The tool's description: the limits of this deployment, then its notes on the collection."""
+    text = SEARCH_DESCRIPTION.format(max_limit=settings.rag_max_limit, default_limit=settings.rag_default_limit)
+    notes = settings.rag_description_notes.strip()
+    return f"{text}\n\nAbout this collection: {notes}" if notes else text
+
+
+def _array_example(value: str) -> str:
+    """The JSON array a client that sent the string `value` meant, as an example of what to write:
+    '["ecb"]' for `ecb` as well as for the array already written as a string, `["ecb"]`."""
+    codes = [code for code in _CODE_IN_A_STRING.findall(value) if len(code) <= MAX_CODE_CHARS]
+    return json.dumps(codes[:MAX_EXAMPLE_CODES] or ["code"], ensure_ascii=False)
+
+
+def _searchable(text: str) -> bool:
+    """rag-engine's rule: at least one letter, number, symbol or punctuation mark."""
+    return any(unicodedata.category(character)[0] in "LNSP" for character in text)
+
+
+def check_arguments(query: str, codes: dict, dates: dict) -> None:
+    """Refuse, in the client's terms (JSON, never Python), what rag-engine would refuse in its own."""
+    if not query.strip():
+        raise tool_error(INVALID_ARGUMENT, "query must be a non-blank string: a question or a topic")
+    if not (_searchable(query) and _searchable(unicodedata.normalize("NFKD", query))):
+        raise tool_error(INVALID_ARGUMENT, "query has no searchable character: it must hold at least one "
+                                           "letter, number, symbol or punctuation mark")
+    for name, value in codes.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            raise tool_error(INVALID_ARGUMENT, f"{name} must be a JSON array of strings, e.g. "
+                                               f"{_array_example(value)}; omit it for no restriction")
+        if not value:
+            raise tool_error(INVALID_ARGUMENT, f'{name} is an empty array, which could mean "match nothing" as '
+                                               'well as "no restriction": omit the argument for no restriction')
+        if not all(item.strip() for item in value):
+            raise tool_error(INVALID_ARGUMENT, f"{name} must hold non-blank strings")
+    days = {}
+    for name, value in dates.items():
+        if value is None:
+            continue
+        if _DATE.fullmatch(value) is None:
+            raise tool_error(INVALID_ARGUMENT, f'{name} must be "YYYY-MM-DD", e.g. "2016-03-10"')
+        try:
+            days[name] = dt.date.fromisoformat(value)
+        except ValueError:
+            raise tool_error(INVALID_ARGUMENT, f"{name} is not a date of the calendar: "
+                                               f"{json.dumps(value)}") from None
+    if len(days) == 2 and days["date_from"] > days["date_to"]:
+        raise tool_error(INVALID_ARGUMENT, f"date_from ({dates['date_from']}) is after date_to ({dates['date_to']})")
 
 
 def human_page(page) -> int | None:
@@ -109,8 +186,12 @@ def capped(query: str, filters: dict, hits: list[dict], settings: Settings) -> d
 def build_rag_toolset(backend: RagBackend, settings: Settings, *, auth_enabled: bool) -> FastMCP:
     rag = FastMCP("rag", mask_error_details=True)
     read = tier_check("read", auth_enabled=auth_enabled)
+    budget = settings.rag_call_timeout_s
+    # The toolset's own threads, never more than the limit: a search that outlives its call (a hanging
+    # Qdrant) keeps one until it ends, and the calls waiting for one wait in the event loop.
+    workers = ThreadPoolExecutor(max_workers=settings.rag_max_concurrency, thread_name_prefix="mof-rag")
 
-    @rag.tool(auth=read, annotations=READ_ONLY, description=SEARCH_DESCRIPTION)
+    @rag.tool(auth=read, annotations=READ_ONLY, description=search_description(settings))
     async def search(
         query: Annotated[str, Field(description=QUERY_DESCRIPTION, max_length=MAX_QUERY_CHARS)],
         source_codes: Annotated[Codes | None, Field(description=SOURCE_CODES_DESCRIPTION)] = None,
@@ -127,11 +208,17 @@ def build_rag_toolset(backend: RagBackend, settings: Settings, *, auth_enabled: 
         if wanted > maximum:
             raise tool_error(LIMIT_EXCEEDED, f"limit {wanted} is above the maximum of {maximum}: "
                                              f"ask for at most {maximum} passages")
-        filters = {"source_codes": source_codes, "doc_types": doc_types, "languages": languages,
-                   "date_from": date_from, "date_to": date_to}
-        # The backend is blocking (model inference, HTTP to Qdrant): run it off the event loop.
-        applied, hits = await anyio.to_thread.run_sync(
-            partial(backend.search, query=query, filters=filters, limit=wanted, max_limit=maximum))
+        codes = {"source_codes": source_codes, "doc_types": doc_types, "languages": languages}
+        dates = {"date_from": date_from, "date_to": date_to}
+        check_arguments(query, codes, dates)
+        # The backend is blocking (model inference, HTTP to Qdrant): it runs off the event loop.
+        job = workers.submit(partial(backend.search, query=query, filters={**codes, **dates}, limit=wanted,
+                                     max_limit=maximum, deadline=time.monotonic() + budget))
+        with anyio.move_on_after(budget) as scope:
+            applied, hits = await asyncio.wrap_future(job)
+        if scope.cancelled_caught:
+            # cancel() succeeds only for a search that has not started: it never will.
+            raise unavailable("busy" if job.cancel() else "timeout")
         return capped(query, applied, [shape_hit(rank, hit) for rank, hit in enumerate(hits, start=1)], settings)
 
     return rag
