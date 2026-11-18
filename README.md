@@ -208,7 +208,7 @@ into a volume at each start of the stack.
 
    At this commit the engine also creates the datetime indexes on `date_start` and `date_end` (payload
    schema version 2). Once they exist, `auto` mode applies date bounds to the intervals (within
-   `MOF_RAG_DATE_FILTER_REFRESH` seconds, without a restart of the MCP). That is safe before the payloads
+   `MOF_RAG_DATE_FILTER_REFRESH_S` seconds, without a restart of the MCP). That is safe before the payloads
    carry their intervals (a point without one is still found by its `date`), but a month or a year
    document is found by its whole period only once the orchestrator's `sync-metadata` has written the
    intervals; `sync-metadata` creates the two indexes itself (see [Dates](#dates-in-rag_search)).
@@ -260,7 +260,7 @@ into a volume at each start of the stack.
    `MOF_RAG_MODEL_CACHE=/models`; `MOF_RAG_QDRANT_HTTPS=true` when Qdrant is behind TLS; optionally
    `MOF_RAG_DESCRIPTION_NOTES` (see [Passage search](#passage-search-rag)). The others have defaults
    ([Configuration and limits](#configuration-and-limits)); the date settings
-   (`MOF_RAG_DATE_FILTER_MODE=auto`, `MOF_RAG_DATE_FILTER_REFRESH=300`, `MOF_RAG_DATE_FILTER_RETRY=30`) need
+   (`MOF_RAG_DATE_FILTER_MODE=auto`, `MOF_RAG_DATE_FILTER_REFRESH_S=300`, `MOF_RAG_DATE_FILTER_RETRY_S=30`) need
    no value of their own.
 7. **Restart and check.**
    - `GET /health` answers `200` within the start period.
@@ -525,18 +525,18 @@ a year document is found only at the first day of its period.
 `date_end` **and** both fields have a datetime index. The orchestrator's `sync-metadata` writes the
 intervals (with the corrected dates, precisions and kinds) and creates the two indexes; until it has run,
 `auto` mode finds no index and every bound is applied to `date`, exactly as before this version, and
-`date_precision` / `date_kind` are `null` in the hits. Within `MOF_RAG_DATE_FILTER_REFRESH` seconds after the
+`date_precision` / `date_kind` are `null` in the hits. Within `MOF_RAG_DATE_FILTER_REFRESH_S` seconds after the
 indexes appear, the running server uses them, without a restart. A collection whose indexes exist before
 all its payloads have intervals loses nothing: a point without its interval yet is still found by its
 `date`.
 
 How a date bound is applied is rag-engine's `date_filter_mode`, set here by `MOF_RAG_DATE_FILTER_MODE`
-and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH` and
-`MOF_RAG_DATE_FILTER_RETRY` (the engine's own `RAG_ENGINE_DATE_FILTER_*` variables are never read).
+and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH_S` and
+`MOF_RAG_DATE_FILTER_RETRY_S` (the engine's own `RAG_ENGINE_DATE_FILTER_*` variables are never read).
 
 - **Mode `auto` (the default) follows the collection.** A call with a date bound asks the collection
   whether `date_start` and `date_end` both have a datetime index (one read request, which the read-only
-  key may send), and the answer is kept `MOF_RAG_DATE_FILTER_REFRESH` seconds (300). Indexed: the bound
+  key may send), and the answer is kept `MOF_RAG_DATE_FILTER_REFRESH_S` seconds (300). Indexed: the bound
   is applied to the intervals; not indexed: to the `date` field, as before. A call without a date bound
   never asks. The read is also made once at start, after the collection check and the read of the filter
   values (not when either failed: then the first date-bounded call makes it), so the log says which
@@ -549,7 +549,7 @@ and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH` a
 - **A failed read refuses no call and is not an outage.** When the read fails or times out, the engine
   answers with the last answer it read, or with the `date` field when it never read one, logs one
   warning (logger `rag_engine.store`, naming the error's class only: see Privacy above), and reads
-  again `MOF_RAG_DATE_FILTER_RETRY` seconds later (30) at the earliest; the calls made meanwhile ask
+  again `MOF_RAG_DATE_FILTER_RETRY_S` seconds later (30) at the earliest; the calls made meanwhile ask
   nothing. The toolset does not remember that failure: no `[rag_unavailable]` follows from it,
   `server_info` stays `ready`, and only the search itself says whether Qdrant answers. So with Qdrant
   frozen, a date-bounded call may spend one request timeout on that read before its search, once per
@@ -698,8 +698,8 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_CODES_RETRY_S` | `5` | Least seconds between two reads of the filter values that the TTL did not ask for: the read made before a value is refused, and the retry after a failed read (1-3600). |
 | `MOF_RAG_DESCRIPTION_NOTES` | unset | One line of text appended to the description of `rag_search`: what the collection holds, what its codes mean (at most 1500 characters). See [Passage search](#passage-search-rag) for a suggested value. |
 | `MOF_RAG_DATE_FILTER_MODE` | `auto` | How a date bound of `rag_search` is applied (rag-engine's `date_filter_mode`): `auto` (the intervals on a collection where `date_start` and `date_end` both have a datetime index, the `date` field elsewhere), `interval` (always the intervals; a collection in strict mode without the two indexes refuses it: `search_refused`) or `legacy` (always the `date` field). Lower case, exactly. See [Dates](#dates-in-rag_search). |
-| `MOF_RAG_DATE_FILTER_REFRESH` | `300` | `auto` mode: seconds the collection's answer (are the two indexes there?) is kept before a date-bounded call reads it again (0-86400; `0` reads it before every date-bounded search). The longest the server takes to use the intervals once the indexes exist, without a restart. |
-| `MOF_RAG_DATE_FILTER_RETRY` | `30` | `auto` mode: seconds before a collection whose answer could not be read is read again (1-3600). Meanwhile date-bounded calls use the last answer read, or `legacy` when none was. Such a failure refuses no call and is not remembered as an outage. |
+| `MOF_RAG_DATE_FILTER_REFRESH_S` | `300` | `auto` mode: seconds the collection's answer (are the two indexes there?) is kept before a date-bounded call reads it again (0-86400; `0` reads it before every date-bounded search). The longest the server takes to use the intervals once the indexes exist, without a restart. |
+| `MOF_RAG_DATE_FILTER_RETRY_S` | `30` | `auto` mode: seconds before a collection whose answer could not be read is read again (1-3600). Meanwhile date-bounded calls use the last answer read, or `legacy` when none was. Such a failure refuses no call and is not remembered as an outage. |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

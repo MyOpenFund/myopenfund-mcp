@@ -34,12 +34,12 @@ No lock is held during a request to Qdrant.
 Date bounds (`rag_date_filter_mode`, passed to the engine's `search` with its refresh and retry
 delays: the engine's own `RAG_ENGINE_DATE_FILTER_*` variables are never read). In `auto` mode a call
 with a date bound may need one more request: the read of the collection's payload schema (are
-`date_start` and `date_end` indexed?), at most once every `rag_date_filter_refresh` seconds. It is
+`date_start` and `date_end` indexed?), at most once every `rag_date_filter_refresh_s` seconds. It is
 made here, in the call's own thread (its slot) and before the deadline check, by the engine's
 `QdrantStore.uses_date_intervals`, and the mode it gives is handed to `search`: a search is never
 started after the call's deadline because of that read. The read never fails a call: when it fails,
 the engine answers with the last mode it read, or `legacy`, and reads again after
-`rag_date_filter_retry` seconds. It is therefore not an outage for the toolset either: nothing of it
+`rag_date_filter_retry_s` seconds. It is therefore not an outage for the toolset either: nothing of it
 reaches the collection check's memory, and only the search that follows says whether Qdrant answers.
 It is also made once at start, after a collection check and a read of the filter values that passed,
 so the first date-bounded call does not pay for it and the log says which filter is in use.
@@ -296,8 +296,8 @@ def engine_settings(settings: Settings) -> EngineSettings:
             search_limit=settings.rag_default_limit,
             search_max_limit=settings.rag_max_limit,
             date_filter_mode=settings.rag_date_filter_mode,
-            date_filter_refresh=settings.rag_date_filter_refresh,
-            date_filter_retry=settings.rag_date_filter_retry,
+            date_filter_refresh=settings.rag_date_filter_refresh_s,
+            date_filter_retry=settings.rag_date_filter_retry_s,
         )
     except EngineConfigError as exc:  # the engine names its own variables; it never echoes the key
         error = ConfigError(f"the MOF_RAG_* settings were refused by rag-engine ({exc})")
@@ -315,8 +315,8 @@ class EngineRagBackend:
         self._codes_retry_s = settings.rag_codes_retry_s
         self._check_retry_s = settings.rag_check_retry_s
         self._date_mode = settings.rag_date_filter_mode
-        self._date_refresh = settings.rag_date_filter_refresh
-        self._date_retry = settings.rag_date_filter_retry
+        self._date_refresh = settings.rag_date_filter_refresh_s
+        self._date_retry = settings.rag_date_filter_retry_s
         self._embedder = embedder
         self._engine_settings = None
         if store is None or embedder is None:

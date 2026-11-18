@@ -172,12 +172,12 @@ class Settings:
     # MOF_RAG_DATE_FILTER_MODE: how rag-engine applies a date bound -- auto (the intervals on a collection
     # where date_start and date_end are indexed, the date field elsewhere) | interval | legacy
     rag_date_filter_mode: str = "auto"
-    # MOF_RAG_DATE_FILTER_REFRESH: in auto mode, seconds the answer "are the intervals indexed?" is kept
+    # MOF_RAG_DATE_FILTER_REFRESH_S: in auto mode, seconds the answer "are the intervals indexed?" is kept
     # before the collection is asked again (0 = before every date-bounded search)
-    rag_date_filter_refresh: int = 300
-    # MOF_RAG_DATE_FILTER_RETRY: in auto mode, seconds before a collection whose payload schema could not
+    rag_date_filter_refresh_s: int = 300
+    # MOF_RAG_DATE_FILTER_RETRY_S: in auto mode, seconds before a collection whose payload schema could not
     # be read is asked again (meanwhile the last answer, or legacy, is used)
-    rag_date_filter_retry: int = 30
+    rag_date_filter_retry_s: int = 30
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -224,8 +224,8 @@ class Settings:
             rag_check_retry_s=_int(env, "MOF_RAG_CHECK_RETRY_S", 5, maximum=3600),
             rag_description_notes=_get(env, "MOF_RAG_DESCRIPTION_NOTES") or "",
             rag_date_filter_mode=_get(env, "MOF_RAG_DATE_FILTER_MODE") or "auto",
-            rag_date_filter_refresh=_int(env, "MOF_RAG_DATE_FILTER_REFRESH", 300, minimum=0, maximum=86_400),
-            rag_date_filter_retry=_int(env, "MOF_RAG_DATE_FILTER_RETRY", 30, maximum=3600),
+            rag_date_filter_refresh_s=_int(env, "MOF_RAG_DATE_FILTER_REFRESH_S", 300, minimum=0, maximum=86_400),
+            rag_date_filter_retry_s=_int(env, "MOF_RAG_DATE_FILTER_RETRY_S", 30, maximum=3600),
         )
         if settings.companies_q4_rule not in Q4_RULES:
             raise ConfigError(f"MOF_COMPANIES_Q4_RULE must be one of {', '.join(Q4_RULES)}, "

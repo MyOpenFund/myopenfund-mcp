@@ -305,7 +305,7 @@ async def _found(c, date_from, date_to, **extra) -> tuple[set[str], list[dict]]:
 
 
 async def test_a_legacy_collection_is_served_as_before_and_its_upgrade_is_followed_without_a_restart(writer):
-    """With the READ-ONLY key (when the Qdrant has keys) and MOF_RAG_DATE_FILTER_REFRESH=1: before the
+    """With the READ-ONLY key (when the Qdrant has keys) and MOF_RAG_DATE_FILTER_REFRESH_S=1: before the
     upgrade, `auto` gives exactly the `legacy` answers, and the hits carry null precision and kind; once the
     writer has created the two indexes and given each document its interval, a month document is found by
     a mid-month range by the same running server, within the refresh delay."""
@@ -314,7 +314,7 @@ async def test_a_legacy_collection_is_served_as_before_and_its_upgrade_is_follow
     collection = f"mof-mcp-it-{uuid.uuid4().hex[:12]}"
     try:
         fake = _legacy(writer, collection)
-        async with _client(collection, fake, rag_date_filter_refresh=1) as auto, \
+        async with _client(collection, fake, rag_date_filter_refresh_s=1) as auto, \
                 _client(collection, fake, rag_date_filter_mode="legacy") as legacy:
             for date_from, date_to in RANGES:
                 for undated in (False, True):

@@ -1306,7 +1306,7 @@ async def test_auto_mode_reads_the_collection_for_a_date_bound_and_hands_its_ans
     store, fake = seeded
     for refresh, reads in ((0, 3), (300, 1)):  # 0: read before every date-bounded search
         schema = _Schema(store.client, indexed=indexed)
-        backend = EngineRagBackend(_settings(rag_date_filter_refresh=refresh, rag_date_filter_retry=11),
+        backend = EngineRagBackend(_settings(rag_date_filter_refresh_s=refresh, rag_date_filter_retry_s=11),
                                    store=schema, embedder=fake)
         sent = _spied(monkeypatch)
         async with _client(backend) as c:
@@ -1356,7 +1356,7 @@ async def test_the_schema_read_runs_in_the_calls_slot_and_within_its_budget(seed
     stays taken (another call is `busy`), and no search is started once the budget is spent."""
     store, fake = seeded
     schema = _Schema(store.client, indexed=True)
-    backend = EngineRagBackend(_settings(rag_date_filter_refresh=0), store=schema, embedder=fake)
+    backend = EngineRagBackend(_settings(rag_date_filter_refresh_s=0), store=schema, embedder=fake)
     sent = _spied(monkeypatch)
     async with _client(backend, rag_call_timeout_s=0.4, rag_max_concurrency=1) as c:
         reads = schema.schema.reads
@@ -1666,7 +1666,7 @@ async def test_the_model_is_loaded_at_start_from_mof_settings_only(seeded, monke
     monkeypatch.setattr(backend_module, "QdrantStore", lambda **k: seen.append(("store", k["settings"])) or store)
     settings = _settings(rag_qdrant_port=6334, rag_qdrant_https=True, rag_qdrant_timeout=7, rag_onnx_threads=3,
                          rag_default_limit=5, rag_max_limit=9, rag_date_filter_mode="interval",
-                         rag_date_filter_refresh=60, rag_date_filter_retry=9)
+                         rag_date_filter_refresh_s=60, rag_date_filter_retry_s=9)
     backend = EngineRagBackend(settings)
     assert [kind for kind, _ in seen] == ["store"]  # nothing is loaded before start()
     build_server(settings, rag_backend=backend)
