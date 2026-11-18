@@ -189,7 +189,7 @@ into a volume at each start of the stack.
 2. **Payload indexes, once, from the data side.** The filters and the list of valid filter values use
    Qdrant's payload indexes. Whoever owns the collection creates them, once per collection, with a key
    that can write, from an environment where `rag-engine` is installed (the ingestion's own, or any venv
-   with `pip install "rag-engine @ git+https://github.com/MyOpenFund/rag-engine@fbbe09b789828a67c28beadca1f2a95d611158a8"`,
+   with `pip install "rag-engine @ git+https://github.com/MyOpenFund/rag-engine@6be21ac393d82d7c5c1a058dcad8204ae15c7289"`,
    the commit this server is built on). Give the host AND the port: the engine's default port is 6333.
    The key is typed at a prompt here too:
 
@@ -205,6 +205,13 @@ into a volume at each start of the stack.
    filtered search reads every point (about 0.15 s on 34,000 points), and the valid filter values are
    read by one scroll of the collection, in the background (up to 100,000 points; beyond that, filter
    values are no longer checked).
+
+   At this commit the engine also creates the datetime indexes on `date_start` and `date_end` (payload
+   schema version 2). Once they exist, `auto` mode applies date bounds to the intervals (within
+   `MOF_RAG_DATE_FILTER_REFRESH_S` seconds, without a restart of the MCP). That is safe before the payloads
+   carry their intervals (a point without one is still found by its `date`), but a month or a year
+   document is found by its whole period only once the orchestrator's `sync-metadata` has written the
+   intervals; `sync-metadata` creates the two indexes itself (see [Dates](#dates-in-rag_search)).
 3. **The `[rag]` extra in the install line.** With the built image: `MOF_EXTRAS=vault,rag` as a build
    argument (`compose.example.yaml`). Without a built image: `'myopenfund-mcp[vault,rag] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'`
    in the `install` service. From a checkout: `pip install ".[vault,rag]"`. No PyTorch is installed: queries
@@ -252,12 +259,17 @@ into a volume at each start of the stack.
    `MOF_RAG_QDRANT_PORT`, `MOF_RAG_QDRANT_API_KEY` (the read-only key of step 1), `MOF_RAG_COLLECTION`,
    `MOF_RAG_MODEL_CACHE=/models`; `MOF_RAG_QDRANT_HTTPS=true` when Qdrant is behind TLS; optionally
    `MOF_RAG_DESCRIPTION_NOTES` (see [Passage search](#passage-search-rag)). The others have defaults
-   ([Configuration and limits](#configuration-and-limits)).
+   ([Configuration and limits](#configuration-and-limits)); the date settings
+   (`MOF_RAG_DATE_FILTER_MODE=auto`, `MOF_RAG_DATE_FILTER_REFRESH_S=300`, `MOF_RAG_DATE_FILTER_RETRY_S=30`) need
+   no value of their own.
 7. **Restart and check.**
    - `GET /health` answers `200` within the start period.
    - The log holds, in this order, `rag: embedding model intfloat/multilingual-e5-base ready in ... s`,
      `rag: collection <collection> checked, searches are served` and `rag: filter values read from the
-     collection (source_codes: ..., doc_types: ..., languages: ...)`. It holds **no** line with the word
+     collection (source_codes: ..., doc_types: ..., languages: ...)`, then (logger `rag_engine.store`)
+     `Qdrant collection '<collection>' has no datetime index on both date_start and date_end: date filters
+     in auto mode use the date field (legacy)` (before `sync-metadata`) or `... has datetime indexes on
+     date_start and date_end: date filters in auto mode use the intervals` (after). It holds **no** line with the word
      `Downloading`: the running service never downloads. An error line naming `MOF_RAG_MODEL_CACHE` means
      the cache is incomplete, unreadable or not the pinned model.
    - `server_info`: `toolsets.rag` is `enabled`, `rag.status` is `ready`, and `rag.source_codes` /
@@ -267,9 +279,20 @@ into a volume at each start of the stack.
      "source_codes": ["<a code of rag.source_codes>"]}`: passages come back.
    - `rag_search` with the same code in the wrong case: the answer is `[invalid_argument] source_codes:
      unknown value "..." (did you mean "..."? values are matched exactly); valid values: ...`.
+   - `rag_search` with a date bound, e.g. `{"query": "inflation outlook", "date_from": "2016-07-14",
+     "date_to": "2016-07-14", "include_undated": false}`: passages come back (or none, for a day nothing is
+     dated to), `filters.include_undated` is `false`, and each hit has `date_precision` and `date_kind`
+     (`null` until `sync-metadata` has run).
 8. **Never run this repository's integration tests against a production Qdrant.**
    `tests/integration/test_real_qdrant.py` creates and deletes collections: it is for a throwaway Qdrant
    only (see [Development](#development)).
+
+**Redeploying a new version** (such as the one that raised the rag-engine pin to `6be21ac` and added the date
+settings): the same steps, from step 3. Rebuild the image, or point the `install` service at the new
+`<commit>`; restart; check as in step 7. No new volume, no new variable to set (the date settings have
+defaults), and the model cache is kept: the pinned model revision did not change. Step 2 is not needed
+again for the server: the indexes the new version uses are created by the orchestrator's `sync-metadata`,
+and until they exist date bounds behave as before.
 
 ### Outbound connections of the rag toolset
 
@@ -328,16 +351,19 @@ the client's model reads the passages and cites them. Read tier.
 | `source_codes` | JSON array of source codes, exact (case matters). The valid ones: `server_info`, `rag.source_codes`. |
 | `doc_types` | JSON array of document-type codes, exact. The valid ones: `server_info`, `rag.doc_types`. |
 | `languages` | JSON array of language codes as stored, e.g. `["en"]`. The valid ones: `server_info`, `rag.languages`. |
-| `date_from`, `date_to` | Publication date bounds, `YYYY-MM-DD`, both inclusive. As soon as one is set, a document without a full date (no date, or only a year or a month) is left out, whatever the bounds. |
+| `date_from`, `date_to` | Date bounds, `YYYY-MM-DD`, both inclusive. A document known only to the month or the year matches any range overlapping its period (see [Dates](#dates-in-rag_search) for when). As soon as one bound is set, a document without a date is left out, unless `include_undated` is true. |
+| `include_undated` | JSON boolean, default `false`. `true`: with a date bound, also keep the documents without a date (the dated ones outside the range stay out). Without a date bound it changes nothing and is accepted. A string (`"true"`) or a number is refused. |
 | `limit` | Number of passages; default `MOF_RAG_DEFAULT_LIMIT` (8), at most `MOF_RAG_MAX_LIMIT` (20). |
 
 The values of one array are alternatives (OR), the arguments combine (AND). An omitted argument does not
 restrict; an empty array is refused.
 
 **What the client's model is told.** The tool description states how to call the tool, the default and
-the maximum `limit` of this deployment, and that a date bound leaves out every document without a full
-date (undated, or dated by year or month only: a date range that returns nothing or too little is to be
-retried without dates). It is **corpus-neutral**: it names no source
+the maximum `limit` of this deployment, what a date bound does (with a bound, a document known only to the
+month or the year matches any range overlapping its period, and documents without a date are left out
+unless `include_undated` is true; with `MOF_RAG_DATE_FILTER_MODE=legacy` it says instead that such a
+document is found only at the first day of its period), and the hit fields, `date_precision` and
+`date_kind` included. It stays under 1800 characters before the notes. It is **corpus-neutral**: it names no source
 and gives no meaning to any code, because such facts go stale when the collection changes. The codes
 themselves are read from the collection (`server_info`, and every refusal lists them). What they mean is
 the deployment's to say, in `MOF_RAG_DESCRIPTION_NOTES`: one line of text (at most 1500 characters),
@@ -357,7 +383,7 @@ Example call and result (text shortened):
 ```json
 {
   "query": "Why did the ECB raise interest rates in July 2022?",
-  "filters": {"source_codes": ["ecb"], "doc_types": null, "languages": null, "date_from": "2022-07-01", "date_to": null},
+  "filters": {"source_codes": ["ecb"], "doc_types": null, "languages": null, "date_from": "2022-07-01", "date_to": null, "include_undated": false},
   "count": 1,
   "hits": [
     {
@@ -367,6 +393,8 @@ Example call and result (text shortened):
       "doc_id": "ecb/A1/2022-07-21",
       "title": "Monetary policy decisions",
       "date": "2022-07-21",
+      "date_precision": "day",
+      "date_kind": "meeting",
       "source_code": "ecb",
       "doc_type": "A1",
       "language": "en",
@@ -379,17 +407,26 @@ Example call and result (text shortened):
 ```
 
 - **Hits.** `score` is the cosine between the query and the passage (4 decimals; higher is closer). Several
-  hits may come from one document; nothing is grouped. `filters` echoes the filters as applied. The point id
-  and the rest of the stored payload are not returned.
+  hits may come from one document; nothing is grouped. `filters` echoes the filters as applied,
+  `include_undated` included. The point id and the rest of the stored payload are not returned.
+- **Date fields.** `date` is the stored date, `YYYY-MM-DD`. `date_precision` says how much of it is known:
+  `day`, `month` or `year` (a month or a year is stored as the first day of its period: `2016-07-01` with
+  `month` is July 2016), or `null` when unknown. `date_kind` says what the date marks, as the producer
+  labels it (`meeting`, `publication`, `period`), or `null`. Both are read from the stored payload as they
+  are: **`null` is normal** for a collection whose payloads do not carry them yet (the production
+  collection until the orchestrator's `sync-metadata` has run), and an unknown precision is read as a day.
 - **Pages.** `page` is the page the passage starts on **as a reader counts it: the first page is 1** (the
   collection stores pages from 0; the server adds one). It is `null` for a document without pages, and the
   `citation` then has no page part. `citation` is `<title> (<source_code> <doc_type>, <date>), p. <page>`,
-  each missing part left out (the `doc_id` stands for a missing title).
+  each missing part left out (the `doc_id` stands for a missing title). The date is written at its
+  precision: `July 2016` for `month`, `2016` for `year` (English month names), the stored date for `day`,
+  for an unknown precision and for a date not written `YYYY-MM-DD`.
 - **Argument errors are written for the client's model**, in terms of the JSON to send: a string where an
   array is expected, the array itself written as a string included (`source_codes must be a JSON array of
   strings, e.g. ["ecb"]; omit it for no restriction`, the example being the caller's own value), an empty
   array (`... omit the argument for no restriction`), a date in another form (`date_from must be
-  "YYYY-MM-DD", e.g. "2016-03-10"`). Nothing is corrected silently.
+  "YYYY-MM-DD", e.g. "2016-03-10"`), a boolean written otherwise (`include_undated must be a JSON boolean,
+  true or false without quotes, not "true"; omit it for false`). Nothing is corrected silently.
 - **Unknown filter values are refused, never corrected.** The server reads the distinct `source_code`,
   `doc_type` and `language` values from the collection and keeps them `MOF_RAG_CODES_TTL_S` seconds. A
   value that is not among them is `[invalid_argument]` listing the valid values (as JSON strings), with a
@@ -420,7 +457,9 @@ Example call and result (text shortened):
 - **Time budget, and what happens when Qdrant hangs.** One call never takes longer than
   `MOF_RAG_CALL_TIMEOUT_S` (15 s), its wait included. `MOF_RAG_QDRANT_TIMEOUT` (10 s) is the limit of
   **one request** to Qdrant, and a call makes several: the search, before it the read of the filter
-  values when it is due, and the collection check after a failure.
+  values when it is due, the collection check after a failure, and, for a call with a date bound in
+  `auto` mode, the read of the collection's payload schema when it is due (see
+  [Dates](#dates-in-rag_search)).
   - A request that fails (no answer in time, connection refused, key refused, collection gone, server
     error) ends its call with `[rag_unavailable]` and the reason: a call pays for one request timeout at
     most, never for two in a row (a failed read of the filter values is not followed by a search).
@@ -459,9 +498,91 @@ Example call and result (text shortened):
   run one), without a request to Qdrant: a search that failed does not change it, the check that follows
   does.
 - **Privacy.** As for every tool, the audit line holds the tool name, the client, the outcome and the
-  duration, never the arguments, and the tool's own log lines never contain the query.
+  duration, never the arguments, and the tool's own log lines never contain the query. At the levels the
+  CLI logs (INFO and above), no line written for a search holds the Qdrant host, the API key or a
+  response body, the framework's and rag-engine's included:
+  - every exception of a search is caught by the toolset and answered with a coded reason, so FastMCP
+    never prints one. An error the toolset maps (an outage, a refusal, an answer that is not JSON, such as
+    a proxy's HTML page sent with status 200: `qdrant_error`) is logged by its class; any other is
+    answered `internal_error` and logged at ERROR by its class only, its text and traceback at DEBUG
+    only, a level the CLI never turns on (a developer who sets it accepts them);
+  - the server routes every record of the `rag_engine` loggers (present and future modules) through a
+    filter. A record that carries an error (an exception among its arguments or attached to it) or whose text holds the configured host
+  (a whole word, as configured or lowercased, alone or with a port: host `qdrant` is found in
+  `http://qdrant:6333`, not in a collection `qdrant-docs`; the configured collection's name, quoted as the
+  engine writes it, is not taken for the host unless it is the host) or the key (anywhere, even inside a
+  longer word) is written with its logger, its level and a fixed message naming the error's class only; the
+  engine's warning on a failed schema read also keeps its collection, the filter used meanwhile and the
+  delay before the next try. Other engine lines (the collection and the filter in use) are written as
+  they are. The error's text is dropped because it can hold the host, a TLS host name, a proxy's error
+  page naming an upstream host or an internal address, or the engine's hint about its own key variable.
+  **What this changes in the process's logging** (for an operator who embeds the server or configures
+  logging): the `rag_engine` logger stops propagating and gets one handler that filters each record,
+  then hands it to the root logger's handlers, or to `logging.lastResort` (stderr, WARNING and above)
+  when there is none, as the standard library does. The change is process-wide and lasts as long as the
+  process. A later `logging.config.dictConfig` that names `rag_engine` replaces that handler, and the
+  engine's records are then written as the engine writes them: leave `rag_engine` out of such a
+  configuration, or build the rag toolset after it. The CLI configures logging before it builds the
+  toolsets.
+  The HTTP libraries under the Qdrant client are apart: `httpx` logs one INFO line per request with
+  the server's address, which is why the CLI raises its logger to WARNING, and `httpcore` logs the host
+  and port of each connection at DEBUG only.
 - **Concurrency.** One embedder and one Qdrant client are shared by the process; inference runs one query
   at a time (about 20 ms for a short query on 4 cores) off the event loop.
+
+#### Dates in `rag_search`
+
+**What a bound means.** A document is dated by `date` and `date_precision`; rag-engine stores the period
+it covers as `date_start` and `date_end` (the same day for `day`, the whole month for `month`, the whole
+year for `year`). With intervals in use, a bound keeps a document when its period has at least one day in
+common with the range: the minutes of a July 2016 meeting known only to the month are found by
+`2016-07-14`..`2016-07-14` and by any range touching July 2016; a document of the year 2015 by any range
+touching 2015. A document dated to the day is found on that day, as before. A document without a date is
+left out of every bounded search unless `include_undated` is true. Without intervals (`legacy`) a month or
+a year document is found only at the first day of its period.
+
+**When results change.** Intervals are used only once the collection's payloads carry `date_start` and
+`date_end` **and** both fields have a datetime index. The orchestrator's `sync-metadata` writes the
+intervals (with the corrected dates, precisions and kinds) and creates the two indexes; until it has run,
+`auto` mode finds no index and every bound is applied to `date`, exactly as before this version, and
+`date_precision` / `date_kind` are `null` in the hits. Within `MOF_RAG_DATE_FILTER_REFRESH_S` seconds after the
+indexes appear, the running server uses them, without a restart. A collection whose indexes exist before
+all its payloads have intervals loses nothing: a point without its interval yet is still found by its
+`date`.
+
+How a date bound is applied is rag-engine's `date_filter_mode`, set here by `MOF_RAG_DATE_FILTER_MODE`
+and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH_S` and
+`MOF_RAG_DATE_FILTER_RETRY_S` (the engine's own `RAG_ENGINE_DATE_FILTER_*` variables are never read).
+
+- **Mode `auto` (the default) follows the collection.** A call with a date bound asks the collection
+  whether `date_start` and `date_end` both have a datetime index (one read request, which the read-only
+  key may send), and the answer is kept `MOF_RAG_DATE_FILTER_REFRESH_S` seconds (300). Indexed: the bound
+  is applied to the intervals; not indexed: to the `date` field, as before. A call without a date bound
+  never asks. The read is also made once at start, after the collection check and the read of the filter
+  values (not when either failed: then the first date-bounded call makes it), so the log says which
+  filter is in use (a line of the `rag_engine.store` logger: `... date filters in auto mode use the
+  intervals`, or `... use the date field (legacy)`), and it is made again by the first date-bounded call
+  after the refresh delay: a collection upgraded while the server runs is followed without a restart.
+- **The read is part of the call.** It runs in the call's own slot (one of `MOF_RAG_MAX_CONCURRENCY`) and
+  within its budget (`MOF_RAG_CALL_TIMEOUT_S`); when it ends after the budget, the search is not sent and
+  the call has already answered `[rag_unavailable] timeout`.
+- **A failed read refuses no call and is not an outage.** When the read fails or times out, the engine
+  answers with the last answer it read, or with the `date` field when it never read one, logs one
+  warning (logger `rag_engine.store`, naming the error's class only: see Privacy above), and reads
+  again `MOF_RAG_DATE_FILTER_RETRY_S` seconds later (30) at the earliest; the calls made meanwhile ask
+  nothing. The toolset does not remember that failure: no `[rag_unavailable]` follows from it,
+  `server_info` stays `ready`, and only the search itself says whether Qdrant answers. So with Qdrant
+  frozen, a date-bounded call may spend one request timeout on that read before its search, once per
+  retry delay: its budget still bounds it. While no answer has ever been read (a cold start, or a start
+  that skipped the read), the date-bounded calls that arrive during that first read **wait for it**,
+  each in its slot: a burst of them can hold every one of the `MOF_RAG_MAX_CONCURRENCY` slots for one
+  request timeout, once, and the calls behind them, with or without a date bound, wait as long (measured
+  with a 3 s request timeout and 4 slots: 8 date-bounded calls answered in about 3 s, an undated call sent
+  meanwhile in 2.8 s). Once an answer is known, or the read has failed, the other calls never wait for a
+  read in progress.
+- **Modes `interval` and `legacy`** never read the collection: always the intervals, or always the `date`
+  field. `interval` on a collection in strict mode without the two indexes is refused by Qdrant
+  (`[rag_unavailable] search_refused`, the error of that call alone).
 
 ### Companies and datasets
 
@@ -516,11 +637,11 @@ branch on the code and show the message.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
+| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
 | `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
-| `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
+| `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free), `internal_error` (the search failed with an error the server does not expect; the log names its class). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `internal_error`, retry and report it if it lasts; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
 | `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |
 | `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit` (`rag_search` names the largest that fits). |
 | `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
@@ -533,7 +654,9 @@ branch on the code and show the message.
 
 Arguments that do not match a tool's input schema (wrong type, string too long, e.g. an over-long company
 id) are rejected by the MCP framework before a tool runs, without a `[code]`. An unexpected internal failure reaches the client as a generic error
-without details (they may hold connection strings); the server log has the rest. Over HTTP, a missing or
+without details (they may hold connection strings); the server log has the rest. `rag_search` is the
+exception: every error of its search is answered with a coded `[rag_unavailable]` reason, so nothing of
+an exception reaches the framework (see Privacy in [Passage search](#passage-search-rag)). Over HTTP, a missing or
 unknown token is rejected with HTTP `401` before any tool runs.
 
 ## Tiers and tokens
@@ -584,7 +707,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_QDRANT_PORT` | `6333` | Qdrant HTTP port (1-65535). |
 | `MOF_RAG_QDRANT_API_KEY` | unset | Qdrant API key; a **read-only** key is enough and recommended. Never logged, shown or put in an error. |
 | `MOF_RAG_QDRANT_HTTPS` | `false` | Connect to Qdrant over TLS (`true` / `false`). Without TLS the key travels in clear: private network only. |
-| `MOF_RAG_QDRANT_TIMEOUT` | `10` | Seconds **one request** to Qdrant may take (1-300, at most `MOF_RAG_CALL_TIMEOUT_S`); a call makes several (collection check after a failure, read of the filter values when due, search). A request that takes longer fails, and the call that made it answers `[rag_unavailable] qdrant_unreachable`. |
+| `MOF_RAG_QDRANT_TIMEOUT` | `10` | Seconds **one request** to Qdrant may take (1-300, at most `MOF_RAG_CALL_TIMEOUT_S`); a call makes several (collection check after a failure, read of the filter values when due, read of the payload schema for a date bound in `auto` mode when due, search). A request that takes longer fails, and the call that made it answers `[rag_unavailable] qdrant_unreachable`. |
 | `MOF_RAG_CALL_TIMEOUT_S` | `15` | Time budget of one `rag_search` call in seconds, its wait for a free slot included (1-3600, at least `MOF_RAG_QDRANT_TIMEOUT`). At its end the call answers `[rag_unavailable]` with `timeout` or `busy`. |
 | `MOF_RAG_MAX_CONCURRENCY` | `4` | Searches running at once (1-64), in threads of the toolset's own. The calls in excess wait without holding a thread. |
 | `MOF_RAG_CHECK_RETRY_S` | `5` | Seconds a failed collection check is remembered (1-3600): calls made meanwhile answer `[rag_unavailable]` at once. Also the longest the toolset takes to notice that Qdrant is back. A failed search is not remembered: it makes the next call run the check. |
@@ -596,6 +719,9 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_CODES_TTL_S` | `300` | Seconds the collection's filter values (source codes, doc types, languages) are kept before being read again (1-86400). |
 | `MOF_RAG_CODES_RETRY_S` | `5` | Least seconds between two reads of the filter values that the TTL did not ask for: the read made before a value is refused, and the retry after a failed read (1-3600). |
 | `MOF_RAG_DESCRIPTION_NOTES` | unset | One line of text appended to the description of `rag_search`: what the collection holds, what its codes mean (at most 1500 characters). See [Passage search](#passage-search-rag) for a suggested value. |
+| `MOF_RAG_DATE_FILTER_MODE` | `auto` | How a date bound of `rag_search` is applied (rag-engine's `date_filter_mode`): `auto` (the intervals on a collection where `date_start` and `date_end` both have a datetime index, the `date` field elsewhere), `interval` (always the intervals; a collection in strict mode without the two indexes refuses it: `search_refused`) or `legacy` (always the `date` field). Lower case, exactly. See [Dates](#dates-in-rag_search). |
+| `MOF_RAG_DATE_FILTER_REFRESH_S` | `300` | `auto` mode: seconds the collection's answer (are the two indexes there?) is kept before a date-bounded call reads it again (0-86400; `0` reads it before every date-bounded search). The longest the server takes to use the intervals once the indexes exist, without a restart. |
+| `MOF_RAG_DATE_FILTER_RETRY_S` | `30` | `auto` mode: seconds before a collection whose answer could not be read is read again (1-3600). Meanwhile date-bounded calls use the last answer read, or `legacy` when none was. Such a failure refuses no call and is not remembered as an outage. |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

@@ -17,7 +17,13 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from rag_engine.embedding import ModelDownloadError, ModelIntegrityError
-from rag_engine.store import CollectionMismatchError, CollectionNotFoundError, QdrantAuthError
+from rag_engine.store import (
+    CollectionMismatchError,
+    CollectionNotFoundError,
+    MissingIndexError,
+    QdrantAuthError,
+    QdrantStore,
+)
 from rag_fixture import (
     BOE,
     BOJ,
@@ -28,6 +34,8 @@ from rag_fixture import (
     ECB_RATES,
     FOMC,
     MODEL,
+    MPC,
+    PROJECTIONS,
     SOURCE_CODES,
     embedder,
     local_store,
@@ -43,12 +51,16 @@ from myopenfund_mcp.server import build_server
 pytestmark = pytest.mark.anyio
 
 HOST, KEY = "qdrant.secret-host.example", "k-hunter2"
-DATES_SENTENCE = ("With a bound set, documents without a full date (undated, or dated by year or month only) are "
-                  "left out: if a date range returns nothing or too little, retry without dates.")
+DATES_SENTENCE = ("With a bound set, a document known only to the month or the year matches any range overlapping "
+                  "its period; documents without a date are left out unless include_undated is true.")
+UNDATED_SENTENCE = "- include_undated: true also keeps the documents without a date under a date bound; default false."
 CITATION_SENTENCE = ("cite each passage with its `citation`, a ready-made reference: title, then source and "
                      "document-type codes and date in brackets, then the page, each part the document lacks left out.")
-HIT_KEYS = ["rank", "score", "text", "doc_id", "title", "date", "source_code", "doc_type", "language", "page",
-            "chunk_number", "citation"]
+HIT_KEYS = ["rank", "score", "text", "doc_id", "title", "date", "date_precision", "date_kind", "source_code",
+            "doc_type", "language", "page", "chunk_number", "citation"]
+PRECISION_SENTENCE = ("`date_precision` (day, month, year or null) says how much of `date` is known: a month or a "
+                      "year is written as its first day. `date_kind` (such as publication or meeting, or null) "
+                      "says what the date marks.")
 
 
 def _settings(**overrides) -> Settings:
@@ -104,7 +116,9 @@ async def test_the_tool_is_namespaced_read_only_and_described_for_a_model(backen
     for needle in ("YYYY-MM-DD", "inclusive", "does not write an answer", "counted from 1", "citation",
                    "PASSAGES", "never corrected", "JSON arrays", "server_info", "rag.source_codes",
                    "rag.doc_types", "rag.languages", "never send an empty array", "an array even for a single code",
-                   DATES_SENTENCE, CITATION_SENTENCE, "limit: number of passages, from 1 to 20; omitted = 8."):
+                   DATES_SENTENCE, UNDATED_SENTENCE, CITATION_SENTENCE, PRECISION_SENTENCE,
+                   "title, date, date_precision, date_kind, source_code,",
+                   "limit: number of passages, from 1 to 20; omitted = 8."):
         assert needle in tool.description, needle
     # The default text is corpus-neutral: no bank, no code and no meaning of a code that could go stale.
     for absent in ("ecb", "ECB", "European", "Federal", "England", "Japan", "A1", "A2", "A3", "B1", "E1", "F1",
@@ -118,7 +132,10 @@ async def test_the_tool_is_namespaced_read_only_and_described_for_a_model(backen
         assert absent not in served, absent
     schema = tool.input_schema
     assert list(schema["properties"]) == ["query", "source_codes", "doc_types", "date_from", "date_to",
-                                         "languages", "limit"]
+                                         "include_undated", "languages", "limit"]
+    # A JSON boolean and nothing else, false by default; the strings "true" and "false" are refused.
+    flag = schema["properties"]["include_undated"]
+    assert (flag["type"], flag["default"]) == ("boolean", False) and "not a string" in flag["description"]
     assert schema["required"] == ["query"] and schema["additionalProperties"] is False
     for name, prop in schema["properties"].items():
         assert prop.get("description"), name
@@ -138,20 +155,44 @@ async def test_the_description_states_the_deployments_limits_and_appends_its_not
     assert description.endswith("\n\nAbout this collection: " + notes)
 
 
+@pytest.mark.parametrize(("mode", "overlap"), [("auto", True), ("interval", True), ("legacy", False)])
+async def test_the_description_says_how_a_bound_treats_a_month_or_a_year_in_the_configured_mode(backend, mode,
+                                                                                               overlap):
+    async with _client(backend, rag_date_filter_mode=mode) as c:
+        description = {t.name: t for t in await c.list_tools()}["rag_search"].description
+    assert (DATES_SENTENCE in description) is overlap
+    legacy = ("With a bound set, a document known only to the month or the year is found only on its period's first "
+              "day; documents without a date are left out unless include_undated is true.")
+    assert (legacy in description) is not overlap
+
+
+@pytest.mark.parametrize("mode", ["auto", "interval", "legacy"])
+def test_the_description_stays_under_its_cap_in_the_worst_case(mode):
+    """The longest limits the settings accept (MOF_RAG_MAX_LIMIT and MOF_RAG_DEFAULT_LIMIT at 1000), in every
+    date filter mode, without notes: under the 1800 characters the README states."""
+    from myopenfund_mcp.rag.tools import search_description
+
+    worst = Settings.from_env({"MOF_RAG_MAX_LIMIT": "1000", "MOF_RAG_DEFAULT_LIMIT": "1000",
+                               "MOF_RAG_DATE_FILTER_MODE": mode})
+    assert "from 1 to 1000; omitted = 1000." in search_description(worst)
+    assert len(search_description(worst)) < 1800
+
+
 async def test_a_hit_carries_the_passage_its_document_and_a_citation_and_nothing_else(backend):
     async with _client(backend) as c:
         data = (await c.call_tool("rag_search", {"query": ECB_RATES})).data
     assert list(data) == ["query", "filters", "count", "hits"]
     assert data["query"] == ECB_RATES and data["count"] == len(data["hits"]) == CHUNKS
     assert data["filters"] == {"source_codes": None, "doc_types": None, "languages": None,
-                               "date_from": None, "date_to": None}
+                               "date_from": None, "date_to": None, "include_undated": False}
     assert [h["rank"] for h in data["hits"]] == list(range(1, CHUNKS + 1))
     scores = [h["score"] for h in data["hits"]]
     assert scores == sorted(scores, reverse=True) and all(round(s, 4) == s for s in scores)
     first = data["hits"][0]
     assert list(first) == HIT_KEYS  # no point_id (64-bit), no payload, no corpus
     assert first == {"rank": 1, "score": 1.0, "text": ECB_RATES, "doc_id": "ecb/A1/2022-07-21",
-                     "title": "Monetary policy decisions", "date": "2022-07-21", "source_code": "ecb",
+                     "title": "Monetary policy decisions", "date": "2022-07-21", "date_precision": "day",
+                     "date_kind": "meeting", "source_code": "ecb",
                      "doc_type": "A1", "language": "en", "page": 1, "chunk_number": 0,
                      "citation": "Monetary policy decisions (ecb A1, 2022-07-21), p. 1"}
 
@@ -194,6 +235,52 @@ def test_citation_leaves_out_what_is_missing(hit, expected):
     assert citation(hit) == expected
 
 
+@pytest.mark.parametrize(("date", "precision", "shown"), [
+    ("2016-07-01", "month", "July 2016"),
+    ("2016-01-01", "month", "January 2016"),
+    ("2016-12-01", "month", "December 2016"),
+    ("2016-07-14", "month", "July 2016"),  # not the first day: the month all the same
+    ("2016-07-01T00:00:00Z", "month", "July 2016"),
+    ("2016-01-01", "year", "2016"),
+    ("2016-07-01T00:00:00Z", "year", "2016"),
+    ("2016-07-01", "day", "2016-07-01"),
+    ("2016-07-01", None, "2016-07-01"),  # unknown: the stored date, as before the producers stated it
+    ("2016-07-01", "week", "2016-07-01"),  # a precision the server does not know: the stored date
+    ("2016-07-01", "", "2016-07-01"),
+    ("2016-07-01", ["month"], "2016-07-01"),
+    ("2016-13-01", "month", "2016-13-01"),  # not a month: written as stored, never guessed
+    ("2016-00-01", "month", "2016-00-01"),
+    ("2016-07", "month", "2016-07"),  # not a full date: as stored
+    ("2016", "year", "2016"),
+    ("20160701", "month", "20160701"),
+    ("2016-07-011", "month", "2016-07-011"),
+    (None, "month", None),
+    ("", "year", None),
+])
+def test_the_citation_writes_the_date_at_its_precision(date, precision, shown):
+    hit = {"title": "T", "source_code": "gb", "doc_type": "A3", "date": date, "date_precision": precision, "page": 0}
+    assert citation(hit) == (f"T (gb A3, {shown}), p. 1" if shown else "T (gb A3), p. 1")
+
+
+async def test_a_hit_says_how_precise_its_date_is_and_what_it_marks(backend):
+    """Null when the payload has neither key: the production collection until the producers' backfill
+    reaches it. A month or a year is cited as such, a day or an unknown precision as the stored date."""
+    async with _client(backend) as c:
+        async def first(text):
+            hit = (await c.call_tool("rag_search", {"query": text, "limit": 1})).data["hits"][0]
+            return hit["doc_id"], hit["date"], hit["date_precision"], hit["date_kind"], hit["citation"]
+
+        assert await first(MPC) == ("gb/A3/2016-07", "2016-07-01", "month", "meeting",
+                                    "Monetary Policy Summary (gb A3, July 2016), p. 2")
+        assert await first(PROJECTIONS) == ("ecb/E1/2015", "2015-01-01", "year", "period",
+                                            "Staff projections (ecb E1, 2015)")
+        assert await first(ECB_RATES) == ("ecb/A1/2022-07-21", "2022-07-21", "day", "meeting",
+                                          "Monetary policy decisions (ecb A1, 2022-07-21), p. 1")
+        assert await first(FOMC) == ("us/A3/2022-06-15", "2022-06-15", None, None,  # neither key stored
+                                     "Minutes of the Federal Open Market Committee (us A3, 2022-06-15), p. 5")
+        assert await first(BOE) == ("gb/B1/undated", None, None, None, "gb/B1/undated (gb B1), p. 3")  # nulls
+
+
 # -- arguments ---------------------------------------------------------------------------------------
 
 
@@ -204,10 +291,10 @@ async def test_filters_narrow_the_search_and_are_echoed_as_applied(backend):
             return sorted({h["doc_id"] for h in data["hits"]}), data["filters"]
 
         assert (await ids(source_codes=["ecb", "us", "ecb"])) == (
-            ["ecb/A1/2022-07-21", "us/A3/2022-06-15"],
+            ["ecb/A1/2022-07-21", "ecb/E1/2015", "us/A3/2022-06-15"],
             {"source_codes": ["ecb", "us"], "doc_types": None, "languages": None, "date_from": None,
-             "date_to": None})
-        assert (await ids(doc_types=["E1"]))[0] == ["jp/E1/2023-01-18"]  # a type held by one chunk
+             "date_to": None, "include_undated": False})
+        assert (await ids(doc_types=["B1"]))[0] == ["gb/B1/undated"]  # a type held by one chunk
         assert (await ids(languages=["ja"]))[0] == ["jp/E1/2023-01-18"]
         assert (await ids(source_codes=["ecb"], doc_types=["A3"]))[0] == []  # AND between arguments
         # Both bounds inclusive; with a bound set the undated document is left out.
@@ -216,6 +303,50 @@ async def test_filters_narrow_the_search_and_are_echoed_as_applied(backend):
         assert (applied["date_from"], applied["date_to"]) == ("2022-06-15", "2022-07-21")
         assert "gb/B1/undated" not in (await ids(date_from="1900-01-01"))[0]
         assert "gb/B1/undated" in (await ids())[0]
+
+
+async def test_include_undated_lets_the_documents_without_a_date_through_a_date_bound(backend):
+    async with _client(backend) as c:
+        async def found(**arguments):
+            data = (await c.call_tool("rag_search", {"query": "rates", **arguments})).data
+            return {h["doc_id"] for h in data["hits"]}, data["filters"]["include_undated"]
+
+        dated, flag = await found(date_from="1900-01-01")
+        assert "gb/B1/undated" not in dated and flag is False and len(dated) == 6
+        everything, flag = await found(date_from="1900-01-01", include_undated=True)
+        assert everything == dated | {"gb/B1/undated"} and flag is True
+        # Only the undated ones are added: the dated documents outside the range stay out.
+        assert (await found(date_to="2015-12-31", include_undated=True)) == ({"ecb/E1/2015", "gb/B1/undated"}, True)
+        late, flag = await found(date_from="2023-01-01", include_undated=True)
+        assert late == {"jp/E1/2023-01-18", "gb/B1/undated"} and flag is True
+        # Without a date bound it changes nothing, and is accepted rather than refused; null is false.
+        assert (await found(include_undated=True))[0] == (await found())[0]
+        assert (await found(include_undated=None)) == (await found())
+
+
+@pytest.mark.parametrize("mode", ["interval", "auto", "legacy"])
+async def test_a_month_or_a_year_matches_a_range_overlapping_its_period_in_interval_mode(seeded, mode):
+    """The fixture's intervals as rag-engine's build_payload writes them. In-process Qdrant keeps no payload
+    index: `auto` reads the collection, finds no index, and applies the bound to `date` (legacy)."""
+    store, fake = seeded
+    backend = EngineRagBackend(_settings(rag_date_filter_mode=mode), store=store, embedder=fake)
+    intervals = mode == "interval"
+    async with _client(backend, rag_date_filter_mode=mode) as c:
+        async def found(date_from, date_to):
+            data = (await c.call_tool("rag_search", {"query": "rates", "date_from": date_from,
+                                                     "date_to": date_to})).data
+            return {h["doc_id"] for h in data["hits"]}
+
+        mid_july = await found("2016-07-14", "2016-07-14")
+        assert mid_july == ({"gb/A3/2016-07"} if intervals else set())
+        assert await found("2016-07-31", "2016-08-31") == ({"gb/A3/2016-07"} if intervals else set())
+        assert await found("2016-06-01", "2016-06-30") == set()  # inclusive bounds, nothing outside the month
+        assert await found("2016-07-01", "2016-07-01") == {"gb/A3/2016-07"}  # the stored first day: every mode
+        assert await found("2015-06-01", "2015-06-30") == ({"ecb/E1/2015"} if intervals else set())
+        assert await found("2015-12-31", "2016-01-31") == ({"ecb/E1/2015"} if intervals else set())
+        # A day is a day in every mode.
+        assert await found("2022-07-21", "2022-07-21") == {"ecb/A1/2022-07-21"}
+        assert await found("2022-07-22", "2022-12-31") == set()
 
 
 async def test_limit_defaults_to_the_setting_and_is_refused_above_the_maximum(seeded):
@@ -236,6 +367,7 @@ ARRAY = "must be a JSON array of strings, e.g. "
 EMPTY = (' is an empty array, which could mean "match nothing" as well as "no restriction": omit the argument '
          "for no restriction")
 DATE = ' must be "YYYY-MM-DD", e.g. "2016-03-10"'
+FLAG = "include_undated must be a JSON boolean, true or false without quotes, not "
 UNSEARCHABLE = ("query has no searchable character: it must hold at least one letter, number, symbol or "
                 "punctuation mark")
 
@@ -264,6 +396,15 @@ UNSEARCHABLE = ("query has no searchable character: it must hold at least one le
     ({"query": "x", "date_to": "2016-02-30"}, 'date_to is not a date of the calendar: "2016-02-30"'),
     ({"query": "x", "date_from": "2022-07-22", "date_to": "2022-07-21"},
      "date_from (2022-07-22) is after date_to (2022-07-21)"),
+    # A boolean is a JSON true or false: never guessed from a string or a number.
+    ({"query": "x", "date_from": "2016-01-01", "include_undated": "true"}, FLAG + '"true"; omit it for false'),
+    ({"query": "x", "include_undated": "false"}, FLAG + '"false"; omit it for false'),
+    ({"query": "x", "include_undated": "yes"}, FLAG + '"yes"; omit it for false'),
+    ({"query": "x", "include_undated": 1}, FLAG + "1; omit it for false"),
+    ({"query": "x", "include_undated": 0}, FLAG + "0; omit it for false"),
+    ({"query": "x", "include_undated": [True]}, FLAG + "a JSON array; omit it for false"),
+    ({"query": "x", "include_undated": {"value": True}}, FLAG + "a JSON object; omit it for false"),
+    ({"query": "x", "include_undated": "x" * 200}, FLAG + '"' + "x" * 36 + "...; omit it for false"),
 ])
 async def test_a_bad_argument_is_refused_by_the_tool_in_json_terms(backend, monkeypatch, arguments, message):
     """The tool owns these messages: nothing of the engine's wording (Python lists, None, datetime.date)."""
@@ -322,7 +463,7 @@ async def test_an_unknown_code_is_refused_with_the_valid_values_and_never_correc
         assert await _error(c, {"query": "x", "languages": ["english"]}) == (
             '[invalid_argument] languages: unknown value "english"; valid values: "en", "ja"')
         assert calls == []  # nothing was searched with a corrected or an unknown value
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
     assert len(calls) == 1
 
 
@@ -427,7 +568,7 @@ async def test_the_values_are_dropped_when_the_collection_comes_back(seeded, mon
             assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "unavailable"
             clock[0] += 6
         down.failure, codes.values["source_code"] = None, ["ecb", "us"]  # recreated
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert (await c.call_tool("server_info", {})).data["rag"]["source_codes"] == ["ecb", "us"]
 
 
@@ -517,7 +658,7 @@ async def test_without_the_facet_api_the_values_are_read_by_one_scroll_of_the_th
         _settled(backend)
         assert (await _error(c, {"query": "x", "source_codes": ["ECB"]})).endswith("valid values: " + VALID_SOURCES)
         assert (await _error(c, {"query": "x", "doc_types": ["a1"]})).endswith("valid values: " + VALID_TYPES)
-        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["E1"]})).data["count"] == 1
+        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["B1"]})).data["count"] == 1
         info = (await c.call_tool("server_info", {})).data["rag"]
     assert (info["source_codes"], info["doc_types"], info["languages"]) == (SOURCE_CODES, DOC_TYPES, ["en", "ja"])
     # One pass over the collection for the three fields, not one pass per field.
@@ -533,7 +674,7 @@ async def test_the_scroll_runs_in_the_background_and_no_search_waits_for_it(seed
     async with _client(backend) as c:  # the start does not wait for the scroll either
         assert client.scrolls == 1  # started at start-up, once the collection is checked
         # No value is known yet: a filtered search is served at once, unchecked.
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ECB"]})).data["count"] == 0
         assert (await c.call_tool("server_info", {})).data["rag"]["source_codes"] is None
         client.release.set()
@@ -545,9 +686,9 @@ async def test_the_scroll_runs_in_the_background_and_no_search_waits_for_it(seed
         # At the end of the TTL the values are read again in the background: the searches made meanwhile
         # are served, and checked against the values already known.
         clock[0] += 61
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert client.scrolls == 2 and backend._reading  # running, and the call above did not wait for it
-        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["E1"]})).data["count"] == 1
+        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["B1"]})).data["count"] == 1
         assert client.scrolls == 2  # one at a time
         client.release.set()
         _settled(backend)
@@ -981,7 +1122,7 @@ async def test_a_failed_read_of_the_values_refuses_no_other_caller(seeded, monke
         assert await _error(c, {"query": "x", "source_codes": ["ecb"]}) == UNREACHABLE
         codes.failure = None
         assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert healthy.checks == 2  # the start, then the call that followed the failure
 
 
@@ -1064,7 +1205,8 @@ def test_no_search_is_started_after_the_calls_deadline(backend, monkeypatch):
         _backend_search(backend, time.monotonic() - 0.001)
     assert str(refused.value) == TIMEOUT and searched == []
     assert _backend_search(backend, time.monotonic() + 60) == (
-        {"source_codes": None, "doc_types": None, "languages": None, "date_from": None, "date_to": None}, [])
+        {"source_codes": None, "doc_types": None, "languages": None, "date_from": None, "date_to": None,
+         "include_undated": False}, [])
     assert len(searched) == 1
     assert _backend_search(backend, None)[1] == [] and len(searched) == 2  # no deadline: no limit
 
@@ -1091,16 +1233,507 @@ def test_the_read_before_a_refusal_is_not_waited_for_beyond_the_calls_deadline(s
         _settled(backend)
 
 
-async def test_an_unexpected_error_is_masked(backend, monkeypatch, caplog):
+# -- date bounds: the engine's date filter mode -----------------------------------------------------
+
+
+class _SchemaClient:
+    """The fixture's Qdrant client, but the payload schema it reports (are `date_start` and `date_end`
+    indexed?) is the test's: `indexed`, or a `failure` raised after waiting for `release` while `hold`
+    is set. The collection check of the store sees the real collection."""
+
+    def __init__(self, client, indexed):
+        self._client, self.indexed, self.failure, self.hold = client, indexed, None, False
+        self.release, self.reads, self.threads, self.checking = threading.Event(), 0, [], threading.local()
+
+    def get_collection(self, collection_name):
+        info = self._client.get_collection(collection_name=collection_name)
+        if getattr(self.checking, "active", False):
+            return info
+        self.reads += 1
+        self.threads.append(threading.current_thread().name)
+        if self.hold:
+            assert self.release.wait(10)
+        if self.failure is not None:
+            raise self.failure
+        from types import SimpleNamespace as NS
+
+        schema = {field: NS(data_type="datetime") for field in ("date_start", "date_end")} if self.indexed else {}
+        return info.model_copy(update={"payload_schema": schema})
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+class _Schema(QdrantStore):
+    """rag-engine's own store (its cache of the answer, its fallback and retry delay) over that client."""
+
+    def __init__(self, client, indexed=False):
+        self.schema = _SchemaClient(client, indexed)
+        super().__init__(client=self.schema)
+        self.asked, self.checks, self.done = [], 0, threading.Event()
+
+    def check_collection(self, name, dim):
+        self.checks += 1
+        self.schema.checking.active = True
+        try:
+            return super().check_collection(name, dim)
+        finally:
+            self.schema.checking.active = False
+
+    def uses_date_intervals(self, collection, *, max_age=None, retry_after=None):
+        self.asked.append((max_age, retry_after))
+        try:
+            return super().uses_date_intervals(collection, max_age=max_age, retry_after=retry_after)
+        finally:
+            self.done.set()
+
+
+def _spied(monkeypatch) -> list[dict]:
+    """The keyword arguments of every search sent to the engine (which is really run)."""
+    real, seen = backend_module.search, []
+
+    def search(query, **kwargs):
+        seen.append({"query": query, **kwargs})
+        return real(query, **kwargs)
+
+    monkeypatch.setattr(backend_module, "search", search)
+    return seen
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+async def test_auto_mode_reads_the_collection_for_a_date_bound_and_hands_its_answer_to_the_engine(
+        seeded, monkeypatch, indexed):
+    store, fake = seeded
+    for refresh, reads in ((0, 3), (300, 1)):  # 0: read before every date-bounded search
+        schema = _Schema(store.client, indexed=indexed)
+        backend = EngineRagBackend(_settings(rag_date_filter_refresh_s=refresh, rag_date_filter_retry_s=11),
+                                   store=schema, embedder=fake)
+        sent = _spied(monkeypatch)
+        async with _client(backend) as c:
+            assert schema.schema.reads == 1  # once at start, after the collection check passed
+            await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})
+            assert schema.schema.reads == 1  # no date bound: nothing to ask
+            await c.call_tool("rag_search", {"query": "x", "date_from": "2022-01-01"})
+            await c.call_tool("rag_search", {"query": "x", "date_to": "2022-12-31"})
+            assert schema.schema.reads == reads
+        # The settings, never the engine's defaults or its environment.
+        assert schema.asked == [(refresh, 11)] * 3
+        assert [(s["date_filter_mode"], s["date_filter_refresh"], s["date_filter_retry"]) for s in sent] == [
+            ("auto", refresh, 11)] + [("interval" if indexed else "legacy", refresh, 11)] * 2
+
+
+async def test_no_schema_read_at_start_after_a_failed_read_of_the_values(seeded, monkeypatch):
+    """The read of the filter values failed for an outage at start: the schema read could only add one more
+    request timeout to the start. It is made by the first date-bounded call instead."""
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    backend = EngineRagBackend(_settings(), store=schema, embedder=fake)
+    monkeypatch.setattr(backend, "_facet_values", lambda: (_ for _ in ()).throw(_timed_out()))
+    backend.start()
+    assert schema.schema.reads == 0 and backend._suspected == "qdrant_unreachable"
+    monkeypatch.undo()  # Qdrant answers again
+    sent = _spied(monkeypatch)
+    async with _client(backend) as c:
+        assert (await c.call_tool("rag_search", {"query": "x", "date_from": "2022-01-01"})).data["count"] > 0
+    assert schema.schema.reads == 1 and sent[-1]["date_filter_mode"] == "interval"
+
+
+@pytest.mark.parametrize("mode", ["interval", "legacy"])
+async def test_a_fixed_mode_never_reads_the_collection_and_is_passed_as_it_is(seeded, monkeypatch, mode):
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    backend = EngineRagBackend(_settings(rag_date_filter_mode=mode), store=schema, embedder=fake)
+    sent = _spied(monkeypatch)
+    async with _client(backend) as c:
+        found = (await c.call_tool("rag_search", {"query": "x", "date_from": "2022-06-15",
+                                                  "date_to": "2022-07-21"})).data
+    assert schema.schema.reads == 0 and schema.asked == [] and [s["date_filter_mode"] for s in sent] == [mode]
+    assert sorted({h["doc_id"] for h in found["hits"]}) == ["ecb/A1/2022-07-21", "us/A3/2022-06-15"]
+
+
+async def test_the_schema_read_runs_in_the_calls_slot_and_within_its_budget(seeded, monkeypatch):
+    """The read hangs like a frozen Qdrant: the call answers `timeout` at the end of its budget, the slot
+    stays taken (another call is `busy`), and no search is started once the budget is spent."""
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    backend = EngineRagBackend(_settings(rag_date_filter_refresh_s=0), store=schema, embedder=fake)
+    sent = _spied(monkeypatch)
+    async with _client(backend, rag_call_timeout_s=0.4, rag_max_concurrency=1) as c:
+        reads = schema.schema.reads
+        schema.schema.hold, schema.schema.failure = True, _timed_out()
+        schema.done.clear()
+        try:
+            bounded = asyncio.create_task(_timed(_error(c, {"query": "x", "date_from": "2022-01-01"})))
+            await asyncio.sleep(0.1)
+            assert schema.schema.reads == reads + 1 and schema.schema.threads[-1].startswith("mof-rag")
+            assert await _error(c, {"query": "x"}) == BUSY  # the read holds the only slot
+            message, took = await bounded
+            assert message == TIMEOUT and 0.3 <= took < 3
+        finally:
+            schema.schema.release.set()
+        assert await asyncio.to_thread(schema.done.wait, 10)
+        await asyncio.sleep(0.05)  # the worker ends its call (deadline check) after the read
+        assert sent == []  # the read failed late: the deadline had passed, no search was started
+        # A failed read is not an outage: no failure is remembered, no collection check follows.
+        assert (backend._collection_reason, backend._suspected, backend._recheck) == (None, None, False)
+        checks, schema.schema.hold = schema.checks, False
+        data = (await c.call_tool("rag_search", {"query": "x", "date_from": "2022-01-01"})).data
+        assert data["count"] > 0 and schema.checks == checks
+        assert schema.schema.reads == reads + 1  # within the retry delay the engine does not read again
+        assert sent[-1]["date_filter_mode"] == "interval"  # the last answer it read (at start)
+
+
+@pytest.mark.parametrize("failure", [_timed_out(), _response(500), _response(403),
+                                     QdrantAuthError("Qdrant refused the request (HTTP 401)")],
+                         ids=["timeout", "500", "403", "auth"])
+async def test_a_failed_schema_read_refuses_no_call_and_is_not_remembered_as_an_outage(seeded, monkeypatch,
+                                                                                       caplog, failure):
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    schema.schema.failure = failure  # from the start: no answer was ever read
+    backend = EngineRagBackend(_settings(), store=schema, embedder=fake)
+    sent = _spied(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+    async with _client(backend) as c:
+        for _ in range(3):
+            data = (await c.call_tool("rag_search", {"query": FOMC, "date_from": "2022-06-15",
+                                                     "date_to": "2022-06-15"})).data
+            assert [h["doc_id"] for h in data["hits"]] == ["us/A3/2022-06-15"]
+        info = (await c.call_tool("server_info", {})).data["rag"]
+    assert info["status"] == "ready" and schema.checks == 1  # the start's check only
+    assert schema.schema.reads == 1  # the start's read; the calls within the retry delay ask nothing
+    assert [s["date_filter_mode"] for s in sent] == ["legacy"] * 3  # never read: the filter on `date`
+    assert (backend._collection_reason, backend._suspected) == (None, None)
+    assert not [r for r in caplog.records if r.name == "myopenfund_mcp.rag" and r.levelno >= logging.WARNING]
+
+
+# What a proxy or a TLS layer in front of Qdrant answers when the schema read fails: each names a host,
+# an address or a hint that must reach no log record, whatever the logger.
+PROXY_BODY = b'{"status":{"error":"upstream qdrant-prod.internal:6333 refused the connection"}}'
+NGINX_502 = b"<html><head><title>502 Bad Gateway</title></head><body>upstream 10.0.4.17:6333</body></html>"
+SCHEMA_FAILURES = [
+    UnexpectedResponse(500, "Internal Server Error", PROXY_BODY, httpx.Headers()),
+    UnexpectedResponse(502, "Bad Gateway", NGINX_502, httpx.Headers()),
+    ResponseHandlingException(httpx.ConnectError(
+        f"[SSL: CERTIFICATE_VERIFY_FAILED] hostname '{HOST}' doesn't match 'qdrant-prod.internal'")),
+    UnexpectedResponse(401, "Unauthorized", b'{"status":{"error":"Invalid api-key k-hunter2"}}', httpx.Headers()),
+]
+LEAKS = (HOST, KEY, "qdrant-prod.internal", "10.0.4.17", "6333", "upstream", "<html", "Raw response", "api-key",
+         "QDRANT_API_KEY", "secret-term", "council")
+
+
+def _record_texts(records) -> list[str]:
+    """Everything a handler could write of each record: the message, the exception and the stack."""
+    texts = []
+    for record in records:
+        texts.append(record.getMessage())
+        if record.exc_info:
+            texts.append(logging.Formatter().formatException(record.exc_info))
+        texts.extend(filter(None, (record.exc_text, record.stack_info)))
+    return texts
+
+
+@pytest.mark.parametrize("failure", SCHEMA_FAILURES, ids=["proxy-500", "nginx-502", "tls", "auth-401"])
+async def test_a_failed_schema_read_leaves_no_host_body_or_key_in_any_log_record(seeded, monkeypatch, caplog,
+                                                                                 failure):
+    store, fake = seeded
+    schema = _Schema(store.client, indexed=True)
+    schema.schema.failure = failure
+    caplog.set_level(logging.DEBUG)
+    backend = EngineRagBackend(_settings(), store=schema, embedder=fake)
+    async with _client(backend) as c:
+        data = (await c.call_tool("rag_search", {"query": "secret-term what did the council decide",
+                                                 "date_from": "2022-01-01"})).data
+    assert data["count"] > 0
+    engine = [r for r in caplog.records if r.name.startswith("rag_engine")]
+    warned = [r for r in engine if r.levelno == logging.WARNING]
+    assert len(warned) == 1  # the engine's warning is kept, at its level, with the class of the error
+    assert type(failure).__name__ in warned[0].getMessage() or "QdrantAuthError" in warned[0].getMessage()
+    assert COLLECTION in warned[0].getMessage() and "legacy" in warned[0].getMessage()
+    for text in _record_texts(caplog.records):
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
+
+
+def test_any_engine_record_carrying_an_error_is_reduced_to_its_class(seeded, caplog):
+    """Not only the known warning: any record of an engine logger with an exception among its arguments, an
+    attached exception, or the server's host or key in its text, is written without them."""
+    import rag_engine.embedding
+
+    store, fake = seeded
+    EngineRagBackend(_settings(), store=store, embedder=fake)  # installs the filter
+    caplog.set_level(logging.DEBUG)
+    error = UnexpectedResponse(502, "Bad Gateway", NGINX_502, httpx.Headers())
+    for logger in (logging.getLogger("rag_engine.store"), logging.getLogger(rag_engine.embedding.__name__),
+                   logging.getLogger("rag_engine"), logging.getLogger("rag_engine.some_future_module")):
+        logger.error("something failed: %s", error)
+        try:
+            raise error
+        except UnexpectedResponse:
+            logger.exception("something failed")
+        logger.warning("could not reach %s with %s", HOST, KEY)
+        logger.info("Qdrant collection %r has no datetime index", COLLECTION)  # nothing to hide: kept as it is
+    records = [r for r in caplog.records if r.name.startswith("rag_engine")]
+    assert len(records) == 16 and {r.levelno for r in records} == {logging.ERROR, logging.WARNING, logging.INFO}
+    for text in _record_texts(records):
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
+    assert all("UnexpectedResponse" in r.getMessage() for r in records if r.levelno == logging.ERROR)
+    kept = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    assert kept == [f"Qdrant collection {COLLECTION!r} has no datetime index"] * 4
+
+
+def test_an_engine_record_reaches_the_root_handlers_once_reduced_whatever_its_logger(seeded):
+    """As in a deployment: one handler on the root logger (the CLI's). A logger of the engine created after
+    the filter was installed is covered too, and nothing is written twice or dropped."""
+    store, fake = seeded
+    EngineRagBackend(_settings(), store=store, embedder=fake)
+    EngineRagBackend(_settings(), store=store, embedder=fake)  # built twice: still one relay
+
+    class Collect(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    collect, root = Collect(), logging.getLogger()
+    root.addHandler(collect)
+    try:
+        logging.getLogger("rag_engine.created_later").warning("failed: %s", _response(502))
+        logging.getLogger("rag_engine.created_later").warning("plain line")
+    finally:
+        root.removeHandler(collect)
+    assert [r.getMessage() for r in collect.records] == [
+        ("rag-engine logged a message about an error (UnexpectedResponse); its text is not logged: it may hold "
+         "the vector database's address, a response body or a credential hint"), "plain line"]
+    relays = [h for h in logging.getLogger("rag_engine").handlers if type(h).__name__ == "_EngineLogRelay"]
+    assert len(relays) == 1 and logging.getLogger("rag_engine").handlers[0] is relays[0]
+
+
+@pytest.mark.parametrize("collection", ["qdrant-docs", "qdrant"])
+def test_the_host_and_the_key_are_matched_as_whole_tokens_never_the_collection(seeded, caplog, collection):
+    """A host named `qdrant` and a collection `qdrant-docs`: the engine's ordinary lines naming the
+    collection are kept; the host itself, alone, with a port or in capitals, is not written; the key is
+    not written anywhere, even inside a longer word. A collection named like the host gives no exemption
+    to the host: the engine's line naming it is reduced too."""
+    store, fake = seeded
+    EngineRagBackend(_settings(rag_qdrant_host="qdrant", rag_qdrant_api_key="k1", rag_collection=collection),
+                     store=store, embedder=fake)
+    caplog.set_level(logging.DEBUG)
+    engine = logging.getLogger("rag_engine.store")
+    named = (f"Qdrant collection {collection!r} has datetime indexes on date_start and date_end: date filters "
+             "in auto mode use the intervals")
+    kept = ([named] if collection != "qdrant" else []) + ["talking to qdrant.example.org and qdrant-backup"]
+    for line in kept:
+        engine.info(line)
+    reduced = ["could not reach qdrant", "could not reach qdrant:6333", "url http://qdrant:6333/collections",
+               'host "qdrant" refused', "api-key=k1", "key k1.", "token k10 or xk1",
+               "KEY_k1-next"] + ([named] if collection == "qdrant" else [])
+    for line in reduced:
+        engine.warning(line)
+    messages = [r.getMessage() for r in caplog.records if r.name == "rag_engine.store"]
+    assert messages[:len(kept)] == kept
+    assert all(m.startswith("rag-engine logged a message about an error") for m in messages[len(kept):]), messages
+    assert len(messages) == len(kept) + len(reduced)
+
+
+def test_a_host_configured_with_capitals_is_matched_as_the_client_writes_it(seeded, caplog):
+    store, fake = seeded
+    EngineRagBackend(_settings(rag_qdrant_host="Qdrant-Prod.Internal"), store=store, embedder=fake)
+    caplog.set_level(logging.DEBUG)
+    engine = logging.getLogger("rag_engine.store")
+    engine.warning("url http://qdrant-prod.internal:6333/collections")
+    engine.warning("host Qdrant-Prod.Internal refused")
+    engine.info("Qdrant collection 'c' is ready")  # the engine's word, not the host
+    messages = [r.getMessage() for r in caplog.records if r.name == "rag_engine.store"]
+    assert [m.startswith("rag-engine logged a message about an error") for m in messages] == [True, True, False]
+
+
+def test_a_host_configured_as_a_bracketed_ipv6_literal_is_also_matched_bare(seeded, caplog):
+    store, fake = seeded
+    EngineRagBackend(_settings(rag_qdrant_host="[fd00::17]"), store=store, embedder=fake)
+    caplog.set_level(logging.DEBUG)
+    engine = logging.getLogger("rag_engine.store")
+    engine.warning("could not reach fd00::17 port 6333")
+    engine.warning("url http://[fd00::17]:6333/collections")
+    engine.info("collection 'c' is ready")
+    messages = [r.getMessage() for r in caplog.records if r.name == "rag_engine.store"]
+    assert [m.startswith("rag-engine logged a message about an error") for m in messages] == [True, True, False]
+
+
+def test_an_unexpected_error_repeated_is_logged_at_error_once_until_a_search_is_served(backend, monkeypatch,
+                                                                                       caplog):
+    real = backend_module.search
+    failing = {"on": True}
+
+    def search(*args, **kwargs):
+        if failing["on"]:
+            raise RuntimeError("bug")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(backend_module, "search", search)
+    caplog.set_level(logging.INFO, logger="myopenfund_mcp.rag")
+    for _ in range(5):
+        with pytest.raises(ToolError, match="internal_error"):
+            backend.search(query="x", filters={}, limit=1, max_limit=5)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name == "myopenfund_mcp.rag"]
+    assert len(errors) == 1
+    failing["on"] = False
+    backend.search(query="x", filters={}, limit=1, max_limit=5)
+    failing["on"] = True
+    with pytest.raises(ToolError, match="internal_error"):
+        backend.search(query="x", filters={}, limit=1, max_limit=5)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name == "myopenfund_mcp.rag"]
+    assert len(errors) == 2  # served in between: the next one is logged again
+
+
+def test_the_engine_log_filter_can_be_given_values_while_threads_log():
+    """Backends built (protect) while eight threads log through the filter: no record fails."""
+    log_filter, failures, stop = backend_module.EngineLogFilter(), [], threading.Event()
+
+    def logging_thread():
+        while not stop.is_set():
+            record = logging.LogRecord("rag_engine.store", logging.INFO, __file__, 1, "collection %r is ready",
+                                       ("c1",), None)
+            try:
+                log_filter.filter(record)
+            except Exception as exc:  # noqa: BLE001 -- what the test looks for
+                failures.append(exc)
+                return
+
+    threads = [threading.Thread(target=logging_thread) for _ in range(8)]
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # threads switch as often as they can: the window of a race is hit
+    for thread in threads:
+        thread.start()
+    try:
+        for n in range(300):
+            log_filter.protect(f"host-{n}", f"key-{n}", f"collection-{n}")
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(10)
+        sys.setswitchinterval(interval)
+    assert failures == []
+    reduced = logging.LogRecord("rag_engine.store", logging.WARNING, __file__, 1, "no answer from host-299:6333",
+                                None, None)
+    assert log_filter.filter(reduced) and "host-299" not in reduced.getMessage()
+
+
+def test_without_any_handler_an_engine_warning_falls_back_to_the_last_resort(seeded, monkeypatch):
+    """As the standard library does for a record no handler takes: written to stderr by `logging.lastResort`
+    (WARNING and above), reduced like any other."""
+    store, fake = seeded
+    EngineRagBackend(_settings(), store=store, embedder=fake)
+    engine, root = logging.getLogger("rag_engine"), logging.getLogger()
+    relays = [h for h in engine.handlers if type(h).__name__ == "_EngineLogRelay"]
+
+    class Collect(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    last = Collect()
+    monkeypatch.setattr(logging, "lastResort", last)
+    monkeypatch.setattr(engine, "handlers", relays)  # what a deployment has: the relay only
+    monkeypatch.setattr(root, "handlers", [])  # and no handler on the root logger
+    monkeypatch.setattr(root, "level", logging.INFO)
+    logging.getLogger("rag_engine.store").warning("failed: %s", _response(502))
+    logging.getLogger("rag_engine.store").info("not for the last resort")
+    assert [r.getMessage() for r in last.records] == [
+        ("rag-engine logged a message about an error (UnexpectedResponse); its text is not logged: it may hold "
+         "the vector database's address, a response body or a credential hint")]
+
+
+async def test_a_filter_the_collection_refuses_for_a_missing_index_is_search_refused(seeded, monkeypatch, caplog):
+    """rag-engine raises its own MissingIndexError for the HTTP 400 of a collection in strict mode."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(rag_date_filter_mode="interval"), store=healthy, embedder=fake)
+    try:
+        raise _response(400)
+    except UnexpectedResponse as cause:
+        refusal = MissingIndexError(f"collection {COLLECTION!r} refuses a filter on 'date_start'")
+        refusal.__cause__ = cause
+    _failing_for(monkeypatch, {QUERY: refusal})
+    caplog.set_level(logging.DEBUG)
+    async with _client(backend) as c:
+        assert await _error(c, {"query": QUERY, "date_from": "2016-01-01"}) == REFUSED
+        assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+        assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
+        assert healthy.checks == 2  # the next call checked the collection first, and was served
+    logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.rag"]
+    assert "rag: a search was refused by the vector database (HTTP 400, a filtered field has no index)" in logged
+
+
+INTERNAL = ("[rag_unavailable] internal_error: the server failed on this search for a reason of its own (its "
+            "log names the error's class); retry, and tell the operator if it lasts")
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.WARNING])
+async def test_an_unexpected_error_is_coded_and_only_its_class_is_logged(seeded, monkeypatch, caplog, capfd,
+                                                                          level):
+    """A programming error, or anything the backend does not know: nothing of its text reaches the client, a
+    log record of any logger, or stderr (FastMCP prints the traceback of an exception it receives)."""
+    store, fake = seeded
+    backend = EngineRagBackend(_settings(), store=_Store(store, store.client), embedder=fake)
+
     def failing(*args, **kwargs):
         raise RuntimeError(f"http://{HOST}:6333 api-key={KEY}")
 
     monkeypatch.setattr(backend_module, "search", failing)
-    caplog.set_level(logging.INFO, logger="myopenfund_mcp")
+    caplog.set_level(level)
     async with _client(backend) as c:
-        message = await _error(c, {"query": "x"})
-    assert HOST not in message and KEY not in message and not message.startswith("[")
-    assert not any(HOST in r.getMessage() or KEY in r.getMessage() for r in caplog.records)
+        message = await _error(c, {"query": "secret-term what did the council decide"})
+        assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"  # not an outage
+    assert message == INTERNAL
+    texts = _record_texts(caplog.records) + list(capfd.readouterr())
+    for text in texts:
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
+    # FastMCP's own line for any tool error ("Error calling tool ...") holds the coded message only.
+    errors = [r.getMessage() for r in caplog.records
+              if r.levelno >= logging.ERROR and r.name.startswith("myopenfund")]
+    assert errors == [("rag: a search failed with an unexpected error (RuntimeError); rag_search answered "
+                       "[rag_unavailable] internal_error. Its text and traceback, which may hold the vector "
+                       "database's address or a response body, are logged at DEBUG level only")]
+
+
+def test_at_debug_level_a_developer_gets_the_traceback_of_an_unexpected_error(backend, monkeypatch, caplog):
+    def failing(*args, **kwargs):
+        raise RuntimeError("a programming error")
+
+    monkeypatch.setattr(backend_module, "search", failing)
+    caplog.set_level(logging.DEBUG, logger="myopenfund_mcp.rag")
+    with pytest.raises(ToolError, match="internal_error"):
+        backend.search(query="x", filters={}, limit=1, max_limit=5)
+    debug = [r for r in caplog.records if r.levelno == logging.DEBUG and r.exc_info]
+    assert len(debug) == 1 and "a programming error" in logging.Formatter().formatException(debug[0].exc_info)
+
+
+async def test_a_reply_that_is_not_json_is_qdrant_error(seeded, monkeypatch, caplog, capfd):
+    """A proxy in front of Qdrant answering a search with 200 and an HTML page: the client fails to decode
+    it. Qdrant cannot be read, as with an error status: `qdrant_error`, and the next call checks the
+    collection first."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(), store=healthy, embedder=fake)
+    _failing_for(monkeypatch, {QUERY: json.JSONDecodeError("Expecting value", NGINX_502.decode(), 0)})
+    caplog.set_level(logging.DEBUG)
+    async with _client(backend) as c:
+        assert await _error(c, {"query": QUERY}) == (
+            "[rag_unavailable] qdrant_error: the vector database answered with an error; retry later")
+        assert backend._suspected == "qdrant_error"
+        assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
+        assert healthy.checks == 2  # the next call checked the collection, and was served
+    for text in _record_texts(caplog.records) + list(capfd.readouterr()):
+        for leak in LEAKS:
+            assert leak not in text, (leak, text)
 
 
 # -- start-up ----------------------------------------------------------------------------------------
@@ -1215,13 +1848,16 @@ async def test_the_model_is_loaded_at_start_from_mof_settings_only(seeded, monke
     store, fake = seeded
     for name, value in {"QDRANT_HOST": "elsewhere", "QDRANT_API_KEY": "other", "RAG_ENGINE_BACKEND": "torch",
                         "RAG_ENGINE_MODEL_CACHE": "/elsewhere", "RAG_ENGINE_QDRANT_TIMEOUT": "60",
-                        "RAG_ENGINE_ONNX_THREADS": "64", "RAG_ENGINE_MODEL": "other/model"}.items():
+                        "RAG_ENGINE_ONNX_THREADS": "64", "RAG_ENGINE_MODEL": "other/model",
+                        "RAG_ENGINE_DATE_FILTER_MODE": "legacy", "RAG_ENGINE_DATE_FILTER_REFRESH": "1",
+                        "RAG_ENGINE_DATE_FILTER_RETRY": "2"}.items():
         monkeypatch.setenv(name, value)
     seen = []
     monkeypatch.setattr(backend_module, "make_embedder", lambda s, **k: seen.append(("embedder", s)) or fake)
     monkeypatch.setattr(backend_module, "QdrantStore", lambda **k: seen.append(("store", k["settings"])) or store)
     settings = _settings(rag_qdrant_port=6334, rag_qdrant_https=True, rag_qdrant_timeout=7, rag_onnx_threads=3,
-                         rag_default_limit=5, rag_max_limit=9)
+                         rag_default_limit=5, rag_max_limit=9, rag_date_filter_mode="interval",
+                         rag_date_filter_refresh_s=60, rag_date_filter_retry_s=9)
     backend = EngineRagBackend(settings)
     assert [kind for kind, _ in seen] == ["store"]  # nothing is loaded before start()
     build_server(settings, rag_backend=backend)
@@ -1233,6 +1869,7 @@ async def test_the_model_is_loaded_at_start_from_mof_settings_only(seeded, monke
     assert (engine.qdrant_timeout, engine.backend, engine.model_cache, engine.onnx_threads) == (
         7, "onnx", "/models", 3)
     assert (engine.search_limit, engine.search_max_limit) == (5, 9)
+    assert (engine.date_filter_mode, engine.date_filter_refresh, engine.date_filter_retry) == ("interval", 60, 9)
     assert (engine.model_name, engine.model_dim) == ("intfloat/multilingual-e5-base", 768)
 
 
@@ -1331,7 +1968,8 @@ class _CannedBackend:
     def search(self, *, query, filters, limit, max_limit, deadline=None):
         self.threads.append(threading.current_thread())
         hits = [{"score": 0.123456 - n / 100, "text": text, "doc_id": f"d{n}", "title": f"T{n}", "page": n,
-                 "date": "2022-01-01", "source_code": "ecb", "doc_type": "A1", "language": "en",
+                 "date": "2022-01-01", "date_precision": "month", "date_kind": "publication",
+                 "source_code": "ecb", "doc_type": "A1", "language": "en",
                  "chunk_number": n, "corpus": "central-bank", "point_id": 2**62 + n}
                 for n, text in enumerate(self.texts)]
         return {name: None for name in ("source_codes", "doc_types", "languages", "date_from", "date_to")}, hits[:limit]
@@ -1346,6 +1984,20 @@ async def test_a_result_over_the_cap_is_refused_naming_the_largest_limit_that_fi
         assert message.endswith(f"ask again with limit={fits} or less") and 1 <= fits < 8
         assert (await c.call_tool("rag_search", {"query": "q", "limit": fits})).data["count"] == fits  # it fits
         assert (await _error(c, {"query": "q", "limit": fits + 1})).startswith("[result_too_large]")  # the largest
+
+
+async def test_the_cap_counts_the_date_fields_and_the_citation_as_served():
+    """The limit named by the refusal is the largest that fits with every field of a hit, the two date
+    fields and the citation written to its precision included."""
+    backend = _CannedBackend(["x" * 300] * 6)
+    async with _client(backend, max_result_chars=2000) as c:
+        fits = int((await _error(c, {"query": "q"})).rsplit("limit=", 1)[1].split()[0])
+        served = await c.call_tool("rag_search", {"query": "q", "limit": fits})
+        assert len(served.content[0].text) <= 2000
+        hit = served.data["hits"][0]
+        assert (hit["date_precision"], hit["date_kind"]) == ("month", "publication")
+        assert hit["citation"] == "T0 (ecb A1, January 2022), p. 1"
+        assert (await _error(c, {"query": "q", "limit": fits + 1})).startswith("[result_too_large]")
 
 
 async def test_a_single_passage_over_the_cap_is_refused_not_cut():
@@ -1520,7 +2172,9 @@ def test_the_readme_documents_the_codes_every_reason_and_every_argument():
     for needle in ("`rag_unavailable`", "`limit_exceeded`", "`rag_search`", *(f"`{r}`" for r in backend_module.REASONS),
                    "`source_codes`", "`doc_types`", "`languages`", "`date_from`, `date_to`", "`limit`", "`citation`",
                    "the first page is 1", "`ORT_DISABLE_TELEMETRY`", "`HF_HUB_OFFLINE=1`", "`mem_limit: 3g`",
-                   "no outbound connection", "MOF_RAG_DESCRIPTION_NOTES="):
+                   "no outbound connection", "MOF_RAG_DESCRIPTION_NOTES=", "`include_undated`",
+                   "`date_precision`", "`date_kind`", "`July 2016`", "`sync-metadata`", "`date_start`",
+                   "`date_end`", "#### Dates in `rag_search`", "No new volume"):
         assert needle in readme, needle
 
 

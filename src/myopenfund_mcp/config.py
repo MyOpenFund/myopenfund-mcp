@@ -19,6 +19,9 @@ class ConfigError(ValueError):
 
 # company-corpus's TTM Q4 rules (company_corpus.financials.Q4Rule)
 Q4_RULES = ("ytd9", "sum_of_quarters")
+# rag-engine's ways of applying a date bound (rag_engine.config.DATE_FILTER_MODES), the default first.
+# Written out here: this module never imports the [rag] extra.
+RAG_DATE_FILTER_MODES = ("auto", "interval", "legacy")
 
 
 def _get(env: Mapping[str, str], name: str) -> str | None:
@@ -38,7 +41,8 @@ def _int(
         return default
     # ASCII digits only: int() would also take "+5", "1_000" or non-ASCII digits.
     if re.fullmatch(r"[0-9]+", raw) is None:
-        raise ConfigError(f"{name} must be an integer, got {raw!r}")
+        allowed = f"from {minimum} to {maximum}" if maximum is not None else f">= {minimum}"
+        raise ConfigError(f"{name} must be an integer {allowed}, got {raw!r}")
     value = int(raw)
     if value < minimum:
         raise ConfigError(f"{name} must be >= {minimum}, got {value}")
@@ -165,6 +169,15 @@ class Settings:
     # MOF_RAG_DESCRIPTION_NOTES: text appended to the description of rag_search (what the collection
     # holds, what its codes mean); empty = nothing appended
     rag_description_notes: str = ""
+    # MOF_RAG_DATE_FILTER_MODE: how rag-engine applies a date bound -- auto (the intervals on a collection
+    # where date_start and date_end are indexed, the date field elsewhere) | interval | legacy
+    rag_date_filter_mode: str = "auto"
+    # MOF_RAG_DATE_FILTER_REFRESH_S: in auto mode, seconds the answer "are the intervals indexed?" is kept
+    # before the collection is asked again (0 = before every date-bounded search)
+    rag_date_filter_refresh_s: int = 300
+    # MOF_RAG_DATE_FILTER_RETRY_S: in auto mode, seconds before a collection whose payload schema could not
+    # be read is asked again (meanwhile the last answer, or legacy, is used)
+    rag_date_filter_retry_s: int = 30
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -210,10 +223,16 @@ class Settings:
             rag_max_concurrency=_int(env, "MOF_RAG_MAX_CONCURRENCY", 4, maximum=64),
             rag_check_retry_s=_int(env, "MOF_RAG_CHECK_RETRY_S", 5, maximum=3600),
             rag_description_notes=_get(env, "MOF_RAG_DESCRIPTION_NOTES") or "",
+            rag_date_filter_mode=_get(env, "MOF_RAG_DATE_FILTER_MODE") or "auto",
+            rag_date_filter_refresh_s=_int(env, "MOF_RAG_DATE_FILTER_REFRESH_S", 300, minimum=0, maximum=86_400),
+            rag_date_filter_retry_s=_int(env, "MOF_RAG_DATE_FILTER_RETRY_S", 30, maximum=3600),
         )
         if settings.companies_q4_rule not in Q4_RULES:
             raise ConfigError(f"MOF_COMPANIES_Q4_RULE must be one of {', '.join(Q4_RULES)}, "
                               f"got {settings.companies_q4_rule!r}")
+        if settings.rag_date_filter_mode not in RAG_DATE_FILTER_MODES:
+            raise ConfigError(f"MOF_RAG_DATE_FILTER_MODE must be one of {', '.join(RAG_DATE_FILTER_MODES)}, "
+                              f"got {settings.rag_date_filter_mode!r}")
         if bool(settings.companies_catalog) != bool(settings.companies_data_root):
             missing = "MOF_COMPANIES_DATA_ROOT" if settings.companies_catalog else "MOF_COMPANIES_CATALOG"
             raise ConfigError(f"{missing} is required with the other MOF_COMPANIES_* store variable")

@@ -20,7 +20,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Annotated
+from typing import Annotated, Any
 
 import anyio
 from fastmcp import FastMCP
@@ -42,27 +42,28 @@ DATE_ARGUMENTS = ("date_from", "date_to")
 
 # Corpus-neutral on purpose: what the collection holds and what its codes mean is the deployment's to
 # say, in MOF_RAG_DESCRIPTION_NOTES (appended below) -- the codes themselves are read from the collection.
-SEARCH_DESCRIPTION = """Search the embedded document collection by meaning and get the most relevant \
-PASSAGES (text excerpts), best first. It returns source text only; it does not write an answer.
+SEARCH_DESCRIPTION = """Search the embedded documents by meaning and get the most relevant PASSAGES \
+(text excerpts), best first. It returns source text only; it does not write an answer.
 
 Arguments:
 - query (required): a question or topic in plain language.
 - source_codes, doc_types, languages: JSON arrays of strings (an array even for a single code). Each \
-string is one of the exact codes listed in server_info (rag.source_codes, rag.doc_types, rag.languages), \
-copied as written there: case matters. A code the collection does not hold is refused with the list of \
-the valid ones, never corrected.
-- date_from, date_to: publication date bounds, "YYYY-MM-DD", both inclusive. With a bound set, documents \
-without a full date (undated, or dated by year or month only) are left out: if a date range returns \
-nothing or too little, retry without dates.
+string is an exact code listed in server_info (rag.source_codes, rag.doc_types, rag.languages): case \
+matters. An unknown code is refused with the valid ones listed, never corrected.
+- date_from, date_to: date bounds, "YYYY-MM-DD", both inclusive. With a bound set, {dates}; documents \
+without a date are left out unless include_undated is true.
+- include_undated: true also keeps the documents without a date under a date bound; default false.
 - limit: number of passages, from 1 to {max_limit}; omitted = {default_limit}.
 Values of one array are alternatives (OR); different arguments combine (AND). Omit an argument to leave it \
 unrestricted; never send an empty array.
 
 Result: {{query, filters, count, hits}}. Each hit: rank, score (cosine, higher is closer), text, doc_id, \
-title, date, source_code, doc_type, language, page, chunk_number, citation. `page` is the page the passage \
-starts on, counted from 1 (null for a document without pages). Quote `text` and cite each passage with \
-its `citation`, a ready-made reference: title, then source and document-type codes and date in brackets, \
-then the page, each part the document lacks left out. Several hits may come from the same document."""
+title, date, date_precision, date_kind, source_code, doc_type, language, page, chunk_number, citation. \
+`date_precision` (day, month, year or null) says how much of `date` is known: a month or a year is \
+written as its first day. `date_kind` (such as publication or meeting, or null) says what the date marks. \
+`page`, where the passage starts, is counted from 1 (null without pages). Quote `text` and cite each \
+passage with its `citation`, a ready-made reference: title, then source and document-type codes and date \
+in brackets, then the page, each part the document lacks left out. Several hits may share a document."""
 
 QUERY_DESCRIPTION = "What to look for, in plain language (a question or a topic). Required."
 # No example value on purpose: a small model sends a placeholder as it is written.
@@ -72,8 +73,18 @@ DOC_TYPES_DESCRIPTION = ("Document types to keep: JSON array of strings, each an
                          "server_info's rag.doc_types; omitted = all")
 LANGUAGES_DESCRIPTION = ("Languages to keep: JSON array of strings, each an exact code copied from "
                          "server_info's rag.languages; omitted = all")
-DATE_FROM_DESCRIPTION = "Earliest publication date, YYYY-MM-DD, inclusive"
-DATE_TO_DESCRIPTION = "Latest publication date, YYYY-MM-DD, inclusive"
+# What a date bound does with a document known only to the month or the year, per date filter mode.
+# `auto` says what it does once the collection's intervals are indexed (until then it is `legacy`).
+DATE_MATCHING = {
+    "auto": "a document known only to the month or the year matches any range overlapping its period",
+    "interval": "a document known only to the month or the year matches any range overlapping its period",
+    "legacy": "a document known only to the month or the year is found only on its period's first day",
+}
+DATE_FROM_DESCRIPTION = "Earliest date, YYYY-MM-DD, inclusive"
+DATE_TO_DESCRIPTION = "Latest date, YYYY-MM-DD, inclusive"
+INCLUDE_UNDATED_DESCRIPTION = ("JSON boolean true or false (not a string). true: with date_from or date_to set, "
+                               "also keep the documents without a date; default false; no effect without a "
+                               "date bound")
 LIMIT_DESCRIPTION = ("Number of passages; omitted = server default; a value above the server maximum is "
                      "refused, not lowered")
 
@@ -87,15 +98,24 @@ Codes = Annotated[
                     "maxItems": MAX_CODES}),
 ]
 Day = Annotated[str, Field(max_length=MAX_DATE_CHARS)]
+# Published as a JSON boolean and nothing else, but anything is let through to the tool, which refuses a
+# value that is not true or false (the string "true", 1) with a coded message, instead of the framework
+# turning "false" into False, or "no" into a refusal without a code. null is the default, false.
+Flag = Annotated[Any, WithJsonSchema({"type": "boolean", "description": INCLUDE_UNDATED_DESCRIPTION})]
 
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+# A stored date, possibly followed by a time: what a citation can shorten to its month or its year.
+_STORED_DAY = re.compile(r"([0-9]{4})-([0-9]{2})-[0-9]{2}(?![0-9])")
+MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+          "November", "December")
 _CODE_IN_A_STRING = re.compile(r"""[^\s,\[\]'"]+""")
 MAX_EXAMPLE_CODES = 3
 
 
 def search_description(settings: Settings) -> str:
     """The tool's description: the limits of this deployment, then its notes on the collection."""
-    text = SEARCH_DESCRIPTION.format(max_limit=settings.rag_max_limit, default_limit=settings.rag_default_limit)
+    text = SEARCH_DESCRIPTION.format(max_limit=settings.rag_max_limit, default_limit=settings.rag_default_limit,
+                                     dates=DATE_MATCHING[settings.rag_date_filter_mode])
     notes = settings.rag_description_notes.strip()
     return f"{text}\n\nAbout this collection: {notes}" if notes else text
 
@@ -145,16 +165,47 @@ def check_arguments(query: str, codes: dict, dates: dict) -> None:
         raise tool_error(INVALID_ARGUMENT, f"date_from ({dates['date_from']}) is after date_to ({dates['date_to']})")
 
 
+def check_flag(name: str, value) -> bool:
+    """A JSON boolean: true or false, never guessed from a string or a number; null is the default."""
+    if value is None:
+        return False
+    if type(value) is not bool:
+        shown = json.dumps(value, ensure_ascii=False) if isinstance(value, (str, int, float)) else "a " + {
+            list: "JSON array", dict: "JSON object"}.get(type(value), "value of another type")
+        if len(shown) > 40:
+            shown = shown[:37] + "..."
+        raise tool_error(INVALID_ARGUMENT, f"{name} must be a JSON boolean, true or false without quotes, "
+                                           f"not {shown}; omit it for false")
+    return value
+
+
 def human_page(page) -> int | None:
     """The page as a reader counts it: stored pages are counted from 0. None without a usable page."""
     return page + 1 if type(page) is int and page >= 0 else None
 
 
+def cited_date(date, precision) -> str | None:
+    """The date as a citation writes it: "July 2016" for a `month` precision, "2016" for a `year` one (the
+    producers store the first day of the period), the stored date itself for `day`, for an unknown or
+    unexpected precision, and for a date that does not start with YYYY-MM-DD. None without a date."""
+    if not date:
+        return None
+    text = str(date)
+    match = _STORED_DAY.match(text)
+    if match is not None and precision == "year":
+        return match.group(1)
+    if match is not None and precision == "month" and 1 <= int(match.group(2)) <= 12:
+        return f"{MONTHS[int(match.group(2)) - 1]} {match.group(1)}"
+    return text
+
+
 def citation(hit: dict) -> str:
-    """`<title> (<source_code> <doc_type>, <date>), p. <page>`, each missing part left out."""
+    """`<title> (<source_code> <doc_type>, <date>), p. <page>`, each missing part left out; the date at its
+    precision (`cited_date`)."""
     label = hit.get("title") or hit.get("doc_id") or "untitled document"
     origin = " ".join(str(part) for part in (hit.get("source_code"), hit.get("doc_type")) if part)
-    details = ", ".join(str(part) for part in (origin, hit.get("date")) if part)
+    date = cited_date(hit.get("date"), hit.get("date_precision"))
+    details = ", ".join(str(part) for part in (origin, date) if part)
     page = human_page(hit.get("page"))
     return f"{label}{f' ({details})' if details else ''}{f', p. {page}' if page is not None else ''}"
 
@@ -164,6 +215,9 @@ def shape_hit(rank: int, hit: dict) -> dict:
     JavaScript cannot hold) nor the whole payload."""
     return {"rank": rank, "score": round(float(hit["score"]), 4), "text": hit.get("text"),
             "doc_id": hit.get("doc_id"), "title": hit.get("title"), "date": hit.get("date"),
+            # Null when the payload has none: the normal case for a collection written before the producers
+            # stated them.
+            "date_precision": hit.get("date_precision"), "date_kind": hit.get("date_kind"),
             "source_code": hit.get("source_code"), "doc_type": hit.get("doc_type"),
             "language": hit.get("language"), "page": human_page(hit.get("page")),
             "chunk_number": hit.get("chunk_number"), "citation": citation(hit)}
@@ -200,6 +254,7 @@ def build_rag_toolset(backend: RagBackend, settings: Settings, *, auth_enabled: 
         doc_types: Annotated[Codes | None, Field(description=DOC_TYPES_DESCRIPTION)] = None,
         date_from: Annotated[Day | None, Field(description=DATE_FROM_DESCRIPTION)] = None,
         date_to: Annotated[Day | None, Field(description=DATE_TO_DESCRIPTION)] = None,
+        include_undated: Flag = False,
         languages: Annotated[Codes | None, Field(description=LANGUAGES_DESCRIPTION)] = None,
         limit: Annotated[int | None, Field(description=LIMIT_DESCRIPTION)] = None,
     ) -> dict:
@@ -213,9 +268,11 @@ def build_rag_toolset(backend: RagBackend, settings: Settings, *, auth_enabled: 
         codes = {"source_codes": source_codes, "doc_types": doc_types, "languages": languages}
         dates = {"date_from": date_from, "date_to": date_to}
         check_arguments(query, codes, dates)
+        # Without a date bound it changes nothing: accepted, not refused (a small model sends it anyway).
+        flags = {"include_undated": check_flag("include_undated", include_undated)}
         # The backend is blocking (model inference, HTTP to Qdrant): it runs off the event loop.
-        job = workers.submit(partial(backend.search, query=query, filters={**codes, **dates}, limit=wanted,
-                                     max_limit=maximum, deadline=time.monotonic() + budget))
+        job = workers.submit(partial(backend.search, query=query, filters={**codes, **dates, **flags},
+                                     limit=wanted, max_limit=maximum, deadline=time.monotonic() + budget))
         with anyio.move_on_after(budget) as scope:
             applied, hits = await asyncio.wrap_future(job)
         if scope.cancelled_caught:

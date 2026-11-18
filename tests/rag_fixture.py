@@ -2,7 +2,10 @@
 
 Adversarial on purpose: a chunk on the first page (stored page 0), a document without pages, a
 document without date and without title, a doc type held by a single chunk, a Japanese text, and
-one point whose `source_code` is not a string. Texts are stored in NFKD, as the chunker stores them. The embedder is rag-engine's FakeEmbedder with no
+one point whose `source_code` is not a string. Dates as the producers write them: most documents
+carry no `date_precision` nor `date_kind` (the collection before the backfill), one is dated to the
+day with both, one to the month and one to the year (stored at the first day of the period), the
+undated one has both keys null. `build_payload` adds `date_start` / `date_end` to every dated point. Texts are stored in NFKD, as the chunker stores them. The embedder is rag-engine's FakeEmbedder with no
 prefix: a query equal to a chunk's text gets that chunk first, with a score of 1.
 """
 from __future__ import annotations
@@ -23,12 +26,14 @@ FOMC = "Participants judged that an increase of 75 basis points in the target ra
 # As typed (NFC). The chunker stores text in NFKD, and the engine puts the query in NFKD as well.
 BOJ = "デフレ脱却に向けて、日本銀行は金融緩和を継続する。"
 BOE = "The Committee voted by a majority of 7-2 to increase Bank Rate."
+MPC = "The Monetary Policy Committee voted unanimously to maintain Bank Rate at 0.5%."
+PROJECTIONS = "Staff projections foresee annual HICP inflation averaging 0.1% over the year."
 
 # (doc_id, metadata, [(stored page or None, text), ...])
 DOCUMENTS = [
     ("ecb/A1/2022-07-21",
      {"corpus": "central-bank", "source_code": "ecb", "doc_type": "A1", "title": "Monetary policy decisions",
-      "date": "2022-07-21", "year": 2022, "language": "en"},
+      "date": "2022-07-21", "date_precision": "day", "date_kind": "meeting", "year": 2022, "language": "en"},
      [(0, ECB_RATES), (1, ECB_TPI)]),
     ("us/A3/2022-06-15",
      {"corpus": "central-bank", "source_code": "us", "doc_type": "A3",
@@ -39,13 +44,25 @@ DOCUMENTS = [
      {"corpus": "central-bank", "source_code": "jp", "doc_type": "E1",
       "title": "Outlook for Economic Activity and Prices", "date": "2023-01-18", "year": 2023, "language": "ja"},
      [(None, unicodedata.normalize("NFKD", BOJ))]),
+    # No date, no title: its precision and kind are null, as the producer writes them for an undated row.
     ("gb/B1/undated",
-     {"corpus": "central-bank", "source_code": "gb", "doc_type": "B1", "language": "en"},
+     {"corpus": "central-bank", "source_code": "gb", "doc_type": "B1", "language": "en", "date_precision": None,
+      "date_kind": None},
      [(2, BOE)]),
     ("odd/numeric-source",
      {"corpus": "central-bank", "source_code": 7, "doc_type": "A1", "title": "Odd", "date": "2021-01-01",
       "language": "en"},
      [(0, "A point whose source code is a number.")]),
+    # Known to the month: stored at the first day, found by any range that overlaps July 2016.
+    ("gb/A3/2016-07",
+     {"corpus": "central-bank", "source_code": "gb", "doc_type": "A3", "title": "Monetary Policy Summary",
+      "date": "2016-07-01", "date_precision": "month", "date_kind": "meeting", "year": 2016, "language": "en"},
+     [(1, MPC)]),
+    # Known to the year.
+    ("ecb/E1/2015",
+     {"corpus": "central-bank", "source_code": "ecb", "doc_type": "E1", "title": "Staff projections",
+      "date": "2015-01-01", "date_precision": "year", "date_kind": "period", "year": 2015, "language": "en"},
+     [(None, PROJECTIONS)]),
 ]
 SOURCE_CODES = ["ecb", "gb", "jp", "us"]
 DOC_TYPES = ["A1", "A3", "B1", "E1"]

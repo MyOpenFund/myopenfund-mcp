@@ -31,6 +31,19 @@ A search that Qdrant refuses as a request (HTTP 4xx other than a refused key, a 
 matter of that call alone: it answers `[rag_unavailable] search_refused`, and refuses nobody else (the next call checks the collection first).
 No lock is held during a request to Qdrant.
 
+Date bounds (`rag_date_filter_mode`, passed to the engine's `search` with its refresh and retry
+delays: the engine's own `RAG_ENGINE_DATE_FILTER_*` variables are never read). In `auto` mode a call
+with a date bound may need one more request: the read of the collection's payload schema (are
+`date_start` and `date_end` indexed?), at most once every `rag_date_filter_refresh_s` seconds. It is
+made here, in the call's own thread (its slot) and before the deadline check, by the engine's
+`QdrantStore.uses_date_intervals`, and the mode it gives is handed to `search`: a search is never
+started after the call's deadline because of that read. The read never fails a call: when it fails,
+the engine answers with the last mode it read, or `legacy`, and reads again after
+`rag_date_filter_retry_s` seconds. It is therefore not an outage for the toolset either: nothing of it
+reaches the collection check's memory, and only the search that follows says whether Qdrant answers.
+It is also made once at start, after a collection check and a read of the filter values that passed,
+so the first date-bounded call does not pay for it and the log says which filter is in use.
+
 Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown code:
 - with Qdrant's facet API and the keyword indexes, they are read in the calling thread (a few
   milliseconds): at start, then by one call every `rag_codes_ttl_s` seconds;
@@ -43,7 +56,9 @@ Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown
   `rag_codes_retry_s` seconds.
 
 No error message and no `info()` holds the Qdrant host, the API key, a raw response body or the text
-of a query, and neither does a log line of this module (logger `myopenfund_mcp.rag`). The HTTP
+of a query, and neither does a log line of this module (logger `myopenfund_mcp.rag`) nor of rag-engine
+(loggers `rag_engine` and `rag_engine.*`): building the backend routes the engine's records through
+`EngineLogFilter`, which writes those that carry an error without its text (see there). The HTTP
 libraries under the Qdrant client are another matter: `httpx` logs one INFO line per request with
 the server's address, which is why the CLI raises that logger to WARNING, and `httpcore` logs the
 host and port of each connection at DEBUG, a level the CLI never turns on.
@@ -52,17 +67,25 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from typing import Any, Protocol
 
+from fastmcp.exceptions import ToolError
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from rag_engine import __version__ as ENGINE_VERSION
 from rag_engine.config import ConfigError as EngineConfigError
 from rag_engine.config import Settings as EngineSettings
 from rag_engine.embedding import ModelDownloadError, ModelIntegrityError, make_embedder
 from rag_engine.search import SearchError, SearchFilters, search
-from rag_engine.store import CollectionMismatchError, CollectionNotFoundError, QdrantAuthError, QdrantStore
+from rag_engine.store import (
+    CollectionMismatchError,
+    CollectionNotFoundError,
+    MissingIndexError,
+    QdrantAuthError,
+    QdrantStore,
+)
 
 from ..config import ConfigError, Settings
 from ..errors import INVALID_ARGUMENT, RAG_UNAVAILABLE, tool_error
@@ -111,7 +134,152 @@ REASONS = {
     "timeout": "the search did not finish within the time allowed for one call; retry later",
     "busy": "too many searches are running and none finished within the time allowed for one call; "
             "retry later",
+    "internal_error": "the server failed on this search for a reason of its own (its log names the error's "
+                      "class); retry, and tell the operator if it lasts",
 }
+
+
+#: The engine's warning when the payload schema of a collection cannot be read (rag_engine.store,
+#: `uses_date_intervals`): its arguments are (collection, error class, error, mode used meanwhile,
+#: seconds before the next try). Rewritten without the error itself.
+_SCHEMA_WARNING = ("The payload schema of Qdrant collection %r could not be read (%s: %s): date filters in auto "
+                   "mode use %s until it can; next try in %g seconds at the earliest")
+class EngineLogFilter(logging.Filter):
+    """Keeps the server's log free of what rag-engine's records may carry from a failed request: the
+    Qdrant host (in the client's error, a TLS error), a response body (a proxy's error page naming an
+    upstream host or an internal address), the engine's hint naming `QDRANT_API_KEY`.
+
+    A record of an engine logger is reduced when an exception is among its arguments, when it carries
+    an exception (`logger.exception`, `exc_info`), or when its text holds the configured Qdrant host
+    (as a whole token, as configured or lowercased, with or without a port) or API key (anywhere) (`_sensitive`; the
+    configured collection, as the engine quotes it, never counts unless it is also the host). What is kept: the logger, the level, and a fixed message naming the class of each
+    exception. The engine's warning on a schema read that failed keeps, besides, its collection, the
+    filter used meanwhile and the delay before the next try. A record without any of these (the INFO
+    lines naming a collection and the filter in use) is written as the engine wrote it. Never drops a
+    record."""
+
+    def __init__(self):
+        super().__init__()
+        self._protecting = threading.Lock()  # one change at a time
+        # (hosts, keys, collections, the pattern of the hosts): replaced whole, never changed, so a thread
+        # that logs reads one consistent state without a lock while another backend is built.
+        self._state: tuple[frozenset[str], frozenset[str], frozenset[str], re.Pattern | None] = (
+            frozenset(), frozenset(), frozenset(), None)
+
+    def protect(self, host: str | None, key: str | None, collection: str | None = None) -> None:
+        """The configured host and API key must never be written; the collection is not sensitive."""
+        with self._protecting:
+            hosts, keys, collections, _ = self._state
+            if host:
+                # As configured and lowercased (the HTTP client writes it lowercased in its errors), bare
+                # too when it was configured as a bracketed IPv6 literal. Not matched without case: the
+                # engine's own lines start with the word "Qdrant", a usual host name.
+                hosts = hosts | {host, host.lower(), host.strip("[]"), host.strip("[]").lower()}
+            keys = keys | ({key} if key else set())
+            collections = collections | ({collection} if collection else set())
+            # A host is not inside a longer name: no name character before, none after (a dot ending a
+            # sentence is no part of a name, a dot followed by a name character is). Longest first.
+            alternatives = "|".join(re.escape(value) for value in sorted(hosts, key=len, reverse=True))
+            pattern = (re.compile(rf"(?<![A-Za-z0-9._-])(?:{alternatives})(?::[0-9]+)?(?![A-Za-z0-9_-]|\.[A-Za-z0-9])")
+                       if hosts else None)
+            self._state = (frozenset(hosts), frozenset(keys), frozenset(collections), pattern)
+
+    def _sensitive(self, text: str) -> bool:
+        """Whether `text` holds a protected value. The key anywhere, as a plain substring (a false alarm
+        on a key costs one reduced line). The host as a whole token, as configured or lowercased, with or
+        without `:port`: `Qdrant-Prod` is found in `http://qdrant-prod:6333/`, `qdrant` is not found in
+        `qdrant-docs`, `qdrant.example.org` nor the engine's word "Qdrant". A configured collection written as the engine writes it, quoted
+        (`'qdrant-docs'`), is taken out first, unless it is also a protected host."""
+        hosts, keys, collections, pattern = self._state
+        if any(key in text for key in keys):
+            return True
+        if pattern is None:
+            return False
+        lowered = {host.lower() for host in hosts}
+        for collection in collections:
+            if collection.lower() not in lowered:
+                text = text.replace(repr(collection), "")
+        return pattern.search(text) is not None
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        errors = [arg for arg in args if isinstance(arg, BaseException)]
+        if record.exc_info and isinstance(record.exc_info, tuple) and record.exc_info[1] is not None:
+            errors.append(record.exc_info[1])
+        if not errors:
+            try:
+                text = record.getMessage()
+            except Exception:  # noqa: BLE001 -- a malformed record: reduced rather than written
+                text = None
+            if text is not None and not self._sensitive(text):
+                return True
+        classes = ", ".join(dict.fromkeys(type(error).__name__ for error in errors)) or "none"
+        if record.msg == _SCHEMA_WARNING and len(args) == 5:
+            record.msg = ("The payload schema of Qdrant collection %r could not be read (%s; its text is "
+                          "not logged): date filters in auto mode use %s until it can; next try in %g "
+                          "seconds at the earliest")
+            record.args = (args[0], classes, args[3] if isinstance(args[3], str) else "the last known answer",
+                           args[4] if isinstance(args[4], (int, float)) else 0)
+        else:
+            record.msg = ("rag-engine logged a message about an error (%s); its text is not logged: it may "
+                          "hold the vector database's address, a response body or a credential hint")
+            record.args = (classes,)
+        record.exc_info = record.exc_text = record.stack_info = None
+        return True
+
+
+ENGINE_LOG_FILTER = EngineLogFilter()
+
+
+class _EngineLogRelay(logging.Handler):
+    """The first handler of the `rag_engine` logger, which no longer propagates: every record of the
+    engine, from `rag_engine` or any `rag_engine.*` logger, existing or created later, goes through
+    `ENGINE_LOG_FILTER` here, then on to the root logger's handlers, as it would have propagated (a
+    handler attached to both loggers, as pytest attaches its own, is left to get it from `rag_engine`).
+    When no handler takes the record, `logging.lastResort` writes it (WARNING and above), as the
+    standard library does.
+
+    What `propagate = False` costs, accepted for the privacy it buys: the change is made on the process's
+    `rag_engine` logger and lasts as long as the process (another user of rag-engine in the same process
+    gets the filter too); handlers of loggers between `rag_engine` and the root are skipped (there are
+    none: the engine's loggers sit directly under the root); and a later `logging.config.dictConfig` that
+    names `rag_engine` replaces its handlers, the relay included, and so gives the records back unfiltered
+    (the filters put on the engine's existing loggers stay unless the configuration replaces those too)."""
+
+    def __init__(self):
+        super().__init__(level=logging.NOTSET)
+        self.addFilter(ENGINE_LOG_FILTER)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        engine = logging.getLogger("rag_engine").handlers
+        found = sum(1 for handler in engine if handler is not self)
+        for handler in logging.getLogger().handlers:
+            if handler not in engine:
+                found += 1
+                if record.levelno >= handler.level:
+                    handler.handle(record)
+        # No handler anywhere on the way: what the standard library does when a record finds none.
+        last = logging.lastResort
+        if not found and last is not None and record.levelno >= last.level:
+            last.handle(record)
+
+
+def install_engine_log_filter(host: str | None, key: str | None, collection: str | None = None) -> None:
+    """Route the engine's records through `ENGINE_LOG_FILTER` (once), and protect `host` and `key`. The
+    filter is also put on the engine's loggers that exist already: a record is reduced before any handler
+    sees it, whatever the order of the handlers."""
+    ENGINE_LOG_FILTER.protect(host, key, collection)
+    engine = logging.getLogger("rag_engine")
+    # By name: a module imported again (tests do) defines the class again, and one relay is enough.
+    if not any(type(handler).__name__ == _EngineLogRelay.__name__ for handler in engine.handlers):
+        engine.handlers.insert(0, _EngineLogRelay())
+    engine.propagate = False
+    for name in [name for name in list(logging.root.manager.loggerDict) if name.startswith("rag_engine.")]:
+        logger = logging.getLogger(name)
+        if ENGINE_LOG_FILTER not in logger.filters:
+            logger.addFilter(ENGINE_LOG_FILTER)
+    if ENGINE_LOG_FILTER not in engine.filters:
+        engine.addFilter(ENGINE_LOG_FILTER)
 
 
 class RagBackend(Protocol):
@@ -148,6 +316,10 @@ def _reason(exc: BaseException) -> str | None:
         return "collection_mismatch"
     if isinstance(exc, ResponseHandlingException):  # connection refused, DNS, TLS, timeout
         return "qdrant_unreachable"
+    if isinstance(exc, json.JSONDecodeError):
+        # An answer that is not JSON, such as a proxy's HTML page sent with status 200: the client does
+        # not wrap that one. Qdrant cannot be read, as with an error status.
+        return "qdrant_error"
     if isinstance(exc, UnexpectedResponse):
         # 404 on a search or a scroll: the collection is gone.
         return {401: "qdrant_auth", 403: "qdrant_auth",
@@ -161,7 +333,10 @@ def _reason(exc: BaseException) -> str | None:
 
 def _refused(exc: BaseException) -> bool:
     """Whether a search failed because Qdrant refused that request: an error of one call, which says
-    nothing of the next one (see NOT_A_REFUSAL_STATUSES)."""
+    nothing of the next one (see NOT_A_REFUSAL_STATUSES). The engine raises its own `MissingIndexError`
+    for the 400 of a collection in strict mode asked to filter on a field without an index."""
+    if isinstance(exc, MissingIndexError):
+        return True
     return (isinstance(exc, UnexpectedResponse) and 400 <= exc.status_code < 500
             and exc.status_code not in NOT_A_REFUSAL_STATUSES)
 
@@ -180,6 +355,9 @@ def engine_settings(settings: Settings) -> EngineSettings:
             onnx_threads=settings.rag_onnx_threads,
             search_limit=settings.rag_default_limit,
             search_max_limit=settings.rag_max_limit,
+            date_filter_mode=settings.rag_date_filter_mode,
+            date_filter_refresh=settings.rag_date_filter_refresh_s,
+            date_filter_retry=settings.rag_date_filter_retry_s,
         )
     except EngineConfigError as exc:  # the engine names its own variables; it never echoes the key
         error = ConfigError(f"the MOF_RAG_* settings were refused by rag-engine ({exc})")
@@ -191,10 +369,14 @@ class EngineRagBackend:
     a deployment builds both from the settings."""
 
     def __init__(self, settings: Settings, *, store: Any = None, embedder: Any = None):
+        install_engine_log_filter(settings.rag_qdrant_host, settings.rag_qdrant_api_key, settings.rag_collection)
         self._collection = settings.rag_collection
         self._ttl_s = settings.rag_codes_ttl_s
         self._codes_retry_s = settings.rag_codes_retry_s
         self._check_retry_s = settings.rag_check_retry_s
+        self._date_mode = settings.rag_date_filter_mode
+        self._date_refresh = settings.rag_date_filter_refresh_s
+        self._date_retry = settings.rag_date_filter_retry_s
         self._embedder = embedder
         self._engine_settings = None
         if store is None or embedder is None:
@@ -220,6 +402,9 @@ class EngineRagBackend:
         # A search was refused as a request: the next call checks the collection before it searches
         # (a collection recreated with another vector size refuses every search). Refuses nobody.
         self._recheck = False
+        # The class of the last unexpected search error logged at ERROR: one line per new class, not per
+        # call, until a search is served again.
+        self._unexpected_logged: str | None = None
         self._checking = False  # a call is running the collection check
         self._logged: tuple[str, str] | None = None  # the failure last logged: (what failed, reason)
         self._values: dict[str, frozenset[str] | None] | None = None  # None: not known (yet)
@@ -261,6 +446,11 @@ class EngineRagBackend:
                     self._read_values()
                 except _Outage:
                     pass  # recorded: the first call checks the collection again
+                else:
+                    # After an outage the read could only add a request timeout to the start: the first
+                    # date-bounded call makes it instead.
+                    if self._date_mode == "auto":
+                        self._date_filter_mode()  # never raises: the engine falls back by itself
 
     def _check_collection(self) -> str | None:
         """Run the engine's read-only collection check and record the outcome: None, or the reason
@@ -320,6 +510,7 @@ class EngineRagBackend:
     def _served(self) -> None:
         """A search succeeded: Qdrant answers, whatever a search that failed meanwhile recorded."""
         with self._lock:
+            self._unexpected_logged = None
             if self._collection_reason is None or self._from_search:
                 # A failure remembered from a search (not from a check) is disproved the same way.
                 self._collection_reason = self._failed_at = None
@@ -540,6 +731,17 @@ class EngineRagBackend:
                              f"{argument}: unknown value{'' if len(parts) == 1 else 's'} {', '.join(parts)}; "
                              f"valid values: {', '.join(quoted(v) for v in listed[:MAX_LISTED_VALUES])}{more}")
 
+    # -- date bounds -------------------------------------------------------------------------
+
+    def _date_filter_mode(self) -> str:
+        """`interval` or `legacy` for `auto` mode: the engine's own reading of the collection, at most
+        one request (none while its answer is fresh or a failed read is recent). It never raises for
+        Qdrant: a failed read gives the last answer, or `legacy`, and is the engine's to log (one
+        warning, written without the error's text by `EngineLogFilter`)."""
+        uses = self._store.uses_date_intervals(self._collection, max_age=self._date_refresh,
+                                               retry_after=self._date_retry)
+        return "interval" if uses else "legacy"
+
     # -- search ------------------------------------------------------------------------------
 
     def search(self, *, query: str, filters: dict, limit: int, max_limit: int,
@@ -552,7 +754,9 @@ class EngineRagBackend:
         Raises the tool errors itself: `[invalid_argument]` with the engine's own message for an
         argument the engine refuses or a filter value the collection does not hold,
         `[rag_unavailable]` with a reason for an outage or for a search Qdrant refuses (`search_refused`:
-        the error of this call alone; the next call checks the collection before it searches). Anything else is left to the server's masking.
+        the error of this call alone; the next call checks the collection before it searches), and
+        `internal_error` for any other exception, whose class only is logged (its text and traceback at
+        DEBUG level): nothing of an exception reaches the server's masking.
         """
         error = None
         try:
@@ -561,29 +765,50 @@ class EngineRagBackend:
                 raise _Outage(self._model_reason)
             self._require_collection()
             self._check_values(applied, deadline)
+            mode = self._date_mode
+            if mode == "auto" and (applied.date_from is not None or applied.date_to is not None):
+                mode = self._date_filter_mode()  # before the deadline check: no search after it
             if deadline is not None and time.monotonic() >= deadline:
                 raise _Outage("timeout")
             hits = search(query, collection=self._collection, store=self._store, embedder=self._embedder,
-                          filters=applied, limit=limit, max_limit=max_limit)
+                          filters=applied, limit=limit, max_limit=max_limit, date_filter_mode=mode,
+                          date_filter_refresh=self._date_refresh, date_filter_retry=self._date_retry)
         except SearchError as exc:
             error = tool_error(INVALID_ARGUMENT, str(exc))
         except _Outage as exc:
             error = unavailable(exc.reason)
-        except Exception as exc:  # mapped below, or re-raised as it is
+        except ToolError:
+            raise  # a coded error of the toolset's own (a filter value the collection does not hold)
+        except Exception as exc:  # mapped below, never re-raised
             if _refused(exc):
                 # The request is refused, not the service: the other calls are served. The next one
                 # checks the collection first, in case it is the collection that changed.
                 with self._lock:
                     self._recheck = True
-                log.info("rag: a search was refused by the vector database (HTTP %d)", exc.status_code)
+                status = getattr(exc, "status_code", None) or getattr(exc.__cause__, "status_code", 400)
+                log.info("rag: a search was refused by the vector database (HTTP %d%s)", status,
+                         ", a filtered field has no index" if isinstance(exc, MissingIndexError) else "")
                 error = unavailable("search_refused")
             else:
                 reason = _reason(exc)
                 if reason is None:
-                    raise
-                # The class only: a client error's text holds the URL and the response body.
-                self._suspect(reason, exc, "search failed")
-                error = unavailable(reason)
+                    # Not raised on: FastMCP would log the text and the traceback of the exception, which
+                    # may hold the host, the key or a response body. A developer gets them at DEBUG level,
+                    # which the CLI never turns on.
+                    with self._lock:
+                        first = self._unexpected_logged != type(exc).__name__
+                        self._unexpected_logged = type(exc).__name__
+                    log.log(logging.ERROR if first else logging.DEBUG,
+                            "rag: a search failed with an unexpected error (%s); rag_search answered "
+                            "[rag_unavailable] internal_error. Its text and traceback, which may hold the "
+                            "vector database's address or a response body, are logged at DEBUG level only",
+                            type(exc).__name__)
+                    log.debug("rag: the unexpected error of a search", exc_info=exc)
+                    error = unavailable("internal_error")
+                else:
+                    # The class only: a client error's text holds the URL and the response body.
+                    self._suspect(reason, exc, "search failed")
+                    error = unavailable(reason)
         if error is not None:
             # Raised outside the handler so the client error (URL, body) is not chained.
             raise error
@@ -592,8 +817,11 @@ class EngineRagBackend:
             {"source_codes": _list(applied.source_codes), "doc_types": _list(applied.doc_types),
              "languages": _list(applied.languages),
              "date_from": applied.date_from.isoformat() if applied.date_from else None,
-             "date_to": applied.date_to.isoformat() if applied.date_to else None},
-            [hit.to_dict() for hit in hits],
+             "date_to": applied.date_to.isoformat() if applied.date_to else None,
+             "include_undated": applied.include_undated},
+            # The engine's hit has no field for these two: they are read from the stored payload.
+            [{**hit.to_dict(), "date_precision": hit.payload.get("date_precision"),
+              "date_kind": hit.payload.get("date_kind")} for hit in hits],
         )
 
 
