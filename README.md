@@ -553,7 +553,13 @@ and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH` a
   nothing. The toolset does not remember that failure: no `[rag_unavailable]` follows from it,
   `server_info` stays `ready`, and only the search itself says whether Qdrant answers. So with Qdrant
   frozen, a date-bounded call may spend one request timeout on that read before its search, once per
-  retry delay: its budget still bounds it.
+  retry delay: its budget still bounds it. While no answer has ever been read (a cold start, or a start
+  that skipped the read), the date-bounded calls that arrive during that first read **wait for it**,
+  each in its slot: a burst of them can hold every one of the `MOF_RAG_MAX_CONCURRENCY` slots for one
+  request timeout, once, and the calls behind them, with or without a date bound, wait as long (measured
+  with a 3 s request timeout and 4 slots: 8 date-bounded calls answered in about 3 s, an undated call sent
+  meanwhile in 2.8 s). Once an answer is known, or the read has failed, the other calls never wait for a
+  read in progress.
 - **Modes `interval` and `legacy`** never read the collection: always the intervals, or always the `date`
   field. `interval` on a collection in strict mode without the two indexes is refused by Qdrant
   (`[rag_unavailable] search_refused`, the error of that call alone).
