@@ -50,6 +50,10 @@ def _serve() -> int:
     # stdout is the stdio transport: every log line goes to stderr.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # The Qdrant client's HTTP library logs one INFO line per request, with the server's address: the
+    # audit line already says a call happened. With this, no line holds the address at the INFO level
+    # set above (at DEBUG, the `httpcore` logger would still print the host and port it connects to).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         settings = Settings.from_env()
         server = build_server(settings)

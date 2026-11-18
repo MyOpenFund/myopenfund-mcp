@@ -146,3 +146,100 @@ def test_companies_q4_rule_accepts_sum_of_quarters():
 def test_companies_q4_rule_refuses_other_values(bad):
     with pytest.raises(ConfigError, match="MOF_COMPANIES_Q4_RULE"):
         Settings.from_env({"MOF_COMPANIES_Q4_RULE": bad})
+
+
+RAG_ENV = {"MOF_RAG_QDRANT_HOST": "qdrant", "MOF_RAG_COLLECTION": "central-bank-e5b-v1",
+           "MOF_RAG_MODEL_CACHE": "/models"}
+
+
+def test_rag_defaults():
+    s = Settings.from_env({})
+    assert s.rag_qdrant_host is None and s.rag_collection is None and s.rag_model_cache is None
+    assert (s.rag_qdrant_port, s.rag_qdrant_https, s.rag_qdrant_timeout) == (6333, False, 10)
+    assert (s.rag_default_limit, s.rag_max_limit, s.rag_onnx_threads, s.rag_codes_ttl_s) == (8, 20, None, 300)
+    assert (s.rag_call_timeout_s, s.rag_max_concurrency, s.rag_check_retry_s, s.rag_codes_retry_s) == (15, 4, 5, 5)
+    assert s.rag_description_notes == ""
+
+
+def test_rag_settings_from_env():
+    s = Settings.from_env({**RAG_ENV, "MOF_RAG_QDRANT_PORT": "6334", "MOF_RAG_QDRANT_API_KEY": "k-secret",
+                           "MOF_RAG_QDRANT_HTTPS": "TRUE", "MOF_RAG_QDRANT_TIMEOUT": "5",
+                           "MOF_RAG_ONNX_THREADS": "4", "MOF_RAG_DEFAULT_LIMIT": "5", "MOF_RAG_MAX_LIMIT": "30",
+                           "MOF_RAG_CODES_TTL_S": "60", "MOF_RAG_CALL_TIMEOUT_S": "9",
+                           "MOF_RAG_MAX_CONCURRENCY": "2", "MOF_RAG_CHECK_RETRY_S": "3",
+                           "MOF_RAG_CODES_RETRY_S": "7", "MOF_RAG_DESCRIPTION_NOTES": "  Corpus: test.  "})
+    assert (s.rag_call_timeout_s, s.rag_max_concurrency, s.rag_check_retry_s, s.rag_codes_retry_s) == (9, 2, 3, 7)
+    assert s.rag_description_notes == "Corpus: test."
+    assert (s.rag_qdrant_host, s.rag_qdrant_port, s.rag_collection) == ("qdrant", 6334, "central-bank-e5b-v1")
+    assert (s.rag_qdrant_https, s.rag_qdrant_timeout, s.rag_model_cache) == (True, 5, "/models")
+    assert (s.rag_onnx_threads, s.rag_default_limit, s.rag_max_limit, s.rag_codes_ttl_s) == (4, 5, 30, 60)
+    assert s.rag_qdrant_api_key == "k-secret" and "k-secret" not in repr(s)
+
+
+@pytest.mark.parametrize(("env", "match"), [
+    ({"MOF_RAG_QDRANT_HOST": "qdrant"}, "MOF_RAG_COLLECTION"),
+    ({"MOF_RAG_COLLECTION": "c"}, "MOF_RAG_QDRANT_HOST"),
+    ({"MOF_RAG_QDRANT_HOST": "qdrant", "MOF_RAG_COLLECTION": "c"}, "MOF_RAG_MODEL_CACHE"),
+    ({**RAG_ENV, "MOF_RAG_QDRANT_PORT": "0"}, "MOF_RAG_QDRANT_PORT"),
+    ({**RAG_ENV, "MOF_RAG_QDRANT_PORT": "65536"}, "MOF_RAG_QDRANT_PORT"),
+    ({**RAG_ENV, "MOF_RAG_QDRANT_HTTPS": "maybe"}, "MOF_RAG_QDRANT_HTTPS"),
+    ({**RAG_ENV, "MOF_RAG_QDRANT_TIMEOUT": "0"}, "MOF_RAG_QDRANT_TIMEOUT"),
+    ({**RAG_ENV, "MOF_RAG_QDRANT_TIMEOUT": "301"}, "MOF_RAG_QDRANT_TIMEOUT"),
+    ({**RAG_ENV, "MOF_RAG_QDRANT_TIMEOUT": "2.5"}, "MOF_RAG_QDRANT_TIMEOUT"),
+    ({**RAG_ENV, "MOF_RAG_ONNX_THREADS": "0"}, "MOF_RAG_ONNX_THREADS"),
+    ({**RAG_ENV, "MOF_RAG_ONNX_THREADS": "many"}, "MOF_RAG_ONNX_THREADS"),
+    ({**RAG_ENV, "MOF_RAG_MAX_LIMIT": "0"}, "MOF_RAG_MAX_LIMIT"),
+    ({**RAG_ENV, "MOF_RAG_DEFAULT_LIMIT": "0"}, "MOF_RAG_DEFAULT_LIMIT"),
+    ({**RAG_ENV, "MOF_RAG_DEFAULT_LIMIT": "21"}, r"MOF_RAG_DEFAULT_LIMIT \(21\) must not exceed MOF_RAG_MAX_LIMIT \(20\)"),
+    ({**RAG_ENV, "MOF_RAG_CODES_TTL_S": "0"}, "MOF_RAG_CODES_TTL_S"),
+    ({**RAG_ENV, "MOF_RAG_COLLECTION": "a/b"}, "MOF_RAG_COLLECTION"),
+    ({**RAG_ENV, "MOF_RAG_CALL_TIMEOUT_S": "0"}, "MOF_RAG_CALL_TIMEOUT_S"),
+    # A call must outlast one request to Qdrant, or the Qdrant timeout would never be the one reported.
+    ({**RAG_ENV, "MOF_RAG_CALL_TIMEOUT_S": "9"},
+     r"MOF_RAG_CALL_TIMEOUT_S \(9\) must not be below MOF_RAG_QDRANT_TIMEOUT \(10\)"),
+    ({**RAG_ENV, "MOF_RAG_QDRANT_TIMEOUT": "20"}, "MOF_RAG_CALL_TIMEOUT_S"),
+    ({**RAG_ENV, "MOF_RAG_MAX_CONCURRENCY": "0"}, "MOF_RAG_MAX_CONCURRENCY"),
+    ({**RAG_ENV, "MOF_RAG_MAX_CONCURRENCY": "65"}, "MOF_RAG_MAX_CONCURRENCY"),
+    ({**RAG_ENV, "MOF_RAG_CHECK_RETRY_S": "0"}, "MOF_RAG_CHECK_RETRY_S"),
+    ({**RAG_ENV, "MOF_RAG_CODES_RETRY_S": "soon"}, "MOF_RAG_CODES_RETRY_S"),
+    ({**RAG_ENV, "MOF_RAG_DESCRIPTION_NOTES": "x" * 1501}, "MOF_RAG_DESCRIPTION_NOTES must hold at most 1500"),
+    ({**RAG_ENV, "MOF_RAG_MODEL_CACHE": "models"}, "MOF_RAG_MODEL_CACHE must be an absolute path"),
+    ({**RAG_ENV, "MOF_RAG_MODEL_CACHE": "./models"}, "MOF_RAG_MODEL_CACHE must be an absolute path"),
+])
+def test_rag_bad_values_fail_at_start_with_the_variable_named(env, match):
+    with pytest.raises(ConfigError, match=match):
+        Settings.from_env(env)
+
+
+@pytest.mark.parametrize("host", ["http://qdrant:6333", "user:pw@qdrant/x", "qdrant host", "qdrant/", "[::1",
+                                  "[qdrant]", "::1]", "https://[::1]"])
+def test_rag_host_is_a_bare_host_and_a_bad_one_is_never_echoed(host):
+    with pytest.raises(ConfigError, match="MOF_RAG_QDRANT_HOST") as caught:
+        Settings.from_env({**RAG_ENV, "MOF_RAG_QDRANT_HOST": host})
+    assert host not in str(caught.value) and "pw" not in str(caught.value)
+
+
+@pytest.mark.parametrize("host", ["qdrant:6333", "10.0.0.5:6333", "[::1]:6333", "[2001:db8::5]:6333", "user:pw@qdrant",
+                                  "qdrant:"])
+def test_rag_host_with_a_port_is_refused_naming_the_port_variable(host):
+    """It used to pass, then every request failed for ever with `qdrant_error`."""
+    with pytest.raises(ConfigError, match="MOF_RAG_QDRANT_HOST must not carry a port.*MOF_RAG_QDRANT_PORT") as caught:
+        Settings.from_env({**RAG_ENV, "MOF_RAG_QDRANT_HOST": host})
+    assert host not in str(caught.value) and "pw" not in str(caught.value)
+
+
+@pytest.mark.parametrize("host", ["qdrant", "10.0.0.5", "nas.example.net", "::1", "[::1]", "2001:db8::5",
+                                  "[2001:db8::5]", "fe80::1"])
+def test_rag_host_accepts_names_and_addresses(host):
+    assert Settings.from_env({**RAG_ENV, "MOF_RAG_QDRANT_HOST": host}).rag_qdrant_host == host
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("1", True), ("yes", True), ("On", True), ("0", False),
+                                               ("no", False), ("OFF", False), ("", False)])
+def test_rag_https_reads_the_usual_booleans(raw, expected):
+    assert Settings.from_env({**RAG_ENV, "MOF_RAG_QDRANT_HTTPS": raw}).rag_qdrant_https is expected
+
+
+def test_rag_tuning_variables_alone_do_not_configure_the_toolset():
+    s = Settings.from_env({"MOF_RAG_MAX_LIMIT": "30", "MOF_RAG_MODEL_CACHE": "/models"})
+    assert s.rag_qdrant_host is None and s.rag_max_limit == 30

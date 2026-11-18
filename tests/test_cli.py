@@ -138,6 +138,24 @@ def test_serve_http_does_not_warn_about_tokens(clean_env, no_server, caplog):
     assert "ignored" not in caplog.text
 
 
+def test_serve_keeps_http_client_request_lines_out_of_the_log(clean_env, no_server, monkeypatch):
+    monkeypatch.setattr(logging.getLogger("httpx"), "level", logging.NOTSET)
+    assert cli.main(["serve"]) == 0
+    assert logging.getLogger("httpx").level == logging.WARNING  # no per-request line naming the Qdrant host
+
+
+def test_serve_refuses_rag_settings_without_the_extra(clean_env, capsys):
+    for name, value in {"MOF_RAG_QDRANT_HOST": "qdrant", "MOF_RAG_COLLECTION": "c", "MOF_RAG_MODEL_CACHE": "/m",
+                        "MOF_RAG_QDRANT_API_KEY": "k-hunter2"}.items():
+        clean_env.setenv(name, value)
+    for name in [n for n in sys.modules if n.startswith("myopenfund_mcp.rag")]:
+        clean_env.delitem(sys.modules, name)
+    clean_env.setitem(sys.modules, "rag_engine", None)
+    assert cli.main(["serve"]) == 2
+    err = capsys.readouterr().err
+    assert "[rag] extra is not installed" in err and "hunter2" not in err
+
+
 def test_serve_refuses_a_vault_url_without_the_extra(clean_env, capsys):
     clean_env.setenv("MOF_VAULT_DATABASE_URL", "postgresql://u:hunter2@h/db")
     clean_env.setitem(sys.modules, "vault_query", None)

@@ -13,6 +13,8 @@ UNKNOWN_METRIC = "unknown_metric"
 UNKNOWN_DATASET = "unknown_dataset"
 UNKNOWN_COLUMN = "unknown_column"
 TOO_MANY_COMPANIES = "too_many_companies"
+RAG_UNAVAILABLE = "rag_unavailable"
+LIMIT_EXCEEDED = "limit_exceeded"
 
 
 def tool_error(code: str, message: str) -> ToolError:

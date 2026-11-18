@@ -6,6 +6,7 @@ the server at start with the variable named — never a silent fallback.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from collections.abc import Mapping
@@ -46,6 +47,66 @@ def _int(
     return value
 
 
+def _optional_int(env: Mapping[str, str], name: str, minimum: int = 1, maximum: int | None = None) -> int | None:
+    """An integer with no default: unset or empty stays None (the library's own choice applies)."""
+    return None if _get(env, name) is None else _int(env, name, minimum, minimum, maximum)
+
+
+_TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
+
+
+def _bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = _get(env, name)
+    if raw is None:
+        return default
+    if raw.lower() in _TRUE:
+        return True
+    if raw.lower() in _FALSE:
+        return False
+    raise ConfigError(f"{name} must be true or false, got {raw!r}")
+
+
+# A host name or an IPv4 address: no scheme, no port, no path. IPv6 literals are checked apart.
+_HOST = re.compile(r"[A-Za-z0-9._-]{1,253}")
+#: Most characters of MOF_RAG_DESCRIPTION_NOTES: the text is sent to every client with the tool list.
+RAG_NOTES_MAX_CHARS = 1500
+# Qdrant refuses a collection name holding '/' or longer than 255 characters.
+_COLLECTION = re.compile(r"[^/\s]{1,255}")
+
+
+def _is_ipv6(text: str) -> bool:
+    try:
+        ipaddress.IPv6Address(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _check_rag_host(host: str) -> None:
+    """Refuse a MOF_RAG_QDRANT_HOST that is not a bare host. The value is never echoed: a pasted URL
+    may carry credentials."""
+    name = "MOF_RAG_QDRANT_HOST"
+    if "://" in host or "/" in host:
+        raise ConfigError(f"{name} must be a host name or an address, without scheme or path "
+                          "(TLS is MOF_RAG_QDRANT_HTTPS, the port is MOF_RAG_QDRANT_PORT)")
+    if host.startswith("["):
+        # A bracketed IPv6 literal, alone: "[::1]". "[::1]:6333" carries a port.
+        if host.endswith("]") and _is_ipv6(host[1:-1]):
+            return
+        if "]:" in host and _is_ipv6(host[1:host.index("]:")]):
+            raise ConfigError(f"{name} must not carry a port: give the address alone and the port in "
+                              "MOF_RAG_QDRANT_PORT")
+        raise ConfigError(f"{name} is not an IPv6 address in brackets")
+    if ":" in host:
+        if _is_ipv6(host):
+            return
+        raise ConfigError(f"{name} must not carry a port: give the host alone and the port in "
+                          "MOF_RAG_QDRANT_PORT")
+    if _HOST.fullmatch(host) is None:
+        raise ConfigError(f"{name} must be a host name or an address, without scheme, port or path "
+                          "(the port is MOF_RAG_QDRANT_PORT, TLS is MOF_RAG_QDRANT_HTTPS)")
+
+
 @dataclass(frozen=True)
 class Settings:
     transport: str = "stdio"  # MOF_MCP_TRANSPORT: stdio | http
@@ -73,6 +134,37 @@ class Settings:
     # company-corpus's published outputs) |
     # sum_of_quarters (FY - Q1 - Q2 - Q3)
     companies_q4_rule: str = "ytd9"
+    # MOF_RAG_QDRANT_HOST: the Qdrant server holding the embedded corpus; unset = no rag toolset
+    rag_qdrant_host: str | None = None
+    rag_qdrant_port: int = 6333  # MOF_RAG_QDRANT_PORT: Qdrant HTTP port
+    # MOF_RAG_QDRANT_API_KEY: a read-only key is enough; kept out of repr, never logged or echoed
+    rag_qdrant_api_key: str | None = field(default=None, repr=False)
+    rag_qdrant_https: bool = False  # MOF_RAG_QDRANT_HTTPS: connect to Qdrant over TLS
+    # MOF_RAG_QDRANT_TIMEOUT: seconds ONE request to Qdrant may take (a call makes several)
+    rag_qdrant_timeout: int = 10
+    rag_collection: str | None = None  # MOF_RAG_COLLECTION: the collection searched; needed with the host
+    # MOF_RAG_MODEL_CACHE: directory of the pinned embedding model files; needed with the host
+    rag_model_cache: str | None = None
+    rag_onnx_threads: int | None = None  # MOF_RAG_ONNX_THREADS: unset = the ONNX runtime decides
+    rag_default_limit: int = 8  # MOF_RAG_DEFAULT_LIMIT: passages returned when the caller gives no limit
+    rag_max_limit: int = 20  # MOF_RAG_MAX_LIMIT: largest limit a caller may ask for
+    # MOF_RAG_CODES_TTL_S: how long the collection's filter values (source codes, doc types, languages)
+    # are kept before being read again
+    rag_codes_ttl_s: int = 300
+    # MOF_RAG_CODES_RETRY_S: least seconds between two reads of the filter values that the TTL did not
+    # ask for (before a value is refused; after a read that failed)
+    rag_codes_retry_s: int = 5
+    # MOF_RAG_CALL_TIMEOUT_S: time budget of one rag_search call, its wait for a free slot included;
+    # never below MOF_RAG_QDRANT_TIMEOUT
+    rag_call_timeout_s: int = 15
+    rag_max_concurrency: int = 4  # MOF_RAG_MAX_CONCURRENCY: searches running at once (worker threads)
+    # MOF_RAG_CHECK_RETRY_S: seconds a failed collection check is remembered: calls made meanwhile are
+    # answered at once with its reason instead of asking Qdrant again (a failed search is not
+    # remembered: it makes the next call run the check)
+    rag_check_retry_s: int = 5
+    # MOF_RAG_DESCRIPTION_NOTES: text appended to the description of rag_search (what the collection
+    # holds, what its codes mean); empty = nothing appended
+    rag_description_notes: str = ""
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -102,6 +194,22 @@ class Settings:
             companies_max_companies=_int(env, "MOF_COMPANIES_MAX_COMPANIES", 10, maximum=100),
             companies_max_concurrency=_int(env, "MOF_COMPANIES_MAX_CONCURRENCY", 2, maximum=16),
             companies_q4_rule=_get(env, "MOF_COMPANIES_Q4_RULE") or "ytd9",
+            rag_qdrant_host=_get(env, "MOF_RAG_QDRANT_HOST"),
+            rag_qdrant_port=_int(env, "MOF_RAG_QDRANT_PORT", 6333, maximum=65535),
+            rag_qdrant_api_key=_get(env, "MOF_RAG_QDRANT_API_KEY"),
+            rag_qdrant_https=_bool(env, "MOF_RAG_QDRANT_HTTPS", False),
+            rag_qdrant_timeout=_int(env, "MOF_RAG_QDRANT_TIMEOUT", 10, maximum=300),
+            rag_collection=_get(env, "MOF_RAG_COLLECTION"),
+            rag_model_cache=_get(env, "MOF_RAG_MODEL_CACHE"),
+            rag_onnx_threads=_optional_int(env, "MOF_RAG_ONNX_THREADS", maximum=256),
+            rag_default_limit=_int(env, "MOF_RAG_DEFAULT_LIMIT", 8),
+            rag_max_limit=_int(env, "MOF_RAG_MAX_LIMIT", 20, maximum=1000),
+            rag_codes_ttl_s=_int(env, "MOF_RAG_CODES_TTL_S", 300, maximum=86_400),
+            rag_codes_retry_s=_int(env, "MOF_RAG_CODES_RETRY_S", 5, maximum=3600),
+            rag_call_timeout_s=_int(env, "MOF_RAG_CALL_TIMEOUT_S", 15, maximum=3600),
+            rag_max_concurrency=_int(env, "MOF_RAG_MAX_CONCURRENCY", 4, maximum=64),
+            rag_check_retry_s=_int(env, "MOF_RAG_CHECK_RETRY_S", 5, maximum=3600),
+            rag_description_notes=_get(env, "MOF_RAG_DESCRIPTION_NOTES") or "",
         )
         if settings.companies_q4_rule not in Q4_RULES:
             raise ConfigError(f"MOF_COMPANIES_Q4_RULE must be one of {', '.join(Q4_RULES)}, "
@@ -109,6 +217,35 @@ class Settings:
         if bool(settings.companies_catalog) != bool(settings.companies_data_root):
             missing = "MOF_COMPANIES_DATA_ROOT" if settings.companies_catalog else "MOF_COMPANIES_CATALOG"
             raise ConfigError(f"{missing} is required with the other MOF_COMPANIES_* store variable")
+        if bool(settings.rag_qdrant_host) != bool(settings.rag_collection):
+            missing = "MOF_RAG_COLLECTION" if settings.rag_qdrant_host else "MOF_RAG_QDRANT_HOST"
+            raise ConfigError(f"{missing} is required with the other of MOF_RAG_QDRANT_HOST / MOF_RAG_COLLECTION")
+        if settings.rag_qdrant_host:
+            _check_rag_host(settings.rag_qdrant_host)
+            if _COLLECTION.fullmatch(settings.rag_collection) is None:
+                raise ConfigError("MOF_RAG_COLLECTION must be a collection name: 1-255 characters, "
+                                  "no '/' and no whitespace")
+            if not settings.rag_model_cache:
+                raise ConfigError(
+                    "MOF_RAG_MODEL_CACHE is required with MOF_RAG_QDRANT_HOST: the directory holding the "
+                    "embedding model files (about 1.1 GB, never a temporary directory)"
+                )
+            if not os.path.isabs(settings.rag_model_cache):
+                raise ConfigError("MOF_RAG_MODEL_CACHE must be an absolute path: a relative one would depend "
+                                  "on the directory the server is started from")
+        if settings.rag_call_timeout_s < settings.rag_qdrant_timeout:
+            raise ConfigError(
+                f"MOF_RAG_CALL_TIMEOUT_S ({settings.rag_call_timeout_s}) must not be below "
+                f"MOF_RAG_QDRANT_TIMEOUT ({settings.rag_qdrant_timeout}): a call must outlast one request to Qdrant"
+            )
+        if len(settings.rag_description_notes) > RAG_NOTES_MAX_CHARS:
+            raise ConfigError(f"MOF_RAG_DESCRIPTION_NOTES must hold at most {RAG_NOTES_MAX_CHARS} characters, "
+                              f"got {len(settings.rag_description_notes)}")
+        if settings.rag_default_limit > settings.rag_max_limit:
+            raise ConfigError(
+                f"MOF_RAG_DEFAULT_LIMIT ({settings.rag_default_limit}) must not exceed "
+                f"MOF_RAG_MAX_LIMIT ({settings.rag_max_limit})"
+            )
         if not settings.path.startswith("/"):
             raise ConfigError(f"MOF_MCP_PATH must start with '/', got {settings.path!r}")
         if settings.default_rows > settings.max_rows:

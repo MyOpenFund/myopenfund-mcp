@@ -17,6 +17,8 @@ companies = [
   "my-open-data[reader] @ git+https://github.com/MyOpenFund/my-open-data@3252e97dd6808290895cc4e117685388e6d4e354",
   "company-corpus @ git+https://github.com/MyOpenFund/company-corpus@06c619d7d216d230b92ea62394672f8dd443830f",
 ]
+# [onnx]: queries are embedded on the ONNX runtime (CPU), without PyTorch.
+rag = ["rag-engine[onnx] @ git+https://github.com/MyOpenFund/rag-engine@fbbe09b789828a67c28beadca1f2a95d611158a8"]
 dev = ["pytest>=8.3", "ruff>=0.6"]
 
 [project.scripts]
@@ -30,7 +32,7 @@ packages = ["src/myopenfund_mcp"]
 
 [tool.pytest.ini_options]
 markers = [
-  "integration: needs a real vault database (MOF_MCP_IT_DATABASE_URL) or a real company store (MOF_MCP_IT_COMPANIES_CATALOG + MOF_MCP_IT_COMPANIES_DATA_ROOT)",
+  "integration: needs a real vault database (MOF_MCP_IT_DATABASE_URL), a real company store (MOF_MCP_IT_COMPANIES_CATALOG + MOF_MCP_IT_COMPANIES_DATA_ROOT) or a throwaway Qdrant (MOF_MCP_IT_QDRANT_URL)",
   "llm: needs a local Ollama (MOF_MCP_IT_OLLAMA_URL)",
 ]
 addopts = "-m 'not integration and not llm'"
