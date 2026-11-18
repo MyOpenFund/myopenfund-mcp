@@ -1568,6 +1568,34 @@ def test_the_engine_log_filter_can_be_given_values_while_threads_log():
     assert log_filter.filter(reduced) and "host-299" not in reduced.getMessage()
 
 
+def test_without_any_handler_an_engine_warning_falls_back_to_the_last_resort(seeded, monkeypatch):
+    """As the standard library does for a record no handler takes: written to stderr by `logging.lastResort`
+    (WARNING and above), reduced like any other."""
+    store, fake = seeded
+    EngineRagBackend(_settings(), store=store, embedder=fake)
+    engine, root = logging.getLogger("rag_engine"), logging.getLogger()
+    relays = [h for h in engine.handlers if type(h).__name__ == "_EngineLogRelay"]
+
+    class Collect(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    last = Collect()
+    monkeypatch.setattr(logging, "lastResort", last)
+    monkeypatch.setattr(engine, "handlers", relays)  # what a deployment has: the relay only
+    monkeypatch.setattr(root, "handlers", [])  # and no handler on the root logger
+    monkeypatch.setattr(root, "level", logging.INFO)
+    logging.getLogger("rag_engine.store").warning("failed: %s", _response(502))
+    logging.getLogger("rag_engine.store").info("not for the last resort")
+    assert [r.getMessage() for r in last.records] == [
+        ("rag-engine logged a message about an error (UnexpectedResponse); its text is not logged: it may hold "
+         "the vector database's address, a response body or a credential hint")]
+
+
 async def test_a_filter_the_collection_refuses_for_a_missing_index_is_search_refused(seeded, monkeypatch, caplog):
     """rag-engine raises its own MissingIndexError for the HTTP 400 of a collection in strict mode."""
     store, fake = seeded

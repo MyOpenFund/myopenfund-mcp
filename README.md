@@ -516,6 +516,14 @@ Example call and result (text shortened):
   delay before the next try. Other engine lines (the collection and the filter in use) are written as
   they are. The error's text is dropped because it can hold the host, a TLS host name, a proxy's error
   page naming an upstream host or an internal address, or the engine's hint about its own key variable.
+  **What this changes in the process's logging** (for an operator who embeds the server or configures
+  logging): the `rag_engine` logger stops propagating and gets one handler that filters each record,
+  then hands it to the root logger's handlers, or to `logging.lastResort` (stderr, WARNING and above)
+  when there is none, as the standard library does. The change is process-wide and lasts as long as the
+  process. A later `logging.config.dictConfig` that names `rag_engine` replaces that handler, and the
+  engine's records are then written as the engine writes them: leave `rag_engine` out of such a
+  configuration, or build the rag toolset after it. The CLI configures logging before it builds the
+  toolsets.
   The HTTP libraries under the Qdrant client are apart: `httpx` logs one INFO line per request with
   the server's address, which is why the CLI raises its logger to WARNING, and `httpcore` logs the host
   and port of each connection at DEBUG only.

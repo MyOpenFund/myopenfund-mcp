@@ -224,7 +224,16 @@ class _EngineLogRelay(logging.Handler):
     """The first handler of the `rag_engine` logger, which no longer propagates: every record of the
     engine, from `rag_engine` or any `rag_engine.*` logger, existing or created later, goes through
     `ENGINE_LOG_FILTER` here, then on to the root logger's handlers, as it would have propagated (a
-    handler attached to both loggers, as pytest attaches its own, is left to get it from `rag_engine`)."""
+    handler attached to both loggers, as pytest attaches its own, is left to get it from `rag_engine`).
+    When no handler takes the record, `logging.lastResort` writes it (WARNING and above), as the
+    standard library does.
+
+    What `propagate = False` costs, accepted for the privacy it buys: the change is made on the process's
+    `rag_engine` logger and lasts as long as the process (another user of rag-engine in the same process
+    gets the filter too); handlers of loggers between `rag_engine` and the root are skipped (there are
+    none: the engine's loggers sit directly under the root); and a later `logging.config.dictConfig` that
+    names `rag_engine` replaces its handlers, the relay included, and so gives the records back unfiltered
+    (the filters put on the engine's existing loggers stay unless the configuration replaces those too)."""
 
     def __init__(self):
         super().__init__(level=logging.NOTSET)
@@ -232,9 +241,16 @@ class _EngineLogRelay(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         engine = logging.getLogger("rag_engine").handlers
+        found = sum(1 for handler in engine if handler is not self)
         for handler in logging.getLogger().handlers:
-            if handler not in engine and record.levelno >= handler.level:
-                handler.handle(record)
+            if handler not in engine:
+                found += 1
+                if record.levelno >= handler.level:
+                    handler.handle(record)
+        # No handler anywhere on the way: what the standard library does when a record finds none.
+        last = logging.lastResort
+        if not found and last is not None and record.levelno >= last.level:
+            last.handle(record)
 
 
 def install_engine_log_filter(host: str | None, key: str | None, collection: str | None = None) -> None:
