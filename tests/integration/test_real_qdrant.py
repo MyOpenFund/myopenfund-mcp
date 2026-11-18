@@ -118,7 +118,7 @@ async def test_rag_search_end_to_end(seeded):
                                    "date_from": "2022-06-15", "date_to": "2022-06-15", "include_undated": False}
         dated = (await c.call_tool("rag_search", {"query": "rates", "date_from": "1900-01-01"})).data
         assert "gb/B1/undated" not in {h["doc_id"] for h in dated["hits"]} and dated["count"] == CHUNKS - 1
-        undated = (await c.call_tool("rag_search", {"query": "rates", "source_codes": ["gb"]})).data
+        undated = (await c.call_tool("rag_search", {"query": "rates", "doc_types": ["B1"]})).data
         assert [(h["date"], h["citation"]) for h in undated["hits"]] == [(None, "gb/B1/undated (gb B1), p. 3")]
 
         # The valid values are the collection's own (facet API on the keyword indexes).
@@ -150,12 +150,12 @@ async def test_the_values_are_read_by_a_scroll_when_the_collection_has_no_keywor
             writer.client.delete_payload_index(collection, field)
         async with _client(collection, embedder()) as c:
             # The scroll runs in the background from the start: a search never waits for it.
-            assert (await c.call_tool("rag_search", {"query": "rates", "doc_types": ["E1"]})).data["count"] == 1
+            assert (await c.call_tool("rag_search", {"query": "rates", "doc_types": ["B1"]})).data["count"] == 1
             info = await _rag_info(c, until=lambda info: info["source_codes"] is not None)
             assert (info["source_codes"], info["doc_types"]) == (SOURCE_CODES, DOC_TYPES)
             assert (await _error(c, {"query": "rates", "source_codes": ["ECB"]})).endswith(
                 "valid values: " + _quoted(SOURCE_CODES))
-            assert (await c.call_tool("rag_search", {"query": "rates", "doc_types": ["E1"]})).data["count"] == 1
+            assert (await c.call_tool("rag_search", {"query": "rates", "doc_types": ["B1"]})).data["count"] == 1
     finally:
         writer.client.delete_collection(collection)
 
@@ -232,8 +232,145 @@ async def test_a_filter_the_collection_cannot_serve_is_the_error_of_that_search_
                     "one: the collection, as it is indexed, cannot serve it (most often a filter on a field "
                     "without a payload index); retry with fewer filters, without date_from and date_to first")
                 assert (await c.call_tool("rag_search", {"query": "rates"})).data["count"] == CHUNKS
-                assert (await c.call_tool("rag_search", {"query": "rates", "source_codes": ["ecb"]})).data["count"] == 2
+                assert (await c.call_tool("rag_search", {"query": "rates", "source_codes": ["ecb"]})).data["count"] == 3
                 assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+    finally:
+        writer.client.delete_collection(collection)
+
+
+# -- date bounds on a collection written before the intervals, then upgraded under a running server ------
+
+DATE_KEYS = ["date_start", "date_end", "date_precision", "date_kind"]
+# Ranges around the fixture's dates: a day, the month of the month document (mid-month, its ends), the year
+# of the year document, wide ranges, one bound only.
+RANGES = [("2016-07-14", "2016-07-14"), ("2016-07-01", "2016-07-01"), ("2016-07-31", "2016-08-15"),
+          ("2016-06-01", "2016-06-30"), ("2015-06-01", "2015-06-30"), ("2015-01-01", "2015-01-01"),
+          ("2014-12-31", "2015-01-31"), ("2022-06-15", "2022-07-21"), ("2022-07-21", "2022-07-21"),
+          ("1900-01-01", "2100-12-31"), ("2016-07-02", None), (None, "2016-06-30"), (None, "2015-01-01")]
+
+
+def _legacy(writer, collection: str):
+    """The fixture as a collection written before the intervals: no `date_start` / `date_end` index, and
+    payloads without the interval, the precision and the kind (schema version 1, as in production)."""
+    from qdrant_client import models
+    from rag_fixture import seed
+
+    fake = seed(writer, collection)
+    for field in ("date_start", "date_end"):
+        writer.client.delete_payload_index(collection, field, wait=True)
+    writer.client.delete_payload(collection, keys=DATE_KEYS, points=models.FilterSelector(filter=models.Filter()),
+                                 wait=True)
+    return fake
+
+
+def _upgrade(writer, collection: str) -> None:
+    """What the orchestrator's sync-metadata does, with rag-engine's own calls: the two indexes, then for
+    each document its date fields (interval included) and its kind."""
+    from rag_engine.schema import date_fields
+    from rag_fixture import DOCUMENTS
+
+    assert sorted(writer.ensure_payload_indexes(collection)) == ["date_end", "date_start"]
+    for doc_id, metadata, _ in DOCUMENTS:
+        fields = date_fields(metadata.get("date"), metadata.get("date_precision"))
+        writer.set_payload(collection, doc_id, {**fields, "date_kind": metadata.get("date_kind")})
+
+
+def _oracle(date_from: str | None, date_to: str | None, *, intervals: bool, undated: bool = False) -> set[str]:
+    """The documents a bound keeps: the stored day (legacy), or the period overlapping the range (intervals)."""
+    import datetime as dt
+
+    from rag_engine.schema import date_interval
+    from rag_fixture import DOCUMENTS
+
+    low = dt.date.fromisoformat(date_from) if date_from else dt.date.min
+    high = dt.date.fromisoformat(date_to) if date_to else dt.date.max
+    kept = set()
+    for doc_id, metadata, _ in DOCUMENTS:
+        date = metadata.get("date")
+        if not date:
+            if undated:
+                kept.add(doc_id)
+            continue
+        start, end = date_interval(date, metadata.get("date_precision") if intervals else "day")
+        if dt.date.fromisoformat(start[:10]) <= high and dt.date.fromisoformat(end[:10]) >= low:
+            kept.add(doc_id)
+    return kept
+
+
+async def _found(c, date_from, date_to, **extra) -> tuple[set[str], list[dict]]:
+    arguments = {"query": "rates", "limit": 20, **extra}
+    arguments.update({k: v for k, v in (("date_from", date_from), ("date_to", date_to)) if v})
+    hits = (await c.call_tool("rag_search", arguments)).data["hits"]
+    return {h["doc_id"] for h in hits}, hits
+
+
+async def test_a_legacy_collection_is_served_as_before_and_its_upgrade_is_followed_without_a_restart(writer):
+    """With the READ-ONLY key (when the Qdrant has keys) and MOF_RAG_DATE_FILTER_REFRESH=1: before the
+    upgrade, `auto` gives exactly the `legacy` answers, and the hits carry null precision and kind; once the
+    writer has created the two indexes and given each document its interval, a month document is found by
+    a mid-month range by the same running server, within the refresh delay."""
+    import time
+
+    collection = f"mof-mcp-it-{uuid.uuid4().hex[:12]}"
+    try:
+        fake = _legacy(writer, collection)
+        async with _client(collection, fake, rag_date_filter_refresh=1) as auto, \
+                _client(collection, fake, rag_date_filter_mode="legacy") as legacy:
+            for date_from, date_to in RANGES:
+                for undated in (False, True):
+                    extra = {"include_undated": True} if undated else {}
+                    found, hits = await _found(auto, date_from, date_to, **extra)
+                    assert found == (await _found(legacy, date_from, date_to, **extra))[0]
+                    assert found == _oracle(date_from, date_to, intervals=False, undated=undated), (date_from, date_to)
+                    assert all(h["date_precision"] is None and h["date_kind"] is None for h in hits)
+            _, hits = await _found(auto, "2016-07-01", "2016-07-01")
+            assert [h["citation"] for h in hits] == ["Monetary Policy Summary (gb A3, 2016-07-01), p. 2"]
+
+            _upgrade(writer, collection)  # the server is not restarted
+            upgraded_at, deadline = time.monotonic(), time.monotonic() + 10
+            while (await _found(auto, "2016-07-14", "2016-07-14"))[0] != {"gb/A3/2016-07"}:
+                assert time.monotonic() < deadline, "the upgrade was not followed"
+                await asyncio.sleep(0.2)
+            assert time.monotonic() - upgraded_at < 3  # within the refresh delay (1 s), give or take a search
+            _, hits = await _found(auto, "2016-07-14", "2016-07-14")
+            assert [(h["date"], h["date_precision"], h["date_kind"], h["citation"]) for h in hits] == [
+                ("2016-07-01", "month", "meeting", "Monetary Policy Summary (gb A3, July 2016), p. 2")]
+            for date_from, date_to in RANGES:
+                for undated in (False, True):
+                    extra = {"include_undated": True} if undated else {}
+                    assert (await _found(auto, date_from, date_to, **extra))[0] == _oracle(
+                        date_from, date_to, intervals=True, undated=undated), (date_from, date_to, undated)
+                    # The legacy filter, on the upgraded collection, still finds what it found before.
+                    assert (await _found(legacy, date_from, date_to, **extra))[0] == _oracle(
+                        date_from, date_to, intervals=False, undated=undated), (date_from, date_to, undated)
+            data = (await auto.call_tool("rag_search", {"query": "rates", "date_from": "2015-06-01",
+                                                        "date_to": "2015-06-30", "include_undated": True})).data
+            assert {(h["doc_id"], h["citation"]) for h in data["hits"]} == {
+                ("ecb/E1/2015", "Staff projections (ecb E1, 2015)"), ("gb/B1/undated", "gb/B1/undated (gb B1), p. 3")}
+            assert data["filters"]["include_undated"] is True
+            assert (await auto.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+    finally:
+        writer.client.delete_collection(collection)
+
+
+async def test_interval_mode_on_a_strict_collection_without_the_indexes_is_search_refused(writer):
+    """rag-engine raises its own MissingIndexError for that refusal: the toolset answers search_refused,
+    and serves the other searches."""
+    from qdrant_client import models
+    from rag_fixture import CHUNKS
+
+    collection = f"mof-mcp-it-{uuid.uuid4().hex[:12]}"
+    try:
+        fake = _legacy(writer, collection)
+        writer.client.update_collection(collection, strict_mode_config=models.StrictModeConfig(
+            enabled=True, unindexed_filtering_retrieve=False))
+        async with _client(collection, fake, rag_date_filter_mode="interval", rag_check_retry_s=3600) as c:
+            assert (await _error(c, {"query": "rates", "date_from": "2016-01-01"})).startswith(
+                "[rag_unavailable] search_refused: ")
+            assert (await c.call_tool("rag_search", {"query": "rates"})).data["count"] == CHUNKS
+            assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+        async with _client(collection, fake) as c:  # auto: the indexes are not there, the `date` filter is used
+            assert (await _found(c, "2016-07-01", "2016-07-01"))[0] == {"gb/A3/2016-07"}
     finally:
         writer.client.delete_collection(collection)
 
