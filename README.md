@@ -429,7 +429,9 @@ Example call and result (text shortened):
     few milliseconds and the call is served; a search that succeeds meanwhile cancels the check.
     When the check passes and the search that follows fails again before any search is served (Qdrant
     answers the check and no search), that failure is remembered like a failed check: one call per
-    retry period pays for a request timeout, the others are answered at once.
+    retry period pays for a request timeout, the others are answered at once (the calls that arrive
+    while that one search is still waiting pay for it too: under steady traffic, more than one). A
+    search that is served clears that memory at once.
   - **A failed collection check** (at start, or the one that follows a failed search) is remembered
     `MOF_RAG_CHECK_RETRY_S` seconds (5): the calls made meanwhile get its reason **at once**, without a
     request, and so do the calls that arrive while a check is running. Then one call checks again. So

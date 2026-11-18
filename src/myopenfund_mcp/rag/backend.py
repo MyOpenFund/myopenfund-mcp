@@ -320,8 +320,11 @@ class EngineRagBackend:
     def _served(self) -> None:
         """A search succeeded: Qdrant answers, whatever a search that failed meanwhile recorded."""
         with self._lock:
-            if self._collection_reason is None:
+            if self._collection_reason is None or self._from_search:
+                # A failure remembered from a search (not from a check) is disproved the same way.
+                self._collection_reason = self._failed_at = None
                 self._suspected = self._logged = self._passed_at = None
+                self._from_search = False
 
     def _require_collection(self) -> None:
         """Return when searches are served; `_Outage` otherwise.

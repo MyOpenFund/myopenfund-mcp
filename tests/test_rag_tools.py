@@ -789,6 +789,34 @@ async def test_searches_that_fail_while_the_check_passes_are_remembered_like_a_f
     assert len(warnings) == 2, warnings  # once for the outage, once after the recovery: not once per call
 
 
+def test_a_search_served_disproves_a_failure_remembered_from_a_search(seeded, monkeypatch):
+    """Two slow requests of a healthy Qdrant time out around a check that passes: the second is
+    remembered like a failed check, and the search that is served just after clears it for everyone."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(rag_check_retry_s=3600), store=healthy, embedder=fake)
+    backend.start()
+    _failing_for(monkeypatch, {"heavy": _timed_out()})
+    call = {"filters": {}, "limit": 3, "max_limit": 20}
+    with pytest.raises(ToolError):
+        backend.search(query="heavy", **call)  # suspected
+    backend._require_collection()  # a third caller's check passes; its search is still running
+    with pytest.raises(ToolError):
+        backend.search(query="heavy", **call)  # the second slow request: remembered
+    assert backend._collection_reason == "qdrant_unreachable" and backend.info()["status"] == "unavailable"
+    backend._served()  # the third caller's search ends well
+    assert backend._collection_reason is None and backend.info()["status"] == "ready"
+    assert backend.search(query="light", **call)[1]
+    # A failure remembered from a CHECK is not cleared by a late search: only a check that passes does.
+    healthy.failure = CollectionNotFoundError("gone")
+    with pytest.raises(ToolError):
+        backend.search(query="heavy", **call)
+    with pytest.raises(ToolError):
+        backend.search(query="light", **call)  # the check fails
+    backend._served()
+    assert backend._collection_reason == "collection_missing"
+
+
 async def test_after_an_outage_the_collection_is_checked_again_and_the_toolset_recovers(seeded, monkeypatch, clock):
     store, fake = seeded
     down = _Store(store, store.client)
