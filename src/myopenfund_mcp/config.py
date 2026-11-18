@@ -41,7 +41,8 @@ def _int(
         return default
     # ASCII digits only: int() would also take "+5", "1_000" or non-ASCII digits.
     if re.fullmatch(r"[0-9]+", raw) is None:
-        raise ConfigError(f"{name} must be an integer, got {raw!r}")
+        allowed = f"from {minimum} to {maximum}" if maximum is not None else f">= {minimum}"
+        raise ConfigError(f"{name} must be an integer {allowed}, got {raw!r}")
     value = int(raw)
     if value < minimum:
         raise ConfigError(f"{name} must be >= {minimum}, got {value}")
