@@ -25,7 +25,7 @@ MAX_ARG_CHARS = 200  # doc_id, text and cursor: longer strings are refused by sc
 _REFUSED = "a value outside [1, server maximum] is refused, not clamped"
 LIMIT_DESCRIPTION = f"Rows per page; omitted = server default; {_REFUSED}"
 STATS_LIMIT_DESCRIPTION = f"The maximum number of groups returned; omitted = server default; {_REFUSED}"
-RUNS_LIMIT_DESCRIPTION = (f"Applies to each list (runs, source_runs, open_discovery_errors); "
+RUNS_LIMIT_DESCRIPTION = (f"Applies to each list (runs, source_runs, open_discovery_errors, source_health); "
                           f"omitted = server default; {_REFUSED}")
 CORPUS_DESCRIPTION = "e.g. 'central-bank'"
 SOURCE_CODE_DESCRIPTION = "Publisher code, e.g. 'us' (Fed), 'fr'"
@@ -47,8 +47,26 @@ RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first:
 - `open_discovery_errors`: unresolved discovery failures, most recently seen first. While an error's
   `seen_at_is_ingestion_time` is true, its `last_seen_at` is approximate (the time it was ingested,
   not the time it was last observed).
-- `source_health`: expected-vs-observed publication cadence per series.
-`limit` applies to each of `runs`, `source_runs` and `open_discovery_errors`."""
+- `source_health`: expected-vs-observed publication cadence per series, the least healthy first:
+  `cadence_status` overdue, then soon, then the rest; within each, most `days_late` first (unknown
+  last). `source_health_total` counts every series matching corpus/source_code, so a smaller list
+  means `limit` left some out.
+`limit` applies to each of `runs`, `source_runs`, `open_discovery_errors` and `source_health`.
+A result over the server's size cap is refused, never cut: ask for a smaller `limit`, or filter by
+`source_code`."""
+# Rank of a `source_health.cadence_status` in the list (lower first); any other value, NULL included,
+# ranks after these.
+HEALTH_STATUS_RANK = {"overdue": 0, "soon": 1}
+
+
+def _least_healthy_first(rows: list[dict]) -> list[dict]:
+    """`source_health` rows ordered as RUNS_STATUS_DESCRIPTION says; a stable sort, so ties keep the
+    view's own order (corpus, source_code, doc_type)."""
+    def key(row: dict) -> tuple:
+        days_late = row.get("days_late")
+        return (HEALTH_STATUS_RANK.get(row.get("cadence_status"), len(HEALTH_STATUS_RANK)),
+                days_late is None, -(days_late or 0))
+    return sorted(rows, key=key)
 
 
 async def _call(fn, /, **kwargs):
@@ -145,9 +163,13 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
                                   max_text_chars=settings.max_text_chars)
         errors = await _call(reader.open_discovery_errors, corpus=corpus, source_code=source_code,
                              limit=page, max_text_chars=settings.max_text_chars)
+        # The pinned vault-query has no limit on source_health: the view is small (one row per series),
+        # so it is read whole, ordered here and cut to `limit`, with its total.
         health = await _call(reader.source_health, corpus=corpus, source_code=source_code)
         return cap_result({"runs": runs, "source_runs": source_runs, "open_discovery_errors": errors,
-                           "source_health": health}, settings)
+                           "source_health": _least_healthy_first(health)[:page],
+                           "source_health_total": len(health)},
+                          settings, hint="ask for a smaller limit, or filter by source_code")
 
     return vault
 

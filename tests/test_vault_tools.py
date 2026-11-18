@@ -4,7 +4,7 @@ import logging
 import sys
 
 import pytest
-from fakes import DOCS, FakeVaultReader, invalid_query_reader
+from fakes import DOCS, MANY_HEALTH, FakeVaultReader, health_row, invalid_query_reader
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
@@ -36,6 +36,7 @@ async def test_descriptions_carry_the_caveats():
     runs = tools["vault_runs_status"].description
     assert "seen_at_is_ingestion_time" in runs and "last_seen_at" in runs and "approximat" in runs
     assert "`runs`" in runs and "source_runs" in runs
+    assert "`source_health`" in runs.split("`limit`", 1)[1] and "overdue" in runs
     search = tools["vault_search_documents"].description
     assert "doc_id" in search and "reverse" not in search.lower()
 
@@ -145,7 +146,48 @@ async def test_runs_status_values_are_json_safe():
     async with _client() as c:
         data = (await c.call_tool("vault_runs_status", {"since": "2026-09-01T00:00:00Z"})).data
     health = data["source_health"][0]
-    assert health["expected_every_days"] == 45.5 and health["observed_every_days"] is None
+    assert health["expected_interval_days"] == 45.5 and health["source_docs_new_median_per_run_90d"] is None
+
+
+async def test_runs_status_limit_bounds_source_health_too():
+    """79 series (the production vault's size): at limit=1 the result was 66,000 characters."""
+    reader = FakeVaultReader(health=MANY_HEALTH)
+    async with _client(reader) as c:
+        result = await c.call_tool("vault_runs_status", {"limit": 1})
+    data = result.data
+    assert len(data["source_health"]) == 1
+    assert data["source_health_total"] == 79
+    assert len(result.content[0].text) < 5_000
+
+
+async def test_runs_status_keeps_the_unhealthy_series_first():
+    rows = [health_row("a"), health_row("b", cadence_status=None, days_late=None),
+            health_row("c", cadence_status="soon"), health_row("d", cadence_status="overdue", days_late=5),
+            health_row("e", cadence_status="overdue", days_late=None),
+            health_row("f", cadence_status="overdue", days_late=40), health_row("g", cadence_status="soon"),
+            health_row("h", cadence_status="overdue", days_late=40)]
+    async with _client(FakeVaultReader(health=rows)) as c:
+        top = (await c.call_tool("vault_runs_status", {"limit": 3})).data
+        every = (await c.call_tool("vault_runs_status", {"limit": 200})).data
+    # overdue (most days late first, NULL last), then soon, then the rest; ties keep the view's order.
+    assert [h["source_code"] for h in every["source_health"]] == ["f", "h", "d", "e", "c", "g", "a", "b"]
+    assert [h["source_code"] for h in top["source_health"]] == ["f", "h", "d"]
+    assert top["source_health_total"] == every["source_health_total"] == 8
+
+
+async def test_runs_status_small_health_is_unchanged():
+    async with _client() as c:
+        data = (await c.call_tool("vault_runs_status", {})).data
+    assert [h["source_code"] for h in data["source_health"]] == ["us"]
+    assert data["source_health_total"] == 1
+
+
+async def test_runs_status_too_large_is_refused_not_cut():
+    async with _client(FakeVaultReader(health=MANY_HEALTH), max_result_chars=5_000) as c:
+        with pytest.raises(ToolError, match=r"^\[result_too_large\] .*smaller limit"):
+            await c.call_tool("vault_runs_status", {"limit": 50})
+        data = (await c.call_tool("vault_runs_status", {"limit": 2})).data
+    assert len(data["source_health"]) == 2
 
 
 async def test_server_info_reports_toolsets_tier_and_freshness():
@@ -257,6 +299,7 @@ async def test_parameter_descriptions_are_present():
     assert stats["group_by"].get("description")
     runs = tools["vault_runs_status"].input_schema["properties"]
     assert "each" in runs["limit"]["description"] and "refused" in runs["limit"]["description"]
+    assert "source_health" in runs["limit"]["description"]
     assert runs["corpus"]["description"] == search["corpus"]["description"]
     assert runs["source_code"]["description"] == search["source_code"]["description"]
 

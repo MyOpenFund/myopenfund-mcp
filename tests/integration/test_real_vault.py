@@ -47,9 +47,10 @@ async def test_real_vault_read_path():
         assert stats["groups"] and all(g["count"] > 0 for g in stats["groups"])
 
         runs = (await c.call_tool("vault_runs_status", {"limit": 5})).data
-        assert set(runs) == {"runs", "source_runs", "open_discovery_errors", "source_health"}
-        assert all(isinstance(v, list) for v in runs.values())
-        assert all(len(runs[k]) <= 5 for k in ("runs", "source_runs", "open_discovery_errors"))
+        lists = ("runs", "source_runs", "open_discovery_errors", "source_health")
+        assert set(runs) == {*lists, "source_health_total"}
+        assert all(isinstance(runs[k], list) and len(runs[k]) <= 5 for k in lists)
+        assert runs["source_health_total"] >= len(runs["source_health"])
 
 
 
