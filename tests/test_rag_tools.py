@@ -1535,6 +1535,39 @@ def test_the_host_and_the_key_are_matched_as_whole_tokens_never_the_collection(s
     assert len(messages) == 9
 
 
+def test_the_engine_log_filter_can_be_given_values_while_threads_log():
+    """Backends built (protect) while eight threads log through the filter: no record fails."""
+    log_filter, failures, stop = backend_module.EngineLogFilter(), [], threading.Event()
+
+    def logging_thread():
+        while not stop.is_set():
+            record = logging.LogRecord("rag_engine.store", logging.INFO, __file__, 1, "collection %r is ready",
+                                       ("c1",), None)
+            try:
+                log_filter.filter(record)
+            except Exception as exc:  # noqa: BLE001 -- what the test looks for
+                failures.append(exc)
+                return
+
+    threads = [threading.Thread(target=logging_thread) for _ in range(8)]
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # threads switch as often as they can: the window of a race is hit
+    for thread in threads:
+        thread.start()
+    try:
+        for n in range(300):
+            log_filter.protect(f"host-{n}", f"key-{n}", f"collection-{n}")
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(10)
+        sys.setswitchinterval(interval)
+    assert failures == []
+    reduced = logging.LogRecord("rag_engine.store", logging.WARNING, __file__, 1, "no answer from host-299:6333",
+                                None, None)
+    assert log_filter.filter(reduced) and "host-299" not in reduced.getMessage()
+
+
 async def test_a_filter_the_collection_refuses_for_a_missing_index_is_search_refused(seeded, monkeypatch, caplog):
     """rag-engine raises its own MissingIndexError for the HTTP 400 of a collection in strict mode."""
     store, fake = seeded

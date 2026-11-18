@@ -160,26 +160,35 @@ class EngineLogFilter(logging.Filter):
 
     def __init__(self):
         super().__init__()
-        self._secrets: set[str] = set()
-        self._collections: set[str] = set()
+        self._protecting = threading.Lock()  # one change at a time
+        # (protected values, collections, the pattern of the values): replaced whole, never changed, so
+        # a thread that logs reads one consistent state without a lock while another backend is built.
+        self._state: tuple[frozenset[str], frozenset[str], re.Pattern | None] = (frozenset(), frozenset(), None)
 
     def protect(self, host: str | None, key: str | None, collection: str | None = None) -> None:
         """The configured host and API key must never be written; the collection is not sensitive."""
-        self._secrets.update(value for value in (host, key) if value)
-        if collection:
-            self._collections.add(collection)
+        with self._protecting:
+            secrets, collections, _ = self._state
+            secrets = secrets | {value for value in (host, key) if value}
+            collections = collections | ({collection} if collection else set())
+            # Not inside a longer name: no name character before, none after (a dot ending a sentence is
+            # no part of a name, a dot followed by a name character is). Longest first.
+            alternatives = "|".join(re.escape(value) for value in sorted(secrets, key=len, reverse=True))
+            pattern = (re.compile(rf"(?<![A-Za-z0-9._-])(?:{alternatives})(?::[0-9]+)?(?![A-Za-z0-9_-]|\.[A-Za-z0-9])")
+                       if secrets else None)
+            self._state = (frozenset(secrets), frozenset(collections), pattern)
 
     def _sensitive(self, text: str) -> bool:
         """Whether `text` holds a protected value as a whole token: the host (with or without `:port`) or
         the key, bounded by characters a host name or a key cannot hold. `qdrant` is found in
         `http://qdrant:6333/`, not in `qdrant-docs` nor in `qdrant.example.org`. A configured collection
         written as the engine writes it, quoted (`'qdrant'`), is taken out first."""
-        for collection in self._collections:
+        _, collections, pattern = self._state
+        if pattern is None:
+            return False
+        for collection in collections:
             text = text.replace(repr(collection), "")
-        # Not inside a longer name: no name character before, none after (a dot ending a sentence is no
-        # part of a name, a dot followed by a name character is).
-        return any(re.search(rf"(?<![A-Za-z0-9._-]){re.escape(secret)}(?::[0-9]+)?(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
-                             text) for secret in self._secrets)
+        return pattern.search(text) is not None
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args if isinstance(record.args, tuple) else ()
