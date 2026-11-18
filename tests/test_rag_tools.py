@@ -1848,7 +1848,9 @@ def test_the_readme_documents_the_codes_every_reason_and_every_argument():
     for needle in ("`rag_unavailable`", "`limit_exceeded`", "`rag_search`", *(f"`{r}`" for r in backend_module.REASONS),
                    "`source_codes`", "`doc_types`", "`languages`", "`date_from`, `date_to`", "`limit`", "`citation`",
                    "the first page is 1", "`ORT_DISABLE_TELEMETRY`", "`HF_HUB_OFFLINE=1`", "`mem_limit: 3g`",
-                   "no outbound connection", "MOF_RAG_DESCRIPTION_NOTES="):
+                   "no outbound connection", "MOF_RAG_DESCRIPTION_NOTES=", "`include_undated`",
+                   "`date_precision`", "`date_kind`", "`July 2016`", "`sync-metadata`", "`date_start`",
+                   "`date_end`", "#### Dates in `rag_search`", "No new volume"):
         assert needle in readme, needle
 
 

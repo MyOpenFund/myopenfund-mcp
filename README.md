@@ -205,6 +205,13 @@ into a volume at each start of the stack.
    filtered search reads every point (about 0.15 s on 34,000 points), and the valid filter values are
    read by one scroll of the collection, in the background (up to 100,000 points; beyond that, filter
    values are no longer checked).
+
+   At this commit the engine also creates the datetime indexes on `date_start` and `date_end` (payload
+   schema version 2). Once they exist, `auto` mode applies date bounds to the intervals (within
+   `MOF_RAG_DATE_FILTER_REFRESH` seconds, without a restart of the MCP). That is safe before the payloads
+   carry their intervals (a point without one is still found by its `date`), but a month or a year
+   document is found by its whole period only once the orchestrator's `sync-metadata` has written the
+   intervals; `sync-metadata` creates the two indexes itself (see [Dates](#dates-in-rag_search)).
 3. **The `[rag]` extra in the install line.** With the built image: `MOF_EXTRAS=vault,rag` as a build
    argument (`compose.example.yaml`). Without a built image: `'myopenfund-mcp[vault,rag] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'`
    in the `install` service. From a checkout: `pip install ".[vault,rag]"`. No PyTorch is installed: queries
@@ -252,12 +259,17 @@ into a volume at each start of the stack.
    `MOF_RAG_QDRANT_PORT`, `MOF_RAG_QDRANT_API_KEY` (the read-only key of step 1), `MOF_RAG_COLLECTION`,
    `MOF_RAG_MODEL_CACHE=/models`; `MOF_RAG_QDRANT_HTTPS=true` when Qdrant is behind TLS; optionally
    `MOF_RAG_DESCRIPTION_NOTES` (see [Passage search](#passage-search-rag)). The others have defaults
-   ([Configuration and limits](#configuration-and-limits)).
+   ([Configuration and limits](#configuration-and-limits)); the date settings
+   (`MOF_RAG_DATE_FILTER_MODE=auto`, `MOF_RAG_DATE_FILTER_REFRESH=300`, `MOF_RAG_DATE_FILTER_RETRY=30`) need
+   no value of their own.
 7. **Restart and check.**
    - `GET /health` answers `200` within the start period.
    - The log holds, in this order, `rag: embedding model intfloat/multilingual-e5-base ready in ... s`,
      `rag: collection <collection> checked, searches are served` and `rag: filter values read from the
-     collection (source_codes: ..., doc_types: ..., languages: ...)`. It holds **no** line with the word
+     collection (source_codes: ..., doc_types: ..., languages: ...)`, then (logger `rag_engine.store`)
+     `Qdrant collection '<collection>' has no datetime index on both date_start and date_end: date filters
+     in auto mode use the date field (legacy)` (before `sync-metadata`) or `... has datetime indexes on
+     date_start and date_end: date filters in auto mode use the intervals` (after). It holds **no** line with the word
      `Downloading`: the running service never downloads. An error line naming `MOF_RAG_MODEL_CACHE` means
      the cache is incomplete, unreadable or not the pinned model.
    - `server_info`: `toolsets.rag` is `enabled`, `rag.status` is `ready`, and `rag.source_codes` /
@@ -267,9 +279,20 @@ into a volume at each start of the stack.
      "source_codes": ["<a code of rag.source_codes>"]}`: passages come back.
    - `rag_search` with the same code in the wrong case: the answer is `[invalid_argument] source_codes:
      unknown value "..." (did you mean "..."? values are matched exactly); valid values: ...`.
+   - `rag_search` with a date bound, e.g. `{"query": "inflation outlook", "date_from": "2016-07-14",
+     "date_to": "2016-07-14", "include_undated": false}`: passages come back (or none, for a day nothing is
+     dated to), `filters.include_undated` is `false`, and each hit has `date_precision` and `date_kind`
+     (`null` until `sync-metadata` has run).
 8. **Never run this repository's integration tests against a production Qdrant.**
    `tests/integration/test_real_qdrant.py` creates and deletes collections: it is for a throwaway Qdrant
    only (see [Development](#development)).
+
+**Redeploying a new version** (such as the one that raised the rag-engine pin to `6be21ac` and added the date
+settings): the same steps, from step 3. Rebuild the image, or point the `install` service at the new
+`<commit>`; restart; check as in step 7. No new volume, no new variable to set (the date settings have
+defaults), and the model cache is kept: the pinned model revision did not change. Step 2 is not needed
+again for the server: the indexes the new version uses are created by the orchestrator's `sync-metadata`,
+and until they exist date bounds behave as before.
 
 ### Outbound connections of the rag toolset
 
@@ -328,16 +351,19 @@ the client's model reads the passages and cites them. Read tier.
 | `source_codes` | JSON array of source codes, exact (case matters). The valid ones: `server_info`, `rag.source_codes`. |
 | `doc_types` | JSON array of document-type codes, exact. The valid ones: `server_info`, `rag.doc_types`. |
 | `languages` | JSON array of language codes as stored, e.g. `["en"]`. The valid ones: `server_info`, `rag.languages`. |
-| `date_from`, `date_to` | Publication date bounds, `YYYY-MM-DD`, both inclusive. As soon as one is set, a document without a full date (no date, or only a year or a month) is left out, whatever the bounds. |
+| `date_from`, `date_to` | Date bounds, `YYYY-MM-DD`, both inclusive. A document known only to the month or the year matches any range overlapping its period (see [Dates](#dates-in-rag_search) for when). As soon as one bound is set, a document without a date is left out, unless `include_undated` is true. |
+| `include_undated` | JSON boolean, default `false`. `true`: with a date bound, also keep the documents without a date (the dated ones outside the range stay out). Without a date bound it changes nothing and is accepted. A string (`"true"`) or a number is refused. |
 | `limit` | Number of passages; default `MOF_RAG_DEFAULT_LIMIT` (8), at most `MOF_RAG_MAX_LIMIT` (20). |
 
 The values of one array are alternatives (OR), the arguments combine (AND). An omitted argument does not
 restrict; an empty array is refused.
 
 **What the client's model is told.** The tool description states how to call the tool, the default and
-the maximum `limit` of this deployment, and that a date bound leaves out every document without a full
-date (undated, or dated by year or month only: a date range that returns nothing or too little is to be
-retried without dates). It is **corpus-neutral**: it names no source
+the maximum `limit` of this deployment, what a date bound does (with a bound, a document known only to the
+month or the year matches any range overlapping its period, and documents without a date are left out
+unless `include_undated` is true; with `MOF_RAG_DATE_FILTER_MODE=legacy` it says instead that such a
+document is found only at the first day of its period), and the hit fields, `date_precision` and
+`date_kind` included. It stays under 1800 characters before the notes. It is **corpus-neutral**: it names no source
 and gives no meaning to any code, because such facts go stale when the collection changes. The codes
 themselves are read from the collection (`server_info`, and every refusal lists them). What they mean is
 the deployment's to say, in `MOF_RAG_DESCRIPTION_NOTES`: one line of text (at most 1500 characters),
@@ -357,7 +383,7 @@ Example call and result (text shortened):
 ```json
 {
   "query": "Why did the ECB raise interest rates in July 2022?",
-  "filters": {"source_codes": ["ecb"], "doc_types": null, "languages": null, "date_from": "2022-07-01", "date_to": null},
+  "filters": {"source_codes": ["ecb"], "doc_types": null, "languages": null, "date_from": "2022-07-01", "date_to": null, "include_undated": false},
   "count": 1,
   "hits": [
     {
@@ -367,6 +393,8 @@ Example call and result (text shortened):
       "doc_id": "ecb/A1/2022-07-21",
       "title": "Monetary policy decisions",
       "date": "2022-07-21",
+      "date_precision": "day",
+      "date_kind": "meeting",
       "source_code": "ecb",
       "doc_type": "A1",
       "language": "en",
@@ -379,17 +407,26 @@ Example call and result (text shortened):
 ```
 
 - **Hits.** `score` is the cosine between the query and the passage (4 decimals; higher is closer). Several
-  hits may come from one document; nothing is grouped. `filters` echoes the filters as applied. The point id
-  and the rest of the stored payload are not returned.
+  hits may come from one document; nothing is grouped. `filters` echoes the filters as applied,
+  `include_undated` included. The point id and the rest of the stored payload are not returned.
+- **Date fields.** `date` is the stored date, `YYYY-MM-DD`. `date_precision` says how much of it is known:
+  `day`, `month` or `year` (a month or a year is stored as the first day of its period: `2016-07-01` with
+  `month` is July 2016), or `null` when unknown. `date_kind` says what the date marks, as the producer
+  labels it (`meeting`, `publication`, `period`), or `null`. Both are read from the stored payload as they
+  are: **`null` is normal** for a collection whose payloads do not carry them yet (the production
+  collection until the orchestrator's `sync-metadata` has run), and an unknown precision is read as a day.
 - **Pages.** `page` is the page the passage starts on **as a reader counts it: the first page is 1** (the
   collection stores pages from 0; the server adds one). It is `null` for a document without pages, and the
   `citation` then has no page part. `citation` is `<title> (<source_code> <doc_type>, <date>), p. <page>`,
-  each missing part left out (the `doc_id` stands for a missing title).
+  each missing part left out (the `doc_id` stands for a missing title). The date is written at its
+  precision: `July 2016` for `month`, `2016` for `year` (English month names), the stored date for `day`,
+  for an unknown precision and for a date not written `YYYY-MM-DD`.
 - **Argument errors are written for the client's model**, in terms of the JSON to send: a string where an
   array is expected, the array itself written as a string included (`source_codes must be a JSON array of
   strings, e.g. ["ecb"]; omit it for no restriction`, the example being the caller's own value), an empty
   array (`... omit the argument for no restriction`), a date in another form (`date_from must be
-  "YYYY-MM-DD", e.g. "2016-03-10"`). Nothing is corrected silently.
+  "YYYY-MM-DD", e.g. "2016-03-10"`), a boolean written otherwise (`include_undated must be a JSON boolean,
+  true or false without quotes, not "true"; omit it for false`). Nothing is corrected silently.
 - **Unknown filter values are refused, never corrected.** The server reads the distinct `source_code`,
   `doc_type` and `language` values from the collection and keeps them `MOF_RAG_CODES_TTL_S` seconds. A
   value that is not among them is `[invalid_argument]` listing the valid values (as JSON strings), with a
@@ -461,11 +498,32 @@ Example call and result (text shortened):
   run one), without a request to Qdrant: a search that failed does not change it, the check that follows
   does.
 - **Privacy.** As for every tool, the audit line holds the tool name, the client, the outcome and the
-  duration, never the arguments, and the tool's own log lines never contain the query.
+  duration, never the arguments, and the tool's own log lines never contain the query. rag-engine's own
+  logger `rag_engine.store` writes, when the read of the payload schema fails (see
+  [Dates](#dates-in-rag_search)), the class and the text of the client's error: for an HTTP error, the
+  status and Qdrant's response body; never the API key.
 - **Concurrency.** One embedder and one Qdrant client are shared by the process; inference runs one query
   at a time (about 20 ms for a short query on 4 cores) off the event loop.
 
 #### Dates in `rag_search`
+
+**What a bound means.** A document is dated by `date` and `date_precision`; rag-engine stores the period
+it covers as `date_start` and `date_end` (the same day for `day`, the whole month for `month`, the whole
+year for `year`). With intervals in use, a bound keeps a document when its period has at least one day in
+common with the range: the minutes of a July 2016 meeting known only to the month are found by
+`2016-07-14`..`2016-07-14` and by any range touching July 2016; a document of the year 2015 by any range
+touching 2015. A document dated to the day is found on that day, as before. A document without a date is
+left out of every bounded search unless `include_undated` is true. Without intervals (`legacy`) a month or
+a year document is found only at the first day of its period.
+
+**When results change.** Intervals are used only once the collection's payloads carry `date_start` and
+`date_end` **and** both fields have a datetime index. The orchestrator's `sync-metadata` writes the
+intervals (with the corrected dates, precisions and kinds) and creates the two indexes; until it has run,
+`auto` mode finds no index and every bound is applied to `date`, exactly as before this version, and
+`date_precision` / `date_kind` are `null` in the hits. Within `MOF_RAG_DATE_FILTER_REFRESH` seconds after the
+indexes appear, the running server uses them, without a restart. A collection whose indexes exist before
+all its payloads have intervals loses nothing: a point without its interval yet is still found by its
+`date`.
 
 How a date bound is applied is rag-engine's `date_filter_mode`, set here by `MOF_RAG_DATE_FILTER_MODE`
 and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH` and
@@ -547,7 +605,7 @@ branch on the code and show the message.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
+| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
 | `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
