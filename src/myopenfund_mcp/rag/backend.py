@@ -313,8 +313,8 @@ class EngineRagBackend:
             reason = self._collection_reason or self._suspected
             if reason is None:
                 return
-            recent = (self._collection_reason is not None and self._failed_at is not None
-                      and monotonic() - self._failed_at < self._check_retry_s)
+            # `_failed_at` is set by a failed check only, and cleared by the check that passes.
+            recent = self._failed_at is not None and monotonic() - self._failed_at < self._check_retry_s
             if self._checking or recent:
                 raise _Outage(reason)
             self._checking = True
