@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from typing import Any, Protocol
@@ -149,8 +150,9 @@ class EngineLogFilter(logging.Filter):
     upstream host or an internal address), the engine's hint naming `QDRANT_API_KEY`.
 
     A record of an engine logger is reduced when an exception is among its arguments, when it carries
-    an exception (`logger.exception`, `exc_info`), or when its text holds the configured Qdrant host or
-    API key. What is kept: the logger, the level, and a fixed message naming the class of each
+    an exception (`logger.exception`, `exc_info`), or when its text holds the configured Qdrant host
+    (with or without a port) or API key as a whole token (`_sensitive`; the configured collection, as
+    the engine quotes it, never counts). What is kept: the logger, the level, and a fixed message naming the class of each
     exception. The engine's warning on a schema read that failed keeps, besides, its collection, the
     filter used meanwhile and the delay before the next try. A record without any of these (the INFO
     lines naming a collection and the filter in use) is written as the engine wrote it. Never drops a
@@ -159,10 +161,25 @@ class EngineLogFilter(logging.Filter):
     def __init__(self):
         super().__init__()
         self._secrets: set[str] = set()
+        self._collections: set[str] = set()
 
-    def protect(self, *values: str | None) -> None:
-        """Values that must never be written (the configured host, the API key)."""
-        self._secrets.update(value for value in values if value)
+    def protect(self, host: str | None, key: str | None, collection: str | None = None) -> None:
+        """The configured host and API key must never be written; the collection is not sensitive."""
+        self._secrets.update(value for value in (host, key) if value)
+        if collection:
+            self._collections.add(collection)
+
+    def _sensitive(self, text: str) -> bool:
+        """Whether `text` holds a protected value as a whole token: the host (with or without `:port`) or
+        the key, bounded by characters a host name or a key cannot hold. `qdrant` is found in
+        `http://qdrant:6333/`, not in `qdrant-docs` nor in `qdrant.example.org`. A configured collection
+        written as the engine writes it, quoted (`'qdrant'`), is taken out first."""
+        for collection in self._collections:
+            text = text.replace(repr(collection), "")
+        # Not inside a longer name: no name character before, none after (a dot ending a sentence is no
+        # part of a name, a dot followed by a name character is).
+        return any(re.search(rf"(?<![A-Za-z0-9._-]){re.escape(secret)}(?::[0-9]+)?(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+                             text) for secret in self._secrets)
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args if isinstance(record.args, tuple) else ()
@@ -174,7 +191,7 @@ class EngineLogFilter(logging.Filter):
                 text = record.getMessage()
             except Exception:  # noqa: BLE001 -- a malformed record: reduced rather than written
                 text = None
-            if text is not None and not any(secret in text for secret in self._secrets):
+            if text is not None and not self._sensitive(text):
                 return True
         classes = ", ".join(dict.fromkeys(type(error).__name__ for error in errors)) or "none"
         if record.msg == _SCHEMA_WARNING and len(args) == 5:
@@ -211,11 +228,11 @@ class _EngineLogRelay(logging.Handler):
                 handler.handle(record)
 
 
-def install_engine_log_filter(*secrets: str | None) -> None:
-    """Route the engine's records through `ENGINE_LOG_FILTER` (once), and protect `secrets` too. The
+def install_engine_log_filter(host: str | None, key: str | None, collection: str | None = None) -> None:
+    """Route the engine's records through `ENGINE_LOG_FILTER` (once), and protect `host` and `key`. The
     filter is also put on the engine's loggers that exist already: a record is reduced before any handler
     sees it, whatever the order of the handlers."""
-    ENGINE_LOG_FILTER.protect(*secrets)
+    ENGINE_LOG_FILTER.protect(host, key, collection)
     engine = logging.getLogger("rag_engine")
     # By name: a module imported again (tests do) defines the class again, and one relay is enough.
     if not any(type(handler).__name__ == _EngineLogRelay.__name__ for handler in engine.handlers):
@@ -316,7 +333,7 @@ class EngineRagBackend:
     a deployment builds both from the settings."""
 
     def __init__(self, settings: Settings, *, store: Any = None, embedder: Any = None):
-        install_engine_log_filter(settings.rag_qdrant_host, settings.rag_qdrant_api_key)
+        install_engine_log_filter(settings.rag_qdrant_host, settings.rag_qdrant_api_key, settings.rag_collection)
         self._collection = settings.rag_collection
         self._ttl_s = settings.rag_codes_ttl_s
         self._codes_retry_s = settings.rag_codes_retry_s

@@ -508,8 +508,10 @@ Example call and result (text shortened):
     only, a level the CLI never turns on (a developer who sets it accepts them);
   - the server routes every record of the `rag_engine` loggers (present and future modules) through a
     filter. A record that carries an
-  error (an exception among its arguments or attached to it) or whose text holds the configured host or
-  key is written with its logger, its level and a fixed message naming the error's class only; the
+  error (an exception among its arguments or attached to it) or whose text holds the configured host
+  (alone or with a port) or key as a whole word (host `qdrant` is found in `http://qdrant:6333`, not in a
+  collection `qdrant-docs`; the configured collection's name, quoted as the engine writes it, is never
+  taken for the host) is written with its logger, its level and a fixed message naming the error's class only; the
   engine's warning on a failed schema read also keeps its collection, the filter used meanwhile and the
   delay before the next try. Other engine lines (the collection and the filter in use) are written as
   they are. The error's text is dropped because it can hold the host, a TLS host name, a proxy's error

@@ -1512,6 +1512,29 @@ def test_an_engine_record_reaches_the_root_handlers_once_reduced_whatever_its_lo
     assert len(relays) == 1 and logging.getLogger("rag_engine").handlers[0] is relays[0]
 
 
+@pytest.mark.parametrize("collection", ["qdrant-docs", "qdrant"])
+def test_the_host_and_the_key_are_matched_as_whole_tokens_never_the_collection(seeded, caplog, collection):
+    """A host named `qdrant` and a collection `qdrant-docs` (or `qdrant` itself): the engine's ordinary
+    lines naming the collection are kept; the host itself, alone or with a port, is not written. The
+    collection is exempt as the engine writes it, quoted (`%r`): `'qdrant'`."""
+    store, fake = seeded
+    EngineRagBackend(_settings(rag_qdrant_host="qdrant", rag_qdrant_api_key="k1", rag_collection=collection),
+                     store=store, embedder=fake)
+    caplog.set_level(logging.DEBUG)
+    engine = logging.getLogger("rag_engine.store")
+    kept = [(f"Qdrant collection {collection!r} has datetime indexes on date_start and date_end: date filters "
+             "in auto mode use the intervals"), "talking to qdrant.example.org and qdrant-backup", "token k10 or xk1"]
+    for line in kept:
+        engine.info(line)
+    for line in ("could not reach qdrant", "could not reach qdrant:6333", "url http://qdrant:6333/collections",
+                 'host "qdrant" refused', "api-key=k1", "key k1."):
+        engine.warning(line)
+    messages = [r.getMessage() for r in caplog.records if r.name == "rag_engine.store"]
+    assert messages[:3] == kept
+    assert all(m.startswith("rag-engine logged a message about an error") for m in messages[3:]), messages[3:]
+    assert len(messages) == 9
+
+
 async def test_a_filter_the_collection_refuses_for_a_missing_index_is_search_refused(seeded, monkeypatch, caplog):
     """rag-engine raises its own MissingIndexError for the HTTP 400 of a collection in strict mode."""
     store, fake = seeded
