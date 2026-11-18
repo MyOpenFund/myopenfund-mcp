@@ -96,6 +96,34 @@ the compose file publishes it on `127.0.0.1` of the host unless `MOF_MCP_BIND_AD
 `.env`, leave `MOF_MCP_TRANSPORT` and `MOF_MCP_HOST` unset: the image sets them. The compose file also runs it with a
 read-only root filesystem (writable `/tmp` only), no Linux capabilities and `no-new-privileges`.
 
+### Pinned versions
+
+A deployment installs exactly what the CI tested, at every rebuild and at every start of the `install`
+service:
+
+- **Base image**: `PYTHON_IMAGE` in the [`Dockerfile`](Dockerfile), a tag **and** a digest
+  (`python:3.13.<patch>-slim-<debian>@sha256:...`); the variant without a built image in
+  `compose.example.yaml` uses the same value.
+- **PyPI dependencies**: [`constraints.txt`](constraints.txt), the exact version of every dependency of
+  `[vault,companies,rag]` on that image (fastmcp and everything below it). The image installs with
+  `pip install -c constraints.txt`; the `install` service passes the file of the same commit as a URL:
+  `pip install -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/constraints.txt
+  'myopenfund-mcp[...] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'` (the same `<commit>`
+  twice).
+- **Git dependencies** (`vault-query`, `my-open-data`, `company-corpus`, `rag-engine`): pinned by full
+  commit in `pyproject.toml`, as before.
+
+The CI runs the tests twice: floating within the ranges of `pyproject.toml` (Python 3.12 and 3.13, so a
+coming break shows early) and locked (`locked` job: the image's Python, `-c constraints.txt`, then
+`scripts/check_constraints.py`, which fails when a dependency of the server is missing from the file or
+installed at another version, e.g. a new dependency brought by a release).
+
+**Upgrading** is a deliberate change in a pull request: for the base image, look up the digest of the new
+tag (`docker buildx imagetools inspect python:<tag>`) and replace `PYTHON_IMAGE` in the Dockerfile and the
+image lines of `compose.example.yaml`; for the dependencies, run `python3.13 scripts/update_constraints.py`
+(on linux x86_64, the image's platform) and commit the regenerated `constraints.txt`. The `locked` job then
+tests the new set.
+
 A client connects with its token, e.g. with Claude Code:
 
 ```bash
