@@ -324,7 +324,7 @@ and `cursor` are at most 200 characters.
 | `vault_search_documents` | Find official documents (metadata, not text). Start here: filter, then open one with `vault_get_document`. Rows are ordered by `sort_by` in `sort_dir`; equal sort values are always ordered by `doc_id` ascending, whatever `sort_dir`. `total` counts the whole filtered set. Cursors are offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped). | `corpus` (e.g. `central-bank`), `source_code` (publisher, e.g. `us` for the Fed), `doc_type`, `language`, `year`, `mime_type`, `date_from` / `date_to` (YYYY-MM-DD, inclusive), `text` (case-insensitive substring of the title, matched literally: `%` and `_` are ordinary characters), `sort_by` (`date` default, `year`, `corpus`, `source_code`, `doc_type`, `title`, `created_at`), `sort_dir` (`desc` default), `limit`, `cursor`, `include_deleted` (also return withdrawn documents, with `deleted_at` set) |
 | `vault_get_document` | Every stored fact of one document: dates, source and PDF URLs, publisher, type, `extra`. | `doc_id` |
 | `vault_corpus_stats` | Live-document counts grouped by one field, largest first (NULL is a real group). | `group_by` (`source_code` default, `corpus`, `doc_type`, `language`, `year`, `provenance`, `mime_type`), `corpus`, `limit` |
-| `vault_runs_status` | Is the pipeline healthy? Four lists, newest first: `runs` (one row per run, with outcome and totals; a run that crashed before reaching any source appears only here), `source_runs` (one row per run and source: counts, outcome, bounded error samples), `open_discovery_errors` (unresolved discovery failures; while `seen_at_is_ingestion_time` is true, `last_seen_at` is approximate), `source_health` (expected-vs-observed publication cadence per series). | `corpus`, `source_code`, `since` (ISO 8601, UTC if no offset, an explicit offset is kept: whole minutes, at most ±15:59; keeps runs *finished* at or after it, leaves out runs still in flight; applies to `runs` and `source_runs` only), `limit` (applies to each of `runs`, `source_runs`, `open_discovery_errors`) |
+| `vault_runs_status` | Is the pipeline healthy? Four lists, newest first unless stated: `runs` (one row per run, with outcome and totals; a run that crashed before reaching any source appears only here), `source_runs` (one row per run and source: counts, outcome, bounded error samples), `open_discovery_errors` (unresolved discovery failures; while `seen_at_is_ingestion_time` is true, `last_seen_at` is approximate), `source_health` (expected-vs-observed publication cadence per series, the least healthy first: `cadence_status` overdue, then soon, then the rest, each by most `days_late` first, unknown last), and `source_health_total` (every series matching `corpus` / `source_code`, so a shorter list means `limit` left some out). A result over `MOF_MCP_MAX_RESULT_CHARS` is refused with `[result_too_large]`: lower `limit` or filter by `source_code`. | `corpus`, `source_code`, `since` (ISO 8601, UTC if no offset, an explicit offset is kept: whole minutes, at most ±15:59; keeps runs *finished* at or after it, leaves out runs still in flight; applies to `runs` and `source_runs` only), `limit` (applies to each of `runs`, `source_runs`, `open_discovery_errors`, `source_health`) |
 
 Resource: `vault://documents/{doc_id}`, one document's metadata as JSON (same content as
 `vault_get_document`).
@@ -629,6 +629,13 @@ them `0700` for its own uid). Configuration:
 - **CSV.** `datasets_export_csv` takes the same arguments as `datasets_read_asof`; decimals are written
   exactly (a column's decimals share the widest scale, so `1.5` can appear as `1.500000`). With no rows, the
   header alone if `columns` is given, else an empty string.
+- **Time budget, and a store read over SMB.** One call, all its store reads together, gets
+  `MOF_COMPANIES_QUERY_TIMEOUT_S` seconds (default 20) and then answers `[timeout]`. The default is sized
+  for the NAS, where the server runs next to the store and reads `lake/` from local disk. Read over SMB
+  instead (measured from a Mac, 2026-11), `companies_fundamentals` took 42 to 51 s cold and about 17 s
+  warm, so the default fails cold calls. A deployment that reads the store over SMB (or another network
+  share) should raise `MOF_COMPANIES_QUERY_TIMEOUT_S`, e.g. to 90; the client's own tool-call timeout must
+  then be longer than that too.
 
 ## Errors
 
@@ -699,7 +706,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_MCP_MAX_TEXT_CHARS` | `2000` | Each error text in `vault_runs_status` is cut to this length. |
 | `MOF_COMPANIES_CATALOG` | unset | my-open-data catalogue connection string as the read-only `lake_reader` role (`postgres:dbname=<db> host=<host> port=5432 user=lake_reader password=<password>`); unset = no companies or datasets toolsets. Needs `MOF_COMPANIES_DATA_ROOT` too. |
 | `MOF_COMPANIES_DATA_ROOT` | unset | Folder holding `lake/` as this host sees it; read-only is enough. Needs `MOF_COMPANIES_CATALOG` too. |
-| `MOF_COMPANIES_QUERY_TIMEOUT_S` | `20` | Seconds before a store call stops waiting (1-3600). |
+| `MOF_COMPANIES_QUERY_TIMEOUT_S` | `20` | Seconds one companies tool call may spend on all its store reads before it answers `[timeout]` (1-3600). |
 | `MOF_COMPANIES_MAX_COMPANIES` | `10` | Most companies a single call may name (1-100). |
 | `MOF_COMPANIES_MAX_CONCURRENCY` | `2` | Store reads running at once (1-16); a read abandoned at its time budget keeps its slot until it ends, so the next callers may also get `[timeout]` for a while. |
 | `MOF_COMPANIES_Q4_RULE` | `ytd9` | How TTM derives a fourth quarter the company did not report on its own: `ytd9` = FY minus the 9-month year-to-date (the rule of company-corpus's published outputs; a TTM needing a 9-month value the store lacks is absent), `sum_of_quarters` = FY minus Q1, Q2 and Q3 (present whenever those three quarters are, some differ from company-corpus's). |

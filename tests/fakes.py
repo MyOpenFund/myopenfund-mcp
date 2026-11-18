@@ -52,15 +52,36 @@ ERRORS = [
      "last_run_id": None, "occurrences": 2},
 ]
 
-HEALTH = [
-    {"corpus": "central-bank", "source_code": "us", "doc_type": "C1", "expected_every_days": Decimal("45.5"),
-     "observed_every_days": Decimal("NaN"), "last_date": dt.date(2010, 1, 13), "status": "late"},
-]
+
+def health_row(source_code: str, doc_type: str = "C1", *, cadence_status: str | None = "on-track",
+               days_late: int | None = 0, corpus: str = "central-bank") -> dict:
+    """One row of the vault's `source_health` view, with its 28 columns."""
+    return {
+        "corpus": corpus, "source_code": source_code, "doc_type": doc_type,
+        "expected_interval_days": Decimal("45.5"), "expected_per_year": Decimal("8.0"), "n_3y": 24,
+        "last_document_date": dt.date(2010, 1, 13), "next_expected": dt.date(2010, 2, 27),
+        "days_until": None if days_late is None else -days_late, "days_late": days_late,
+        "cadence_status": cadence_status, "cadence_updated_at": dt.datetime(2026, 11, 3, 4, 0, tzinfo=dt.UTC),
+        "last_run_id": "2026-11-03T04:00:00Z-cb-refresh-abcdef",
+        "last_run_at": dt.datetime(2026, 11, 3, 4, 12, tzinfo=dt.UTC), "last_run_outcome": "degraded",
+        "last_run_truncated": False, "source_runs_7d": 7, "source_degraded_runs_7d": 1,
+        "source_truncated_runs_7d": 0, "source_zero_yield_runs_7d": 6, "source_docs_new_7d": 1,
+        "source_docs_seen_7d": 4123, "source_fetch_errors_7d": 2, "source_runs_90d": 90,
+        "source_docs_new_median_per_run_90d": Decimal("NaN"), "source_open_discovery_errors": 3,
+        "source_open_discovery_attempts": 12,
+        "source_last_discovery_error_at": dt.datetime(2026, 11, 2, 4, 3, tzinfo=dt.UTC),
+    }
+
+
+HEALTH = [health_row("us", cadence_status="overdue", days_late=33)]
+# The production vault's size (79 series, 2026-11-04): about 870 characters a row, the whole list
+# about 66,000 characters, too large for a client to read inline.
+MANY_HEALTH = [health_row(f"s{i:02d}") for i in range(79)]
 
 
 class FakeVaultReader:
-    def __init__(self, docs=DOCS, *, fail_with: Exception | None = None):
-        self.docs, self.calls, self.fail_with = list(docs), [], fail_with
+    def __init__(self, docs=DOCS, *, health=HEALTH, fail_with: Exception | None = None):
+        self.docs, self.health, self.calls, self.fail_with = list(docs), list(health), [], fail_with
 
     def _maybe_fail(self):
         if self.fail_with is not None:
@@ -105,7 +126,7 @@ class FakeVaultReader:
     def source_health(self, *, corpus, source_code):
         self.calls.append(("health", corpus, source_code))
         self._maybe_fail()
-        return [h for h in HEALTH if source_code in (None, h["source_code"])]
+        return [h for h in self.health if source_code in (None, h["source_code"])]
 
     def open_discovery_errors(self, *, corpus, source_code, limit, max_text_chars):
         self.calls.append(("errors", corpus, source_code, limit, max_text_chars))
