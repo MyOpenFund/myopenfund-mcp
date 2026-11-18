@@ -638,7 +638,8 @@ class EngineRagBackend:
             {"source_codes": _list(applied.source_codes), "doc_types": _list(applied.doc_types),
              "languages": _list(applied.languages),
              "date_from": applied.date_from.isoformat() if applied.date_from else None,
-             "date_to": applied.date_to.isoformat() if applied.date_to else None},
+             "date_to": applied.date_to.isoformat() if applied.date_to else None,
+             "include_undated": applied.include_undated},
             [hit.to_dict() for hit in hits],
         )
 

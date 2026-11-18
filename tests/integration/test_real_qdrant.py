@@ -114,7 +114,7 @@ async def test_rag_search_end_to_end(seeded):
         assert [(h["doc_id"], h["page"], h["citation"]) for h in data["hits"]] == [
             ("us/A3/2022-06-15", 5, "Minutes of the Federal Open Market Committee (us A3, 2022-06-15), p. 5")]
         assert data["filters"] == {"source_codes": ["us", "ecb"], "doc_types": ["A3"], "languages": ["en"],
-                                   "date_from": "2022-06-15", "date_to": "2022-06-15"}
+                                   "date_from": "2022-06-15", "date_to": "2022-06-15", "include_undated": False}
         dated = (await c.call_tool("rag_search", {"query": "rates", "date_from": "1900-01-01"})).data
         assert "gb/B1/undated" not in {h["doc_id"] for h in dated["hits"]} and dated["count"] == CHUNKS - 1
         undated = (await c.call_tool("rag_search", {"query": "rates", "source_codes": ["gb"]})).data

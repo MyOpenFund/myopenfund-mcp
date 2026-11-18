@@ -49,8 +49,10 @@ from myopenfund_mcp.server import build_server
 pytestmark = pytest.mark.anyio
 
 HOST, KEY = "qdrant.secret-host.example", "k-hunter2"
-DATES_SENTENCE = ("With a bound set, documents without a full date (undated, or dated by year or month only) are "
-                  "left out: if a date range returns nothing or too little, retry without dates.")
+DATES_SENTENCE = ("With a bound set, a document known only to the month or the year matches any range overlapping "
+                  "its period; documents without a date are left out unless include_undated is true.")
+UNDATED_SENTENCE = ("- include_undated: true to also get the documents without a date when a bound is set (default "
+                    "false; no effect without a bound).")
 CITATION_SENTENCE = ("cite each passage with its `citation`, a ready-made reference: title, then source and "
                      "document-type codes and date in brackets, then the page, each part the document lacks left out.")
 HIT_KEYS = ["rank", "score", "text", "doc_id", "title", "date", "source_code", "doc_type", "language", "page",
@@ -110,7 +112,8 @@ async def test_the_tool_is_namespaced_read_only_and_described_for_a_model(backen
     for needle in ("YYYY-MM-DD", "inclusive", "does not write an answer", "counted from 1", "citation",
                    "PASSAGES", "never corrected", "JSON arrays", "server_info", "rag.source_codes",
                    "rag.doc_types", "rag.languages", "never send an empty array", "an array even for a single code",
-                   DATES_SENTENCE, CITATION_SENTENCE, "limit: number of passages, from 1 to 20; omitted = 8."):
+                   DATES_SENTENCE, UNDATED_SENTENCE, CITATION_SENTENCE,
+                   "limit: number of passages, from 1 to 20; omitted = 8."):
         assert needle in tool.description, needle
     # The default text is corpus-neutral: no bank, no code and no meaning of a code that could go stale.
     for absent in ("ecb", "ECB", "European", "Federal", "England", "Japan", "A1", "A2", "A3", "B1", "E1", "F1",
@@ -124,7 +127,10 @@ async def test_the_tool_is_namespaced_read_only_and_described_for_a_model(backen
         assert absent not in served, absent
     schema = tool.input_schema
     assert list(schema["properties"]) == ["query", "source_codes", "doc_types", "date_from", "date_to",
-                                         "languages", "limit"]
+                                         "include_undated", "languages", "limit"]
+    # A JSON boolean and nothing else, false by default; the strings "true" and "false" are refused.
+    flag = schema["properties"]["include_undated"]
+    assert (flag["type"], flag["default"]) == ("boolean", False) and "not a string" in flag["description"]
     assert schema["required"] == ["query"] and schema["additionalProperties"] is False
     for name, prop in schema["properties"].items():
         assert prop.get("description"), name
@@ -144,13 +150,24 @@ async def test_the_description_states_the_deployments_limits_and_appends_its_not
     assert description.endswith("\n\nAbout this collection: " + notes)
 
 
+@pytest.mark.parametrize(("mode", "overlap"), [("auto", True), ("interval", True), ("legacy", False)])
+async def test_the_description_says_how_a_bound_treats_a_month_or_a_year_in_the_configured_mode(backend, mode,
+                                                                                               overlap):
+    async with _client(backend, rag_date_filter_mode=mode) as c:
+        description = {t.name: t for t in await c.list_tools()}["rag_search"].description
+    assert (DATES_SENTENCE in description) is overlap
+    legacy = ("With a bound set, a document known only to the month or the year matches only a range holding the "
+              "first day of its period; documents without a date are left out unless include_undated is true.")
+    assert (legacy in description) is not overlap
+
+
 async def test_a_hit_carries_the_passage_its_document_and_a_citation_and_nothing_else(backend):
     async with _client(backend) as c:
         data = (await c.call_tool("rag_search", {"query": ECB_RATES})).data
     assert list(data) == ["query", "filters", "count", "hits"]
     assert data["query"] == ECB_RATES and data["count"] == len(data["hits"]) == CHUNKS
     assert data["filters"] == {"source_codes": None, "doc_types": None, "languages": None,
-                               "date_from": None, "date_to": None}
+                               "date_from": None, "date_to": None, "include_undated": False}
     assert [h["rank"] for h in data["hits"]] == list(range(1, CHUNKS + 1))
     scores = [h["score"] for h in data["hits"]]
     assert scores == sorted(scores, reverse=True) and all(round(s, 4) == s for s in scores)
@@ -210,10 +227,10 @@ async def test_filters_narrow_the_search_and_are_echoed_as_applied(backend):
             return sorted({h["doc_id"] for h in data["hits"]}), data["filters"]
 
         assert (await ids(source_codes=["ecb", "us", "ecb"])) == (
-            ["ecb/A1/2022-07-21", "us/A3/2022-06-15"],
+            ["ecb/A1/2022-07-21", "ecb/E1/2015", "us/A3/2022-06-15"],
             {"source_codes": ["ecb", "us"], "doc_types": None, "languages": None, "date_from": None,
-             "date_to": None})
-        assert (await ids(doc_types=["E1"]))[0] == ["jp/E1/2023-01-18"]  # a type held by one chunk
+             "date_to": None, "include_undated": False})
+        assert (await ids(doc_types=["B1"]))[0] == ["gb/B1/undated"]  # a type held by one chunk
         assert (await ids(languages=["ja"]))[0] == ["jp/E1/2023-01-18"]
         assert (await ids(source_codes=["ecb"], doc_types=["A3"]))[0] == []  # AND between arguments
         # Both bounds inclusive; with a bound set the undated document is left out.
@@ -222,6 +239,50 @@ async def test_filters_narrow_the_search_and_are_echoed_as_applied(backend):
         assert (applied["date_from"], applied["date_to"]) == ("2022-06-15", "2022-07-21")
         assert "gb/B1/undated" not in (await ids(date_from="1900-01-01"))[0]
         assert "gb/B1/undated" in (await ids())[0]
+
+
+async def test_include_undated_lets_the_documents_without_a_date_through_a_date_bound(backend):
+    async with _client(backend) as c:
+        async def found(**arguments):
+            data = (await c.call_tool("rag_search", {"query": "rates", **arguments})).data
+            return {h["doc_id"] for h in data["hits"]}, data["filters"]["include_undated"]
+
+        dated, flag = await found(date_from="1900-01-01")
+        assert "gb/B1/undated" not in dated and flag is False and len(dated) == 6
+        everything, flag = await found(date_from="1900-01-01", include_undated=True)
+        assert everything == dated | {"gb/B1/undated"} and flag is True
+        # Only the undated ones are added: the dated documents outside the range stay out.
+        assert (await found(date_to="2015-12-31", include_undated=True)) == ({"ecb/E1/2015", "gb/B1/undated"}, True)
+        late, flag = await found(date_from="2023-01-01", include_undated=True)
+        assert late == {"jp/E1/2023-01-18", "gb/B1/undated"} and flag is True
+        # Without a date bound it changes nothing, and is accepted rather than refused; null is false.
+        assert (await found(include_undated=True))[0] == (await found())[0]
+        assert (await found(include_undated=None)) == (await found())
+
+
+@pytest.mark.parametrize("mode", ["interval", "auto", "legacy"])
+async def test_a_month_or_a_year_matches_a_range_overlapping_its_period_in_interval_mode(seeded, mode):
+    """The fixture's intervals as rag-engine's build_payload writes them. In-process Qdrant keeps no payload
+    index: `auto` reads the collection, finds no index, and applies the bound to `date` (legacy)."""
+    store, fake = seeded
+    backend = EngineRagBackend(_settings(rag_date_filter_mode=mode), store=store, embedder=fake)
+    intervals = mode == "interval"
+    async with _client(backend, rag_date_filter_mode=mode) as c:
+        async def found(date_from, date_to):
+            data = (await c.call_tool("rag_search", {"query": "rates", "date_from": date_from,
+                                                     "date_to": date_to})).data
+            return {h["doc_id"] for h in data["hits"]}
+
+        mid_july = await found("2016-07-14", "2016-07-14")
+        assert mid_july == ({"gb/A3/2016-07"} if intervals else set())
+        assert await found("2016-07-31", "2016-08-31") == ({"gb/A3/2016-07"} if intervals else set())
+        assert await found("2016-06-01", "2016-06-30") == set()  # inclusive bounds, nothing outside the month
+        assert await found("2016-07-01", "2016-07-01") == {"gb/A3/2016-07"}  # the stored first day: every mode
+        assert await found("2015-06-01", "2015-06-30") == ({"ecb/E1/2015"} if intervals else set())
+        assert await found("2015-12-31", "2016-01-31") == ({"ecb/E1/2015"} if intervals else set())
+        # A day is a day in every mode.
+        assert await found("2022-07-21", "2022-07-21") == {"ecb/A1/2022-07-21"}
+        assert await found("2022-07-22", "2022-12-31") == set()
 
 
 async def test_limit_defaults_to_the_setting_and_is_refused_above_the_maximum(seeded):
@@ -242,6 +303,7 @@ ARRAY = "must be a JSON array of strings, e.g. "
 EMPTY = (' is an empty array, which could mean "match nothing" as well as "no restriction": omit the argument '
          "for no restriction")
 DATE = ' must be "YYYY-MM-DD", e.g. "2016-03-10"'
+FLAG = "include_undated must be a JSON boolean, true or false without quotes, not "
 UNSEARCHABLE = ("query has no searchable character: it must hold at least one letter, number, symbol or "
                 "punctuation mark")
 
@@ -270,6 +332,15 @@ UNSEARCHABLE = ("query has no searchable character: it must hold at least one le
     ({"query": "x", "date_to": "2016-02-30"}, 'date_to is not a date of the calendar: "2016-02-30"'),
     ({"query": "x", "date_from": "2022-07-22", "date_to": "2022-07-21"},
      "date_from (2022-07-22) is after date_to (2022-07-21)"),
+    # A boolean is a JSON true or false: never guessed from a string or a number.
+    ({"query": "x", "date_from": "2016-01-01", "include_undated": "true"}, FLAG + '"true"; omit it for false'),
+    ({"query": "x", "include_undated": "false"}, FLAG + '"false"; omit it for false'),
+    ({"query": "x", "include_undated": "yes"}, FLAG + '"yes"; omit it for false'),
+    ({"query": "x", "include_undated": 1}, FLAG + "1; omit it for false"),
+    ({"query": "x", "include_undated": 0}, FLAG + "0; omit it for false"),
+    ({"query": "x", "include_undated": [True]}, FLAG + "a JSON array; omit it for false"),
+    ({"query": "x", "include_undated": {"value": True}}, FLAG + "a JSON object; omit it for false"),
+    ({"query": "x", "include_undated": "x" * 200}, FLAG + '"' + "x" * 36 + "...; omit it for false"),
 ])
 async def test_a_bad_argument_is_refused_by_the_tool_in_json_terms(backend, monkeypatch, arguments, message):
     """The tool owns these messages: nothing of the engine's wording (Python lists, None, datetime.date)."""
@@ -328,7 +399,7 @@ async def test_an_unknown_code_is_refused_with_the_valid_values_and_never_correc
         assert await _error(c, {"query": "x", "languages": ["english"]}) == (
             '[invalid_argument] languages: unknown value "english"; valid values: "en", "ja"')
         assert calls == []  # nothing was searched with a corrected or an unknown value
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
     assert len(calls) == 1
 
 
@@ -433,7 +504,7 @@ async def test_the_values_are_dropped_when_the_collection_comes_back(seeded, mon
             assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "unavailable"
             clock[0] += 6
         down.failure, codes.values["source_code"] = None, ["ecb", "us"]  # recreated
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert (await c.call_tool("server_info", {})).data["rag"]["source_codes"] == ["ecb", "us"]
 
 
@@ -523,7 +594,7 @@ async def test_without_the_facet_api_the_values_are_read_by_one_scroll_of_the_th
         _settled(backend)
         assert (await _error(c, {"query": "x", "source_codes": ["ECB"]})).endswith("valid values: " + VALID_SOURCES)
         assert (await _error(c, {"query": "x", "doc_types": ["a1"]})).endswith("valid values: " + VALID_TYPES)
-        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["E1"]})).data["count"] == 1
+        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["B1"]})).data["count"] == 1
         info = (await c.call_tool("server_info", {})).data["rag"]
     assert (info["source_codes"], info["doc_types"], info["languages"]) == (SOURCE_CODES, DOC_TYPES, ["en", "ja"])
     # One pass over the collection for the three fields, not one pass per field.
@@ -539,7 +610,7 @@ async def test_the_scroll_runs_in_the_background_and_no_search_waits_for_it(seed
     async with _client(backend) as c:  # the start does not wait for the scroll either
         assert client.scrolls == 1  # started at start-up, once the collection is checked
         # No value is known yet: a filtered search is served at once, unchecked.
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ECB"]})).data["count"] == 0
         assert (await c.call_tool("server_info", {})).data["rag"]["source_codes"] is None
         client.release.set()
@@ -551,9 +622,9 @@ async def test_the_scroll_runs_in_the_background_and_no_search_waits_for_it(seed
         # At the end of the TTL the values are read again in the background: the searches made meanwhile
         # are served, and checked against the values already known.
         clock[0] += 61
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert client.scrolls == 2 and backend._reading  # running, and the call above did not wait for it
-        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["E1"]})).data["count"] == 1
+        assert (await c.call_tool("rag_search", {"query": "x", "doc_types": ["B1"]})).data["count"] == 1
         assert client.scrolls == 2  # one at a time
         client.release.set()
         _settled(backend)
@@ -987,7 +1058,7 @@ async def test_a_failed_read_of_the_values_refuses_no_other_caller(seeded, monke
         assert await _error(c, {"query": "x", "source_codes": ["ecb"]}) == UNREACHABLE
         codes.failure = None
         assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
-        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 3
         assert healthy.checks == 2  # the start, then the call that followed the failure
 
 
@@ -1070,7 +1141,8 @@ def test_no_search_is_started_after_the_calls_deadline(backend, monkeypatch):
         _backend_search(backend, time.monotonic() - 0.001)
     assert str(refused.value) == TIMEOUT and searched == []
     assert _backend_search(backend, time.monotonic() + 60) == (
-        {"source_codes": None, "doc_types": None, "languages": None, "date_from": None, "date_to": None}, [])
+        {"source_codes": None, "doc_types": None, "languages": None, "date_from": None, "date_to": None,
+         "include_undated": False}, [])
     assert len(searched) == 1
     assert _backend_search(backend, None)[1] == [] and len(searched) == 2  # no deadline: no limit
 
