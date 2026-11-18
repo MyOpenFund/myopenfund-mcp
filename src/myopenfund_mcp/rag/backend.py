@@ -18,10 +18,17 @@ The other toolsets behave the same way when their backend is down at start: the 
 their tools answer a coded error.
 
 When Qdrant does not answer, a call pays for ONE request timeout at most:
-- a failed check, or a search that failed for an outage, is remembered `rag_check_retry_s` seconds:
-  calls made meanwhile, and calls made while another one is running the check, are answered at once
-  with the recorded reason;
+- a failed collection check is remembered `rag_check_retry_s` seconds: calls made meanwhile, and
+  calls made while another one is running the check, are answered at once with the recorded reason;
+- a search, or a read of the filter values, that fails for an outage (no answer, key refused,
+  collection gone, server error) ends its own call and refuses nobody else: it only makes the NEXT
+  call run the collection check before its search. Qdrant is healthy: the check passes in a few
+  milliseconds and that call is served. Qdrant is down: the check fails and is remembered as above.
+  A search that succeeds meanwhile cancels that check;
 - a read of the filter values that fails for an outage ends the call: the search is not tried after it.
+A search that Qdrant refuses as a request (HTTP 4xx other than a refused key, a missing collection,
+408 and 429: a filter on a field without a payload index under strict mode, for instance) is the
+matter of that call alone: it answers `[rag_unavailable] search_refused`, and nothing is recorded.
 No lock is held during a request to Qdrant.
 
 Filter values (`source_code`, `doc_type`, `language`), used to refuse an unknown code:
@@ -77,8 +84,13 @@ SCROLL_PAGE = 2000
 #: Most valid values listed in an error message and in `info()`.
 MAX_LISTED_VALUES = 60
 #: Answers to a facet request that mean "not here": no keyword index on the field (400), a server
-#: without the facet API (404, 405, 501). A missing collection is a 404 too: the scroll then says so.
+#: without the facet API (404, 405, 501) or one that does not accept the request as written (422).
+#: A missing collection is a 404 too: the scroll then says so.
 NO_FACET_STATUSES = (400, 404, 405, 422, 501)
+#: 4xx answers to a search that say something about Qdrant or the deployment, not about the request:
+#: a refused key, a missing collection, a request timeout, a rate limit. Any other 4xx is a refusal
+#: of that one search.
+NOT_A_REFUSAL_STATUSES = (401, 403, 404, 408, 429)
 
 # reason -> what the caller is told. Fixed texts: never the host, the key, a response body or the
 # text of an engine error.
@@ -93,6 +105,9 @@ REASONS = {
     "model_integrity": "an embedding model file is not the pinned one; the deployment must be fixed",
     "model_unavailable": "the embedding model could not be loaded when the server started; "
                          "the deployment must be fixed",
+    "search_refused": "the vector database refused this search, and only this one: the collection, as it "
+                      "is indexed, cannot serve it (most often a filter on a field without a payload "
+                      "index); retry with fewer filters, without date_from and date_to first",
     "timeout": "the search did not finish within the time allowed for one call; retry later",
     "busy": "too many searches are running and none finished within the time allowed for one call; "
             "retry later",
@@ -134,14 +149,21 @@ def _reason(exc: BaseException) -> str | None:
     if isinstance(exc, ResponseHandlingException):  # connection refused, DNS, TLS, timeout
         return "qdrant_unreachable"
     if isinstance(exc, UnexpectedResponse):
-        # On a search: 404 = the collection is gone, 400 = a vector of another dimension.
-        return {401: "qdrant_auth", 403: "qdrant_auth", 404: "collection_missing",
-                400: "collection_mismatch"}.get(exc.status_code, "qdrant_error")
+        # 404 on a search or a scroll: the collection is gone.
+        return {401: "qdrant_auth", 403: "qdrant_auth",
+                404: "collection_missing"}.get(exc.status_code, "qdrant_error")
     if isinstance(exc, ModelIntegrityError):
         return "model_integrity"
     if isinstance(exc, ModelDownloadError):
         return "model_unavailable"
     return None
+
+
+def _refused(exc: BaseException) -> bool:
+    """Whether a search failed because Qdrant refused that request: an error of one call, which says
+    nothing of the next one (see NOT_A_REFUSAL_STATUSES)."""
+    return (isinstance(exc, UnexpectedResponse) and 400 <= exc.status_code < 500
+            and exc.status_code not in NOT_A_REFUSAL_STATUSES)
 
 
 def engine_settings(settings: Settings) -> EngineSettings:
@@ -187,9 +209,12 @@ class EngineRagBackend:
         # Guards everything below. Never held during a request to Qdrant.
         self._lock = threading.Lock()
         self._collection_reason: str | None = "qdrant_unreachable"  # until the first check passes
-        self._failed_at: float | None = None  # when the last check or search failed for an outage
+        self._failed_at: float | None = None  # when the last check failed
+        # Why a search or a read of the values failed since the last check or successful search:
+        # the next call checks the collection before it searches. It refuses nobody by itself.
+        self._suspected: str | None = None
         self._checking = False  # a call is running the collection check
-        self._logged_reason: str | None = None
+        self._logged: tuple[str, str] | None = None  # the failure last logged: (what failed, reason)
         self._values: dict[str, frozenset[str] | None] | None = None  # None: not known (yet)
         self._values_tried_at: float | None = None  # when the last read started
         self._values_due_at: float | None = None  # when the next read is due; None: at the next filtered call
@@ -232,42 +257,64 @@ class EngineRagBackend:
 
     def _check_collection(self) -> str | None:
         """Run the engine's read-only collection check and record the outcome: None, or the reason
-        it failed for. The caller has set `_checking`; it is cleared here."""
+        it failed for. The caller has set `_checking`; it is cleared here, whatever happens."""
         try:
-            self._store.check_collection(self._collection, self._dim)
-        except Exception as exc:  # noqa: BLE001 -- recorded; the class only is logged (no host, no body)
-            reason = _reason(exc) or "qdrant_error"
-            self._failed(reason, exc, "collection check failed")
-            return reason
-        with self._lock:
-            if self._collection_reason is not None:
-                # Back after a failure: the collection may have been recreated with other codes.
-                self._values = self._values_due_at = self._values_tried_at = None
-            self._collection_reason = self._logged_reason = self._failed_at = None
-            self._checking = False
-        log.info("rag: collection %s checked, searches are served", self._collection)
-        return None
+            try:
+                self._store.check_collection(self._collection, self._dim)
+            except Exception as exc:  # noqa: BLE001 -- recorded; the class only is logged (no host, no body)
+                reason = _reason(exc) or "qdrant_error"
+                with self._lock:
+                    changed = ("check", reason) != self._logged
+                    self._collection_reason, self._logged = reason, ("check", reason)
+                    self._failed_at, self._suspected = monotonic(), None
+                if changed:  # once per change of state, not once per call
+                    log.warning("rag: collection check failed (%s, %s); rag_search answers [rag_unavailable] "
+                                "until a collection check passes", reason, type(exc).__name__)
+                return reason
+            with self._lock:
+                back = self._collection_reason is not None or self._suspected == "collection_missing"
+                if back:
+                    # Back after a failure: the collection may have been recreated with other codes.
+                    self._values = self._values_due_at = self._values_tried_at = None
+                self._collection_reason = self._logged = self._failed_at = self._suspected = None
+            if back:  # not one line per check that follows a failed search
+                log.info("rag: collection %s checked, searches are served", self._collection)
+            return None
+        finally:
+            with self._lock:
+                self._checking = False
 
-    def _failed(self, reason: str, exc: BaseException, what: str) -> None:
-        """Record an outage: calls are answered with `reason` until a check passes."""
+    def _suspect(self, reason: str, exc: BaseException, what: str) -> None:
+        """Record that a search or a read of the values failed for an outage: the next call checks
+        the collection before it searches. Nobody is refused on this record alone."""
         with self._lock:
-            changed = reason != self._logged_reason
-            self._collection_reason = self._logged_reason = reason
-            self._failed_at = monotonic()
-            self._checking = False
+            changed = False
+            if self._collection_reason is None:  # else a failed check already says more
+                changed = (what, reason) != self._logged
+                self._suspected, self._logged = reason, (what, reason)
         if changed:  # once per change of state, not once per call
-            log.warning("rag: %s (%s, %s); rag_search answers [rag_unavailable] until a collection check "
-                        "passes", what, reason, type(exc).__name__)
+            log.warning("rag: %s (%s, %s); the next call checks the collection before it searches",
+                        what, reason, type(exc).__name__)
+
+    def _served(self) -> None:
+        """A search succeeded: Qdrant answers, whatever a search that failed meanwhile recorded."""
+        with self._lock:
+            if self._suspected is not None:
+                self._suspected = self._logged = None
 
     def _require_collection(self) -> None:
-        """Return when searches are served; `_Outage` otherwise. After a failure the check is run
-        again by one call at a time, and not before `rag_check_retry_s` seconds: the other calls
-        are answered at once with the recorded reason."""
+        """Return when searches are served; `_Outage` otherwise.
+
+        After a failed check, the check is run again by one call at a time, and not before
+        `rag_check_retry_s` seconds: the other calls are answered at once with the recorded reason.
+        After a failed search (or read of the values), the first call to come runs the check at
+        once; the calls that arrive while it runs are answered at once with the reason of that failure."""
         with self._lock:
-            reason = self._collection_reason
+            reason = self._collection_reason or self._suspected
             if reason is None:
                 return
-            recent = self._failed_at is not None and monotonic() - self._failed_at < self._check_retry_s
+            recent = (self._collection_reason is not None and self._failed_at is not None
+                      and monotonic() - self._failed_at < self._check_retry_s)
             if self._checking or recent:
                 raise _Outage(reason)
             self._checking = True
@@ -337,29 +384,50 @@ class EngineRagBackend:
             if self._reading:
                 return
             self._reading, self._values_tried_at = True, monotonic()
+        ended = False  # the end of the read is recorded, or left to the background thread
         try:
-            values = self._facet_values()
-        except Exception as exc:  # noqa: BLE001 -- recorded; the search is served unchecked or not at all
-            self._values_read(None, exc)
-            reason = _reason(exc)
-            if reason is None:
+            try:
+                values = self._facet_values()
+                if values is None:
+                    threading.Thread(target=self._scroll_in_background, name="mof-rag-values",
+                                     daemon=True).start()
+                else:
+                    self._values_read(values, None)
+                ended = True
                 return
-            error = _Outage(reason)
-        else:
-            if values is None:
-                threading.Thread(target=self._scroll_in_background, name="mof-rag-values", daemon=True).start()
-            else:
-                self._values_read(values, None)
-            return
+            except Exception as exc:  # noqa: BLE001 -- recorded; the search is served unchecked or not at all
+                self._values_read(None, exc)
+                ended = True
+                reason = _reason(exc)
+                if reason is None:
+                    return
+                error = _Outage(reason)
+        finally:
+            if not ended:
+                self._read_abandoned()
         raise error  # outside the handler: the client error (URL, body) is not chained
 
     def _scroll_in_background(self) -> None:
+        ended = False
         try:
-            values = self._scroll_values()
-        except Exception as exc:  # noqa: BLE001 -- recorded; nothing to answer from a background thread
-            self._values_read(None, exc)
-        else:
-            self._values_read(values, None)
+            try:
+                values = self._scroll_values()
+            except Exception as exc:  # noqa: BLE001 -- recorded; nothing to answer from a background thread
+                self._values_read(None, exc)
+            else:
+                self._values_read(values, None)
+            ended = True
+        finally:
+            if not ended:
+                self._read_abandoned()
+
+    def _read_abandoned(self) -> None:
+        """A read ended without a word (an exception that is not an `Exception`): `_reading` must not
+        stay set, or no read would ever run again and a refusal would wait for nothing."""
+        with self._lock:
+            self._values_due_at = monotonic() + self._codes_retry_s
+            self._reading = False
+            self._read_done.notify_all()
 
     def _values_read(self, values: dict | None, exc: BaseException | None) -> None:
         """Record the end of a read: the values, or the failure (the values already known are kept,
@@ -384,7 +452,7 @@ class EngineRagBackend:
             log.warning("rag: the collection's filter values could not be read (%s); filter values are "
                         "checked against the last values read, if any, until they can", type(exc).__name__)
         if reason is not None:
-            self._failed(reason, exc, "reading the filter values failed")
+            self._suspect(reason, exc, "reading the filter values failed")
 
     def _known_values(self) -> dict[str, frozenset[str] | None] | None:
         """The stored values per checked field, read again when due; None while none is known."""
@@ -457,7 +525,8 @@ class EngineRagBackend:
 
         Raises the tool errors itself: `[invalid_argument]` with the engine's own message for an
         argument the engine refuses or a filter value the collection does not hold,
-        `[rag_unavailable]` with a reason for an outage. Anything else is left to the server's masking.
+        `[rag_unavailable]` with a reason for an outage or for a search Qdrant refuses (`search_refused`:
+        the error of this call alone, never recorded). Anything else is left to the server's masking.
         """
         error = None
         try:
@@ -475,15 +544,21 @@ class EngineRagBackend:
         except _Outage as exc:
             error = unavailable(exc.reason)
         except Exception as exc:  # mapped below, or re-raised as it is
-            reason = _reason(exc)
-            if reason is None:
-                raise
-            # The class only: a client error's text holds the URL and the response body.
-            self._failed(reason, exc, "search failed")
-            error = unavailable(reason)
+            if _refused(exc):
+                # The request is refused, not the service: nothing is recorded, the other calls are served.
+                log.info("rag: a search was refused by the vector database (HTTP %d)", exc.status_code)
+                error = unavailable("search_refused")
+            else:
+                reason = _reason(exc)
+                if reason is None:
+                    raise
+                # The class only: a client error's text holds the URL and the response body.
+                self._suspect(reason, exc, "search failed")
+                error = unavailable(reason)
         if error is not None:
             # Raised outside the handler so the client error (URL, body) is not chained.
             raise error
+        self._served()
         return (
             {"source_codes": _list(applied.source_codes), "doc_types": _list(applied.doc_types),
              "languages": _list(applied.languages),

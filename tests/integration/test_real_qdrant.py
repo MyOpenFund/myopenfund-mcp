@@ -212,6 +212,31 @@ async def test_a_collection_that_disappears_is_rag_unavailable_then_served_again
         writer.client.delete_collection(collection)
 
 
+async def test_a_filter_the_collection_cannot_serve_is_the_error_of_that_search_alone(writer):
+    """Strict mode refuses (HTTP 400) a filter on a field without a payload index: here `date`. The other
+    searches are served, by the same server, before and after."""
+    from qdrant_client import models
+    from rag_fixture import CHUNKS, embedder, seed
+
+    collection = f"mof-mcp-it-{uuid.uuid4().hex[:12]}"
+    try:
+        seed(writer, collection)
+        writer.client.delete_payload_index(collection, "date")
+        writer.client.update_collection(collection, strict_mode_config=models.StrictModeConfig(
+            enabled=True, unindexed_filtering_retrieve=False))
+        async with _client(collection, embedder(), rag_check_retry_s=3600) as c:
+            for _ in range(2):
+                assert await _error(c, {"query": "rates", "date_from": "2022-01-01"}) == (
+                    "[rag_unavailable] search_refused: the vector database refused this search, and only this "
+                    "one: the collection, as it is indexed, cannot serve it (most often a filter on a field "
+                    "without a payload index); retry with fewer filters, without date_from and date_to first")
+                assert (await c.call_tool("rag_search", {"query": "rates"})).data["count"] == CHUNKS
+                assert (await c.call_tool("rag_search", {"query": "rates", "source_codes": ["ecb"]})).data["count"] == 2
+                assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+    finally:
+        writer.client.delete_collection(collection)
+
+
 async def test_a_failure_is_remembered_and_the_next_calls_answer_at_once(seeded):
     """An address that drops packets would cost every call a whole timeout: only the first one pays."""
     import socket

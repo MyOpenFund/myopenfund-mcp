@@ -62,7 +62,9 @@ services:
 # read-only, with the same hardening as above. A restart of `mcp` alone needs no network.
 # `rag-model-fill` is for the FIRST start with the rag toolset only: it downloads the embedding model
 # into its volume (outbound HTTPS to huggingface.co and the hosts it redirects to, a writable HOME) and
-# verifies it. Check its log, then delete the service and the `rag-model-fill` entry of `depends_on`.
+# verifies it. It succeeded when its log ends with `model cache ready` and it exited with code 0
+# (`docker compose ps -a rag-model-fill`); then delete the service and the `rag-model-fill` entry of
+# `depends_on`.
 # (`install` gives the model volume to the service user: a new named volume belongs to root.)
 # services:
 #   install:
@@ -101,7 +103,8 @@ services:
 #       - >-
 #         from rag_engine.config import Settings;
 #         from rag_engine.embedding import make_embedder;
-#         make_embedder(Settings(backend='onnx', model_cache='/models')).release()
+#         make_embedder(Settings(backend='onnx', model_cache='/models')).release();
+#         print('model cache ready')
 #   mcp:
 #     image: python:3.13-slim
 #     restart: unless-stopped

@@ -3,6 +3,7 @@ FakeEmbedder (no model), and a monkeypatched `search` where an outage is needed.
 import asyncio
 import json
 import logging
+import re
 import socket
 import sys
 import threading
@@ -42,8 +43,10 @@ from myopenfund_mcp.server import build_server
 pytestmark = pytest.mark.anyio
 
 HOST, KEY = "qdrant.secret-host.example", "k-hunter2"
-DATES_SENTENCE = ("Date precision varies by bank (some documents carry only the year or the month): if a date "
-                  "range returns nothing, retry with whole-year bounds or without dates.")
+DATES_SENTENCE = ("With a bound set, documents without a full date (undated, or dated by year or month only) are "
+                  "left out: if a date range returns nothing or too little, retry without dates.")
+CITATION_SENTENCE = ("cite each passage with its `citation`, a ready-made reference: title, then source and "
+                     "document-type codes and date in brackets, then the page, each part the document lacks left out.")
 HIT_KEYS = ["rank", "score", "text", "doc_id", "title", "date", "source_code", "doc_type", "language", "page",
             "chunk_number", "citation"]
 
@@ -100,14 +103,19 @@ async def test_the_tool_is_namespaced_read_only_and_described_for_a_model(backen
     assert tool.annotations.read_only_hint is True
     for needle in ("YYYY-MM-DD", "inclusive", "does not write an answer", "counted from 1", "citation",
                    "PASSAGES", "never corrected", "JSON arrays", "server_info", "rag.source_codes",
-                   "rag.doc_types", "rag.languages", "never send an empty array",
-                   DATES_SENTENCE, "limit: number of passages, from 1 to 20; omitted = 8."):
+                   "rag.doc_types", "rag.languages", "never send an empty array", "an array even for a single code",
+                   DATES_SENTENCE, CITATION_SENTENCE, "limit: number of passages, from 1 to 20; omitted = 8."):
         assert needle in tool.description, needle
     # The default text is corpus-neutral: no bank, no code and no meaning of a code that could go stale.
     for absent in ("ecb", "ECB", "European", "Federal", "England", "Japan", "A1", "A2", "A3", "B1", "E1", "F1",
-                   "press", "minutes", "About this collection"):
+                   "press", "minutes", "About this collection", "bank", "whole-year"):
         assert absent not in tool.description, absent
     assert len(tool.description) < 1800
+    # As a client receives it: no markup, no escaped character, and no placeholder a model would send as it
+    # is written (an example value in brackets, a made-up code).
+    served = tool.description + " ".join(p["description"] for p in tool.input_schema["properties"].values())
+    for absent in ("<", ">", "&lt;", "&gt;", "&amp;", "&quot;", "&#", "e.g.", '["'):
+        assert absent not in served, absent
     schema = tool.input_schema
     assert list(schema["properties"]) == ["query", "source_codes", "doc_types", "date_from", "date_to",
                                          "languages", "limit"]
@@ -182,6 +190,7 @@ def test_human_page_is_the_stored_page_plus_one_or_nothing(stored, shown):
     ({}, "untitled document"),
 ])
 def test_citation_leaves_out_what_is_missing(hit, expected):
+    """What the description announces: title, then codes and date in brackets, then the page."""
     assert citation(hit) == expected
 
 
@@ -399,7 +408,8 @@ async def test_a_code_ingested_after_the_last_read_is_accepted_at_once(seeded, c
         assert (await c.call_tool("server_info", {})).data["rag"]["source_codes"] == ["ecb", "us"]
 
 
-async def test_the_values_are_dropped_when_the_collection_comes_back(seeded, clock):
+@pytest.mark.parametrize("seen_by_a_check", [True, False])
+async def test_the_values_are_dropped_when_the_collection_comes_back(seeded, monkeypatch, clock, seen_by_a_check):
     """A collection recreated during an outage: its old codes must not refuse the new ones."""
     store, fake = seeded
     codes = _Codes(store, source_code=["old"], doc_type=["A1"], language=["en"])
@@ -408,11 +418,15 @@ async def test_the_values_are_dropped_when_the_collection_comes_back(seeded, clo
                                store=down, embedder=fake)
     async with _client(backend) as c:
         assert (await _error(c, {"query": "x", "source_codes": ["ecb"]})).endswith('valid values: "old"')
-        down.failure = CollectionNotFoundError("gone")
-        backend._failed("collection_missing", down.failure, "search failed")  # what a failed search records
-        assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "unavailable"
-        down.failure, codes.values["source_code"] = None, ["ecb", "us"]
-        clock[0] += 6
+        with monkeypatch.context() as patched:  # a search finds the collection gone ...
+            patched.setattr(backend_module, "search", lambda *a, **k: (_ for _ in ()).throw(_response(404)))
+            assert (await _error(c, {"query": "x"})).startswith("[rag_unavailable] collection_missing")
+        if seen_by_a_check:  # ... and so does the check of the next call
+            down.failure = CollectionNotFoundError("gone")
+            assert (await _error(c, {"query": "x"})).startswith("[rag_unavailable] collection_missing")
+            assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "unavailable"
+            clock[0] += 6
+        down.failure, codes.values["source_code"] = None, ["ecb", "us"]  # recreated
         assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
         assert (await c.call_tool("server_info", {})).data["rag"]["source_codes"] == ["ecb", "us"]
 
@@ -584,9 +598,9 @@ def _response(status: int) -> UnexpectedResponse:
 
 OUTAGES = [
     (_response(404), "collection_missing"),
-    (_response(400), "collection_mismatch"),
     (_response(500), "qdrant_error"),
     (_response(503), "qdrant_error"),
+    (_response(429), "qdrant_error"),
     (ResponseHandlingException(httpx.ConnectError(f"cannot connect to {HOST}")), "qdrant_unreachable"),
     (ResponseHandlingException(httpx.ReadTimeout(f"timed out reading {HOST}")), "qdrant_unreachable"),
     (QdrantAuthError("Qdrant refused the request (HTTP 401): check QDRANT_API_KEY"), "qdrant_auth"),
@@ -594,19 +608,45 @@ OUTAGES = [
 
 
 QUERY = "secret-term what did the council decide"
+# Written out here, not read from the module: what a client is told.
+UNREACHABLE = ("[rag_unavailable] qdrant_unreachable: the vector database cannot be reached or did not answer in "
+               "time; retry later")
+REFUSED = ("[rag_unavailable] search_refused: the vector database refused this search, and only this one: the "
+           "collection, as it is indexed, cannot serve it (most often a filter on a field without a payload "
+           "index); retry with fewer filters, without date_from and date_to first")
+
+
+def _timed_out() -> ResponseHandlingException:
+    return ResponseHandlingException(httpx.ReadTimeout(f"timed out reading {HOST}"))
+
+
+def _failing_for(monkeypatch, failures: dict):
+    """`search` fails with `failures[query]` for the queries listed there; the others are really served."""
+    real = backend_module.search
+
+    def search(query, **kwargs):
+        if query in failures:
+            raise failures[query]
+        return real(query, **kwargs)
+
+    monkeypatch.setattr(backend_module, "search", search)
 
 
 @pytest.mark.parametrize(("failure", "reason"), OUTAGES, ids=[r + "-" + type(f).__name__ for f, r in OUTAGES])
-async def test_an_outage_is_rag_unavailable_with_a_reason_and_leaks_nothing(backend, monkeypatch, caplog,
+async def test_an_outage_is_rag_unavailable_with_a_reason_and_leaks_nothing(seeded, monkeypatch, caplog,
                                                                              failure, reason):
-    def failing(*args, **kwargs):
-        raise failure
-
-    monkeypatch.setattr(backend_module, "search", failing)
+    """The search fails, then the collection check does: Qdrant is down, and said so to every caller."""
+    store, fake = seeded
+    down = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(), store=down, embedder=fake)
+    _failing_for(monkeypatch, {QUERY: failure})
     caplog.set_level(logging.DEBUG)
     async with _client(backend) as c:
         message = await _error(c, {"query": QUERY, "source_codes": ["ecb"]})
-        again = await _error(c, {"query": QUERY})  # answered from the recorded failure
+        # That failure alone refuses nobody: server_info still shows the outcome of the last check.
+        assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+        down.failure = failure
+        again = await _error(c, {"query": "another caller"})  # checks the collection: it fails too
         info = (await c.call_tool("server_info", {})).data
     assert message == again == f"[rag_unavailable] {reason}: {backend_module.REASONS[reason]}"
     assert info["rag"]["status"] == "unavailable" and info["rag"]["reason"] == reason
@@ -614,18 +654,96 @@ async def test_an_outage_is_rag_unavailable_with_a_reason_and_leaks_nothing(back
     for text in everything:
         assert HOST not in text and KEY not in text and "QDRANT_API_KEY" not in text, text
         assert "secret-term" not in text and "council" not in text, text  # nor the query, on this path either
-    assert any(reason in r.getMessage() and type(failure).__name__ in r.getMessage()
-               for r in caplog.records if r.name == "myopenfund_mcp.rag")
+    logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.rag"]
+    for what in ("search failed", "collection check failed"):
+        assert any(what in line and reason in line and type(failure).__name__ in line for line in logged), what
 
 
-async def test_after_an_outage_the_collection_is_checked_again_and_the_toolset_recovers(backend, monkeypatch, clock):
-    real = backend_module.search
-    monkeypatch.setattr(backend_module, "search", lambda *a, **k: (_ for _ in ()).throw(_response(404)))
+async def test_one_search_that_times_out_refuses_no_other_caller(seeded, monkeypatch):
+    """Qdrant is healthy and one request of one caller is answered too late: the next call checks the
+    collection (one cheap request), is served, and the calls after it ask nothing more."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(rag_check_retry_s=3600), store=healthy, embedder=fake)
+    _failing_for(monkeypatch, {"heavy": _timed_out()})
     async with _client(backend) as c:
-        assert (await _error(c, {"query": "x"})).startswith("[rag_unavailable] collection_missing")
-        monkeypatch.setattr(backend_module, "search", real)
+        assert healthy.checks == 1  # at start
+        for expected_checks in (2, 3):  # as often as it happens
+            assert await _error(c, {"query": "heavy"}) == UNREACHABLE
+            for _ in range(5):
+                assert (await c.call_tool("rag_search", {"query": "light"})).data["count"] == CHUNKS
+            assert healthy.checks == expected_checks  # one check after the failure, not one per call
+            assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
+
+
+async def test_a_search_that_succeeds_clears_the_failure_of_another(seeded, monkeypatch):
+    """A search that ends well after another failed is the proof that Qdrant answers: no check follows."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(), store=healthy, embedder=fake)
+    real, entered, release = backend_module.search, threading.Event(), threading.Event()
+
+    def search(query, **kwargs):
+        if query == "heavy":
+            raise _timed_out()
+        if query == "slow":
+            entered.set()
+            assert release.wait(10)
+        return real(query, **kwargs)
+
+    monkeypatch.setattr(backend_module, "search", search)
+    async with _client(backend) as c:
+        slow = asyncio.create_task(c.call_tool("rag_search", {"query": "slow"}))
+        assert await asyncio.to_thread(entered.wait, 10)
+        assert await _error(c, {"query": "heavy"}) == UNREACHABLE
+        assert backend._suspected == "qdrant_unreachable"
+        release.set()
+        assert (await slow).data["count"] == CHUNKS
+        assert backend._suspected is None
+        assert (await c.call_tool("rag_search", {"query": "light"})).data["count"] == CHUNKS
+        assert healthy.checks == 1  # the one of the start
+
+
+@pytest.mark.parametrize("status", [400, 422, 409])
+async def test_a_search_qdrant_refuses_is_the_error_of_that_call_alone(seeded, monkeypatch, caplog, status):
+    """HTTP 400 is what Qdrant in strict mode answers to a filter on a field without an index: nothing is
+    wrong with the deployment for the other callers, and nothing is remembered."""
+    store, fake = seeded
+    healthy = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(), store=healthy, embedder=fake)
+    _failing_for(monkeypatch, {QUERY: _response(status)})
+    caplog.set_level(logging.DEBUG)
+    async with _client(backend) as c:
+        for _ in range(3):
+            message = await _error(c, {"query": QUERY, "date_from": "2016-01-01"})
+            assert message == REFUSED
+            assert (await c.call_tool("rag_search", {"query": "another caller"})).data["count"] == CHUNKS
+            info = (await c.call_tool("server_info", {})).data
+            assert info["rag"]["status"] == "ready" and "reason" not in info["rag"]
+        assert healthy.checks == 1 and backend._suspected is None  # no check either: nothing was recorded
+    for text in [message] + [r.getMessage() for r in caplog.records]:
+        assert HOST not in text and KEY not in text and "secret-term" not in text, text
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records if r.name == "myopenfund_mcp.rag")
+
+
+async def test_after_an_outage_the_collection_is_checked_again_and_the_toolset_recovers(seeded, monkeypatch, clock):
+    store, fake = seeded
+    down = _Store(store, store.client)
+    backend = EngineRagBackend(_settings(rag_check_retry_s=5), store=down, embedder=fake)
+    _failing_for(monkeypatch, {"x": _response(404)})
+    async with _client(backend) as c:
+        down.failure = CollectionNotFoundError("gone")
+        expected = "[rag_unavailable] collection_missing: " + backend_module.REASONS["collection_missing"]
+        assert await _error(c, {"query": "x"}) == expected  # the search fails
+        assert await _error(c, {"query": "y"}) == expected  # then the check of the next call
+        assert down.checks == 2
+        for _ in range(20):  # that failed check is remembered: no request
+            assert await _error(c, {"query": "y"}) == expected
+        assert down.checks == 2
+        down.failure = None
         clock[0] += 6  # past rag_check_retry_s
-        assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
+        assert (await c.call_tool("rag_search", {"query": "y"})).data["count"] == CHUNKS
+        assert down.checks == 3
         assert (await c.call_tool("server_info", {})).data["rag"]["status"] == "ready"
 
 
@@ -635,11 +753,10 @@ async def test_a_failed_check_is_remembered_a_few_seconds_and_not_run_by_every_c
     down = _Store(store, store.client)
     down.failure = ResponseHandlingException(httpx.ReadTimeout("timed out"))
     backend = EngineRagBackend(_settings(rag_check_retry_s=5), store=down, embedder=fake)
-    expected = "[rag_unavailable] qdrant_unreachable: " + backend_module.REASONS["qdrant_unreachable"]
     async with _client(backend) as c:
         assert down.checks == 1  # at start
         for _ in range(20):
-            assert await _error(c, {"query": "x"}) == expected
+            assert await _error(c, {"query": "x"}) == UNREACHABLE
         assert down.checks == 1  # 20 calls, no request
         clock[0] += 4.9
         await _error(c, {"query": "x"})
@@ -655,52 +772,232 @@ async def test_a_failed_check_is_remembered_a_few_seconds_and_not_run_by_every_c
         assert down.checks == 3
 
 
-async def test_calls_arriving_while_a_check_runs_are_answered_at_once(seeded, clock):
-    store, fake = seeded
-    entered, release = threading.Event(), threading.Event()
+class _Hanging(_Store):
+    """A store whose collection check, while `failure` is set, hangs until `release` and then fails."""
 
-    class Hanging(_Store):
-        def check_collection(self, name, dim):
-            if self.failure is not None and self.checks >= 1:
-                self.checks += 1
-                entered.set()
-                assert release.wait(10)
-                raise self.failure
+    def __init__(self, store, client):
+        super().__init__(store, client)
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def check_collection(self, name, dim):
+        if self.failure is None:
             return super().check_collection(name, dim)
+        self.checks += 1
+        self.entered.set()
+        assert self.release.wait(10)
+        raise self.failure
 
-    down = Hanging(store, store.client)
-    down.failure = ResponseHandlingException(httpx.ReadTimeout("timed out"))
+
+@pytest.mark.parametrize("after", ["a failed check", "a failed search"])
+async def test_calls_arriving_while_a_check_runs_are_answered_at_once(seeded, monkeypatch, clock, after):
+    store, fake = seeded
+    down = _Hanging(store, store.client)
+    if after == "a failed check":  # the one of the start
+        down.failure = _timed_out()
+        down.release.set()
     backend = EngineRagBackend(_settings(rag_check_retry_s=5), store=down, embedder=fake)
+    _failing_for(monkeypatch, {"heavy": _timed_out()})
     async with _client(backend) as c:
-        clock[0] += 6  # the failure of the start is forgotten: the next call checks
+        if after == "a failed check":
+            clock[0] += 6  # that failure is forgotten: the next call checks
+        else:
+            assert await _error(c, {"query": "heavy"}) == UNREACHABLE  # the next call checks, at once
+            down.failure = _timed_out()
+        down.release.clear()
+        checks = down.checks
+        down.entered.clear()
         first = asyncio.create_task(_error(c, {"query": "x"}))
-        assert await asyncio.to_thread(entered.wait, 10)
+        assert await asyncio.to_thread(down.entered.wait, 10)
         started = time.monotonic()
         for _ in range(10):  # the check is running: these do not wait for it, and do not run another
-            assert (await _error(c, {"query": "x"})).startswith("[rag_unavailable] qdrant_unreachable")
-        assert time.monotonic() - started < 2 and down.checks == 2
-        release.set()
-        assert (await first).startswith("[rag_unavailable] qdrant_unreachable")
+            assert await _error(c, {"query": "x"}) == UNREACHABLE
+        assert time.monotonic() - started < 2 and down.checks == checks + 1
+        down.release.set()
+        assert await first == UNREACHABLE
+        for _ in range(10):  # and it failed: remembered
+            assert await _error(c, {"query": "x"}) == UNREACHABLE
+        assert down.checks == checks + 1
+
+
+async def test_qdrant_hanging_after_a_healthy_start_answers_a_burst_within_two_request_timeouts(seeded,
+                                                                                                monkeypatch):
+    """Every request hangs for the request timeout (0.5 s here), then fails. Fifty calls at once, four
+    slots: four searches time out, ONE call runs the check, every other call is answered at once."""
+    store, fake = seeded
+    request_s = 0.5
+
+    class Frozen(_Store):
+        def check_collection(self, name, dim):
+            if self.failure is None:
+                return super().check_collection(name, dim)
+            self.checks += 1
+            time.sleep(request_s)
+            raise self.failure
+
+    down = Frozen(store, store.client)
+    backend = EngineRagBackend(_settings(rag_check_retry_s=5), store=down, embedder=fake)
+    searches = []
+
+    def search(query, **kwargs):
+        searches.append(query)
+        time.sleep(request_s)
+        raise _timed_out()
+
+    monkeypatch.setattr(backend_module, "search", search)
+    async with _client(backend, rag_call_timeout_s=5, rag_max_concurrency=4) as c:
+        down.failure = _timed_out()
+        started = time.monotonic()
+        answers = await asyncio.gather(*[_timed(_error(c, {"query": f"q{n}"})) for n in range(50)])
+        assert time.monotonic() - started < 2 * request_s + 1.5
+        assert {message for message, _ in answers} == {UNREACHABLE}
+        assert len(searches) == 4 and down.checks == 2  # the start, then one check for the whole burst
+        message, took = await _timed(_error(c, {"query": "later"}))
+        assert message == UNREACHABLE and took < 0.3 and down.checks == 2  # from the recorded failure
 
 
 async def test_a_filtered_call_does_not_pay_for_two_timeouts(seeded, monkeypatch, clock):
-    """The read of the filter values failed for an outage: the search is not tried after it."""
+    """The read of the filter values failed for an outage: the search is not tried after it, and the next
+    call checks the collection before anything else."""
     store, fake = seeded
     codes = _Codes(store, source_code=SOURCE_CODES, doc_type=DOC_TYPES, language=["en", "ja"])
-    backend = EngineRagBackend(_settings(rag_codes_ttl_s=60), store=_Store(store, codes), embedder=fake)
+    down = _Store(store, codes)
+    backend = EngineRagBackend(_settings(rag_codes_ttl_s=60), store=down, embedder=fake)
     searched = []
     monkeypatch.setattr(backend_module, "search", lambda *a, **k: searched.append(a) or [])
     async with _client(backend) as c:
         clock[0] += 61  # the values are due
-        codes.failure = ResponseHandlingException(httpx.ReadTimeout(f"timed out reading {HOST}"))
-        assert await _error(c, {"query": "x", "source_codes": ["ecb"]}) == (
-            "[rag_unavailable] qdrant_unreachable: " + backend_module.REASONS["qdrant_unreachable"])
-        assert searched == [] and codes.reads == 2
-        # ... and the outage is recorded: the next calls ask nothing.
+        codes.failure = down.failure = ResponseHandlingException(httpx.ReadTimeout(f"timed out reading {HOST}"))
+        assert await _error(c, {"query": "x", "source_codes": ["ecb"]}) == UNREACHABLE
+        assert searched == [] and codes.reads == 2 and down.checks == 1
+        # The next call checks the collection, which fails too: one request, and it is remembered.
+        assert await _error(c, {"query": "x", "source_codes": ["ecb"]}) == UNREACHABLE
+        assert searched == [] and codes.reads == 2 and down.checks == 2
         await _error(c, {"query": "x", "source_codes": ["ecb"]})
         await _error(c, {"query": "x"})
-        assert searched == [] and codes.reads == 2
+        assert searched == [] and codes.reads == 2 and down.checks == 2
         assert (await c.call_tool("server_info", {})).data["rag"]["reason"] == "qdrant_unreachable"
+
+
+async def test_a_failed_read_of_the_values_refuses_no_other_caller(seeded, monkeypatch, clock):
+    """One facet request answered too late by a healthy Qdrant: the next call is served."""
+    store, fake = seeded
+    codes = _Codes(store, source_code=SOURCE_CODES, doc_type=DOC_TYPES, language=["en", "ja"])
+    healthy = _Store(store, codes)
+    backend = EngineRagBackend(_settings(rag_codes_ttl_s=60), store=healthy, embedder=fake)
+    async with _client(backend) as c:
+        clock[0] += 61  # the values are due
+        codes.failure = _timed_out()
+        assert await _error(c, {"query": "x", "source_codes": ["ecb"]}) == UNREACHABLE
+        codes.failure = None
+        assert (await c.call_tool("rag_search", {"query": "x"})).data["count"] == CHUNKS
+        assert (await c.call_tool("rag_search", {"query": "x", "source_codes": ["ecb"]})).data["count"] == 2
+        assert healthy.checks == 2  # the start, then the call that followed the failure
+
+
+# -- flags that must not stay set ----------------------------------------------------------------------
+
+
+class _Interrupt(BaseException):
+    """Not an `Exception`: what a handler of `Exception` lets through."""
+
+
+def test_a_check_interrupted_by_anything_leaves_no_check_running(seeded, clock):
+    store, fake = seeded
+    down = _Store(store, store.client)
+    down.failure = _timed_out()
+    backend = EngineRagBackend(_settings(rag_check_retry_s=5), store=down, embedder=fake)
+    backend.start()
+    clock[0] += 6
+    down.failure = _Interrupt()
+    with pytest.raises(_Interrupt):
+        backend._require_collection()
+    assert backend._checking is False
+    down.failure = None
+    backend._require_collection()  # the next call checks, and is served: nothing is stuck
+    assert down.checks == 3 and backend.info()["status"] == "ready"
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("can't start new thread"), _Interrupt()],
+                         ids=["no-thread", "interrupted"])
+def test_a_read_of_the_values_that_cannot_be_handed_over_leaves_no_read_running(seeded, monkeypatch, clock,
+                                                                                failure):
+    """The scroll could not be given to its thread: `_reading` must not stay set, or no value would ever
+    be read again and every refusal would wait for the end of its call."""
+    store, fake = seeded
+    client = _Scrolled(store)
+    backend = EngineRagBackend(_settings(rag_codes_retry_s=5), store=_Store(store, client), embedder=fake)
+
+    def start(thread):
+        raise failure
+
+    with monkeypatch.context() as patched:
+        patched.setattr(threading.Thread, "start", start)
+        if isinstance(failure, Exception):
+            backend.start()  # recorded as a failed read: the search is served unchecked
+        else:
+            with pytest.raises(_Interrupt):
+                backend.start()
+    assert backend._reading is False and client.scrolls == 0
+    clock[0] += 6  # past rag_codes_retry_s: the read is tried again, by the next filtered call
+    with pytest.raises(ToolError) as refused:
+        _backend_search(backend, time.monotonic() + 10, source_codes=["ECB"])
+    assert str(refused.value).endswith("valid values: " + VALID_SOURCES) and client.scrolls == 1
+
+
+def test_a_scroll_interrupted_by_anything_leaves_no_read_running(seeded, monkeypatch):
+    store, fake = seeded
+    client = _Scrolled(store)
+    backend = EngineRagBackend(_settings(), store=_Store(store, client), embedder=fake)
+    monkeypatch.setattr(backend, "_scroll_values", lambda: (_ for _ in ()).throw(_Interrupt()))
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)  # the thread ends on it: not this test's matter
+    backend.start()
+    _settled(backend)
+    assert backend._reading is False and backend._values is None
+
+
+# -- the call's deadline, inside the backend ------------------------------------------------------------
+
+
+def _backend_search(backend, deadline, **filters):
+    return backend.search(query="x", filters={"source_codes": None, "doc_types": None, "languages": None,
+                                              "date_from": None, "date_to": None, **filters},
+                          limit=3, max_limit=20, deadline=deadline)
+
+
+def test_no_search_is_started_after_the_calls_deadline(backend, monkeypatch):
+    """A call that got its slot when its caller had already gone asks Qdrant nothing."""
+    backend.start()
+    searched = []
+    monkeypatch.setattr(backend_module, "search", lambda *a, **k: searched.append(a) or [])
+    with pytest.raises(ToolError) as refused:
+        _backend_search(backend, time.monotonic() - 0.001)
+    assert str(refused.value) == TIMEOUT and searched == []
+    assert _backend_search(backend, time.monotonic() + 60) == (
+        {"source_codes": None, "doc_types": None, "languages": None, "date_from": None, "date_to": None}, [])
+    assert len(searched) == 1
+    assert _backend_search(backend, None)[1] == [] and len(searched) == 2  # no deadline: no limit
+
+
+def test_the_read_before_a_refusal_is_not_waited_for_beyond_the_calls_deadline(seeded, clock):
+    """The backend alone, without the tool's own budget around it: the scroll hangs, the call does not."""
+    store, fake = seeded
+    client = _Scrolled(store)
+    backend = EngineRagBackend(_settings(rag_codes_retry_s=5), store=_Store(store, client), embedder=fake)
+    backend.start()
+    _settled(backend)
+    clock[0] += 6  # the values may be read again
+    client.hold = True
+    try:
+        started = time.monotonic()
+        with pytest.raises(ToolError) as refused:
+            _backend_search(backend, started + 0.3, source_codes=["ECB"])
+        took = time.monotonic() - started
+        # Refused against the values already known, at the deadline, while the scroll still runs.
+        assert str(refused.value).endswith("valid values: " + VALID_SOURCES)
+        assert 0.25 <= took < 3 and client.scrolls == 2 and backend._reading
+    finally:
+        client.release.set()
+        _settled(backend)
 
 
 async def test_an_unexpected_error_is_masked(backend, monkeypatch, caplog):
@@ -1134,6 +1431,22 @@ def test_the_readme_documents_the_codes_every_reason_and_every_argument():
                    "the first page is 1", "`ORT_DISABLE_TELEMETRY`", "`HF_HUB_OFFLINE=1`", "`mem_limit: 3g`",
                    "no outbound connection", "MOF_RAG_DESCRIPTION_NOTES="):
         assert needle in readme, needle
+
+
+def test_the_readme_pins_rag_engine_to_the_commit_the_server_is_built_on():
+    root = Path(__file__).resolve().parent.parent
+    pins = re.findall(r"MyOpenFund/rag-engine@([0-9a-f]{40})", (root / "pyproject.toml").read_text())
+    assert len(pins) == 1
+    readme = (root / "README.md").read_text()
+    assert re.findall(r"MyOpenFund/rag-engine(?:@([0-9a-f]+))?[\"`'\s]", readme) == pins  # one install line, pinned
+
+
+def test_the_fill_command_says_when_it_is_done_in_the_readme_and_in_the_compose_example():
+    root = Path(__file__).resolve().parent.parent
+    readme, compose = (root / "README.md").read_text(), (root / "compose.example.yaml").read_text()
+    assert ".release(); print('model cache ready')\"" in readme
+    assert "release();\n#         print('model cache ready')\n" in compose
+    assert "ONNX embedding model ready" not in readme + compose  # a line the fill never prints
 
 
 def test_the_suggested_notes_of_the_readme_fit_the_setting():

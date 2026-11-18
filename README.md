@@ -158,21 +158,43 @@ into a volume at each start of the stack.
 
 1. **A read-only API key on the Qdrant side.** In the Qdrant stack, set a read-only key next to the main
    one (`QDRANT__SERVICE__READ_ONLY_API_KEY`) and restart Qdrant. The MCP gets that key only. Check it
-   from any host that reaches Qdrant: a read answers `200`, a write answers `403` (and creates nothing).
+   from any host that reaches Qdrant. The key is typed at a prompt that shows nothing (`read -s`, in bash
+   and in zsh) and kept in a variable of that shell: it is written neither in a command nor in the
+   shell history.
 
    ```bash
-   curl -s -o /dev/null -w '%{http_code}\n' -H 'api-key: <read-only-key>' http://<qdrant-host>:<qdrant-port>/collections/<collection>
-   curl -s -o /dev/null -w '%{http_code}\n' -H 'api-key: <read-only-key>' -H 'Content-Type: application/json' -X PUT -d '{"vectors":{"size":4,"distance":"Cosine"}}' http://<qdrant-host>:<qdrant-port>/collections/mof-key-check
+   printf 'read-only key: '; read -rs MOF_KEY_CHECK; echo
+   curl -s -o /dev/null -w '%{http_code}\n' -H "api-key: $MOF_KEY_CHECK" http://<qdrant-host>:<qdrant-port>/collections/<collection>
+   curl -s -o /dev/null -w '%{http_code}\n' -H "api-key: $MOF_KEY_CHECK" -H 'Content-Type: application/json' -X PUT -d '{"vectors":{"size":4,"distance":"Cosine"}}' http://<qdrant-host>:<qdrant-port>/collections/mof-key-check
    ```
+
+   - The first request is a read: it must print `200` (`401` or `403`: Qdrant does not accept the key;
+     `404`: no collection of that name).
+   - The second is a write: it must print `403`. The key cannot write, and nothing was created.
+   - If the second prints `200`, **the key can write**: it is not a read-only key, and the request has
+     just created an empty collection named `mof-key-check`. Delete that collection, then give the MCP a
+     real read-only key and run the two checks again:
+
+     ```bash
+     curl -s -o /dev/null -w '%{http_code}\n' -H "api-key: $MOF_KEY_CHECK" -X DELETE http://<qdrant-host>:<qdrant-port>/collections/mof-key-check
+     ```
+
+   - At the end: `unset MOF_KEY_CHECK`.
+   - Qdrant behind TLS: write `https://` in these URLs, with the port TLS is served on; add
+     `QDRANT_HTTPS=true` to the command of step 2 and set `MOF_RAG_QDRANT_HTTPS=true` in step 6. The key
+     then no longer travels in clear.
 
 2. **Payload indexes, once, from the data side.** The filters and the list of valid filter values use
    Qdrant's payload indexes. Whoever owns the collection creates them, once per collection, with a key
    that can write, from an environment where `rag-engine` is installed (the ingestion's own, or any venv
-   with `pip install "rag-engine @ git+https://github.com/MyOpenFund/rag-engine"`). Give the host AND the
-   port: the engine's default port is 6333.
+   with `pip install "rag-engine @ git+https://github.com/MyOpenFund/rag-engine@fbbe09b789828a67c28beadca1f2a95d611158a8"`,
+   the commit this server is built on). Give the host AND the port: the engine's default port is 6333.
+   The key is typed at a prompt here too:
 
    ```bash
-   QDRANT_HOST=<qdrant-host> QDRANT_PORT=<qdrant-port> QDRANT_API_KEY=<key-that-can-write> python -c "from rag_engine.store import QdrantStore; print(QdrantStore().ensure_payload_indexes('<collection>'))"
+   printf 'key that can write: '; read -rs QDRANT_API_KEY; echo; export QDRANT_API_KEY
+   QDRANT_HOST=<qdrant-host> QDRANT_PORT=<qdrant-port> python -c "from rag_engine.store import QdrantStore; print(QdrantStore().ensure_payload_indexes('<collection>'))"
+   unset QDRANT_API_KEY
    ```
 
    It prints the indexes it created (`[]` when they were all there: running it again does nothing). The MCP
@@ -191,18 +213,22 @@ into a volume at each start of the stack.
    to the hosts it redirects downloads to (under `hf.co`), and a writable `HOME`. The exact line it runs:
 
    ```bash
-   python -c "from rag_engine.config import Settings; from rag_engine.embedding import make_embedder; make_embedder(Settings(backend='onnx', model_cache='/models')).release()"
+   python -c "from rag_engine.config import Settings; from rag_engine.embedding import make_embedder; make_embedder(Settings(backend='onnx', model_cache='/models')).release(); print('model cache ready')"
    ```
+
+   It succeeded when its **last line is `model cache ready`** and its **exit code is 0**. Anything else
+   (a traceback, another exit code) is a failed fill: the service would start without the model.
 
    - Built image: `docker run --rm -v myopenfund-mcp-rag-models:/models myopenfund-mcp python -c "..."`
      with the line above (the image owns `/models` as its service user and sets `HOME`).
    - No built image: the `rag-model-fill` service of `compose.example.yaml` runs it for the first start
-     of the stack (the `install` service gives the volume to the service user); delete that service once
-     its log ends with `ONNX embedding model ready`.
+     of the stack (the `install` service gives the volume to the service user). Check both signs with
+     `docker compose logs rag-model-fill` (last line `model cache ready`) and `docker compose ps -a
+     rag-model-fill` (`Exited (0)`), then delete that service.
    - Without Docker: the same line in the server's venv, with your own absolute directory in place of
      `/models`.
 
-   Run again on a filled cache, the line downloads nothing and only verifies the files. A filled
+   Run again on a filled cache, the line downloads nothing, verifies the files and prints the same line. A filled
    directory can be copied from another host instead, **keeping its symbolic links** (`snapshots/` links
    into `blobs/`): `cp -a`, `rsync -a` or `tar`, never a copy that follows or drops links.
 5. **The service** (`compose.yaml`):
@@ -299,15 +325,16 @@ the client's model reads the passages and cites them. Read tier.
 | `source_codes` | JSON array of source codes, exact (case matters). The valid ones: `server_info`, `rag.source_codes`. |
 | `doc_types` | JSON array of document-type codes, exact. The valid ones: `server_info`, `rag.doc_types`. |
 | `languages` | JSON array of language codes as stored, e.g. `["en"]`. The valid ones: `server_info`, `rag.languages`. |
-| `date_from`, `date_to` | Publication date bounds, `YYYY-MM-DD`, both inclusive. As soon as one is set, a document without a full date is left out. |
+| `date_from`, `date_to` | Publication date bounds, `YYYY-MM-DD`, both inclusive. As soon as one is set, a document without a full date (no date, or only a year or a month) is left out, whatever the bounds. |
 | `limit` | Number of passages; default `MOF_RAG_DEFAULT_LIMIT` (8), at most `MOF_RAG_MAX_LIMIT` (20). |
 
 The values of one array are alternatives (OR), the arguments combine (AND). An omitted argument does not
 restrict; an empty array is refused.
 
 **What the client's model is told.** The tool description states how to call the tool, the default and
-the maximum `limit` of this deployment, and that date precision varies (a date range that returns nothing
-is to be retried with whole-year bounds or without dates). It is **corpus-neutral**: it names no source
+the maximum `limit` of this deployment, and that a date bound leaves out every document without a full
+date (undated, or dated by year or month only: a date range that returns nothing or too little is to be
+retried without dates). It is **corpus-neutral**: it names no source
 and gives no meaning to any code, because such facts go stale when the collection changes. The codes
 themselves are read from the collection (`server_info`, and every refusal lists them). What they mean is
 the deployment's to say, in `MOF_RAG_DESCRIPTION_NOTES`: one line of text (at most 1500 characters),
@@ -388,16 +415,28 @@ Example call and result (text shortened):
   an error naming `MOF_RAG_MODEL_CACHE`, and `rag_search` answers `[rag_unavailable]` until the cache is
   fixed and the server restarted.
 - **Time budget, and what happens when Qdrant hangs.** One call never takes longer than
-  `MOF_RAG_CALL_TIMEOUT_S` (15 s), its wait included; one request to Qdrant never longer than
-  `MOF_RAG_QDRANT_TIMEOUT` (10 s).
-  - A request that fails (no answer in time, connection refused, key refused, collection gone) ends its
-    call with `[rag_unavailable]` and the reason: a call pays for one request timeout at most, never for
-    two in a row (a failed read of the filter values is not followed by a search).
-  - That failure is remembered `MOF_RAG_CHECK_RETRY_S` seconds (5): the calls made meanwhile get the same
-    answer **at once**, without a request. Then one call checks the collection again, the others still
-    answering at once while it does. So with Qdrant frozen, a burst of 50 calls is answered within one
-    request timeout, later calls within milliseconds, and the tool works again at most
-    `MOF_RAG_CHECK_RETRY_S` seconds after Qdrant does.
+  `MOF_RAG_CALL_TIMEOUT_S` (15 s), its wait included. `MOF_RAG_QDRANT_TIMEOUT` (10 s) is the limit of
+  **one request** to Qdrant, and a call makes several: the search, before it the read of the filter
+  values when it is due, and the collection check after a failure.
+  - A request that fails (no answer in time, connection refused, key refused, collection gone, server
+    error) ends its call with `[rag_unavailable]` and the reason: a call pays for one request timeout at
+    most, never for two in a row (a failed read of the filter values is not followed by a search).
+  - **A failed search refuses nobody else.** It only makes the next call check the collection before
+    its own search. With a healthy Qdrant (one slow request, one caller's timeout) that check takes a
+    few milliseconds and the call is served; a search that succeeds meanwhile cancels the check.
+  - **A failed collection check** (at start, or the one that follows a failed search) is remembered
+    `MOF_RAG_CHECK_RETRY_S` seconds (5): the calls made meanwhile get its reason **at once**, without a
+    request, and so do the calls that arrive while a check is running. Then one call checks again. So
+    with Qdrant frozen, a burst of 50 calls is answered within one request timeout (only the call that
+    runs the check after a failed search waits longer, for that check or the end of its own budget),
+    later calls within milliseconds, and the tool works again at most `MOF_RAG_CHECK_RETRY_S` seconds
+    after Qdrant does.
+  - **A search that Qdrant refuses as a request** (HTTP 4xx, other than a refused key, a missing
+    collection, 408 and 429) is the error of that call alone: `[rag_unavailable] search_refused`,
+    nothing is remembered, nothing is checked, `server_info` stays `ready`. The usual cause is a
+    collection in strict mode asked to filter on a field that has no payload index (a date bound without
+    the datetime index on `date`): the filter cannot be served by the collection as it is indexed. Step 2
+    of [Deploying the rag toolset](#deploying-the-rag-toolset) creates the indexes.
   - At most `MOF_RAG_MAX_CONCURRENCY` searches (4) run at once, in threads of the toolset's own: the
     calls in excess wait without holding a thread, so the other toolsets and `server_info` keep
     answering whatever Qdrant does. A call whose budget ends answers `[rag_unavailable]`: `busy` if it
@@ -406,9 +445,11 @@ Example call and result (text shortened):
 - **`server_info`** adds a `rag` object: `status` (`ready`, or `unavailable` with a `reason`), `collection`,
   `model`, `engine_version`, `default_limit`, `max_limit`, and `source_codes`, `doc_types`, `languages`:
   the valid values of each filter as last read from the collection (at most 60 each; `null` while not
-  known). It reports the state recorded at start and by the last calls, without a request to Qdrant.
+  known). It reports the outcome of the last collection check (at start, then by the calls that had to
+  run one), without a request to Qdrant: a search that failed does not change it, the check that follows
+  does.
 - **Privacy.** As for every tool, the audit line holds the tool name, the client, the outcome and the
-  duration, never the arguments: the text of a query is not logged, at any level, on any path.
+  duration, never the arguments, and the tool's own log lines never contain the query.
 - **Concurrency.** One embedder and one Qdrant client are shared by the process; inference runs one query
   at a time (about 20 ms for a short query on 4 cores) off the event loop.
 
@@ -469,7 +510,7 @@ branch on the code and show the message.
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
 | `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
-| `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while that failure is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; the others need the deployment fixed. |
+| `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
 | `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |
 | `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit` (`rag_search` names the largest that fits). |
 | `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
@@ -533,10 +574,10 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_QDRANT_PORT` | `6333` | Qdrant HTTP port (1-65535). |
 | `MOF_RAG_QDRANT_API_KEY` | unset | Qdrant API key; a **read-only** key is enough and recommended. Never logged, shown or put in an error. |
 | `MOF_RAG_QDRANT_HTTPS` | `false` | Connect to Qdrant over TLS (`true` / `false`). Without TLS the key travels in clear: private network only. |
-| `MOF_RAG_QDRANT_TIMEOUT` | `10` | Seconds one request to Qdrant may take (1-300, at most `MOF_RAG_CALL_TIMEOUT_S`). A request that takes longer fails, and the call that made it answers `[rag_unavailable] qdrant_unreachable`. |
+| `MOF_RAG_QDRANT_TIMEOUT` | `10` | Seconds **one request** to Qdrant may take (1-300, at most `MOF_RAG_CALL_TIMEOUT_S`); a call makes several (collection check after a failure, read of the filter values when due, search). A request that takes longer fails, and the call that made it answers `[rag_unavailable] qdrant_unreachable`. |
 | `MOF_RAG_CALL_TIMEOUT_S` | `15` | Time budget of one `rag_search` call in seconds, its wait for a free slot included (1-3600, at least `MOF_RAG_QDRANT_TIMEOUT`). At its end the call answers `[rag_unavailable]` with `timeout` or `busy`. |
 | `MOF_RAG_MAX_CONCURRENCY` | `4` | Searches running at once (1-64), in threads of the toolset's own. The calls in excess wait without holding a thread. |
-| `MOF_RAG_CHECK_RETRY_S` | `5` | Seconds a failed collection check or search is remembered (1-3600): calls made meanwhile answer `[rag_unavailable]` at once. Also the longest the toolset takes to notice that Qdrant is back. |
+| `MOF_RAG_CHECK_RETRY_S` | `5` | Seconds a failed collection check is remembered (1-3600): calls made meanwhile answer `[rag_unavailable]` at once. Also the longest the toolset takes to notice that Qdrant is back. A failed search is not remembered: it makes the next call run the check. |
 | `MOF_RAG_COLLECTION` | unset | Collection searched (768-dimension cosine vectors of `intfloat/multilingual-e5-base`). Needs `MOF_RAG_QDRANT_HOST` too. |
 | `MOF_RAG_MODEL_CACHE` | unset | Directory holding the embedding model files (about 1.1 GB), as an absolute path. Required with the rag toolset, for every transport: the model is never kept in a temporary directory. Fill it once, then mount it read-only. The process needs about 2 GB of memory while the model loads: give a container at least 3 GB. |
 | `MOF_RAG_ONNX_THREADS` | unset | Threads of the ONNX runtime (1-256). Unset = one per core of the host; in a container with a CPU limit, set it to the limit. |

@@ -140,7 +140,8 @@ class Settings:
     # MOF_RAG_QDRANT_API_KEY: a read-only key is enough; kept out of repr, never logged or echoed
     rag_qdrant_api_key: str | None = field(default=None, repr=False)
     rag_qdrant_https: bool = False  # MOF_RAG_QDRANT_HTTPS: connect to Qdrant over TLS
-    rag_qdrant_timeout: int = 10  # MOF_RAG_QDRANT_TIMEOUT: seconds one request to Qdrant may take
+    # MOF_RAG_QDRANT_TIMEOUT: seconds ONE request to Qdrant may take (a call makes several)
+    rag_qdrant_timeout: int = 10
     rag_collection: str | None = None  # MOF_RAG_COLLECTION: the collection searched; needed with the host
     # MOF_RAG_MODEL_CACHE: directory of the pinned embedding model files; needed with the host
     rag_model_cache: str | None = None
@@ -158,7 +159,8 @@ class Settings:
     rag_call_timeout_s: int = 15
     rag_max_concurrency: int = 4  # MOF_RAG_MAX_CONCURRENCY: searches running at once (worker threads)
     # MOF_RAG_CHECK_RETRY_S: seconds a failed collection check is remembered: calls made meanwhile are
-    # answered at once with its reason instead of asking Qdrant again
+    # answered at once with its reason instead of asking Qdrant again (a failed search is not
+    # remembered: it makes the next call run the check)
     rag_check_retry_s: int = 5
     # MOF_RAG_DESCRIPTION_NOTES: text appended to the description of rag_search (what the collection
     # holds, what its codes mean); empty = nothing appended

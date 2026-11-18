@@ -47,13 +47,13 @@ PASSAGES (text excerpts), best first. It returns source text only; it does not w
 
 Arguments:
 - query (required): a question or topic in plain language.
-- source_codes, doc_types, languages: JSON arrays of exact codes (case matters), e.g. \
-source_codes=["<code>"]. The valid codes are listed in server_info (rag.source_codes, rag.doc_types, \
-rag.languages) and in the refusal message: a code the collection does not hold is refused with the valid \
-ones, never corrected.
-- date_from, date_to: publication date bounds, "YYYY-MM-DD", both inclusive. With a bound set, undated \
-documents are left out. Date precision varies by bank (some documents carry only the year or the month): \
-if a date range returns nothing, retry with whole-year bounds or without dates.
+- source_codes, doc_types, languages: JSON arrays of strings (an array even for a single code). Each \
+string is one of the exact codes listed in server_info (rag.source_codes, rag.doc_types, rag.languages), \
+copied as written there: case matters. A code the collection does not hold is refused with the list of \
+the valid ones, never corrected.
+- date_from, date_to: publication date bounds, "YYYY-MM-DD", both inclusive. With a bound set, documents \
+without a full date (undated, or dated by year or month only) are left out: if a date range returns \
+nothing or too little, retry without dates.
 - limit: number of passages, from 1 to {max_limit}; omitted = {default_limit}.
 Values of one array are alternatives (OR); different arguments combine (AND). Omit an argument to leave it \
 unrestricted; never send an empty array.
@@ -61,15 +61,17 @@ unrestricted; never send an empty array.
 Result: {{query, filters, count, hits}}. Each hit: rank, score (cosine, higher is closer), text, doc_id, \
 title, date, source_code, doc_type, language, page, chunk_number, citation. `page` is the page the passage \
 starts on, counted from 1 (null for a document without pages). Quote `text` and cite each passage with \
-its `citation` (title, date, page); several hits may come from the same document."""
+its `citation`, a ready-made reference: title, then source and document-type codes and date in brackets, \
+then the page, each part the document lacks left out. Several hits may come from the same document."""
 
 QUERY_DESCRIPTION = "What to look for, in plain language (a question or a topic). Required."
-SOURCE_CODES_DESCRIPTION = ('Sources to keep: JSON array of exact codes among server_info\'s rag.source_codes, '
-                            'e.g. ["<code>"]; omitted = all')
-DOC_TYPES_DESCRIPTION = ('Document types to keep: JSON array of exact codes among server_info\'s rag.doc_types, '
-                         'e.g. ["<code>"]; omitted = all')
-LANGUAGES_DESCRIPTION = ('Languages to keep: JSON array of exact codes among server_info\'s rag.languages, '
-                         'e.g. ["en"]; omitted = all')
+# No example value on purpose: a small model sends a placeholder as it is written.
+SOURCE_CODES_DESCRIPTION = ("Sources to keep: JSON array of strings, each an exact code copied from "
+                            "server_info's rag.source_codes; omitted = all")
+DOC_TYPES_DESCRIPTION = ("Document types to keep: JSON array of strings, each an exact code copied from "
+                         "server_info's rag.doc_types; omitted = all")
+LANGUAGES_DESCRIPTION = ("Languages to keep: JSON array of strings, each an exact code copied from "
+                         "server_info's rag.languages; omitted = all")
 DATE_FROM_DESCRIPTION = "Earliest publication date, YYYY-MM-DD, inclusive"
 DATE_TO_DESCRIPTION = "Latest publication date, YYYY-MM-DD, inclusive"
 LIMIT_DESCRIPTION = ("Number of passages; omitted = server default; a value above the server maximum is "
