@@ -101,8 +101,9 @@ async def test_rag_search_end_to_end(seeded):
         assert data["count"] == CHUNKS
         assert data["hits"][0] == {
             "rank": 1, "score": 1.0, "text": ECB_RATES, "doc_id": "ecb/A1/2022-07-21",
-            "title": "Monetary policy decisions", "date": "2022-07-21", "source_code": "ecb", "doc_type": "A1",
-            "language": "en", "page": 1, "chunk_number": 0,
+            "title": "Monetary policy decisions", "date": "2022-07-21", "date_precision": "day",
+            "date_kind": "meeting", "source_code": "ecb", "doc_type": "A1", "language": "en", "page": 1,
+            "chunk_number": 0,
             "citation": "Monetary policy decisions (ecb A1, 2022-07-21), p. 1"}
         scores = [h["score"] for h in data["hits"]]
         assert scores == sorted(scores, reverse=True)

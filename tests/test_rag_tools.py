@@ -34,6 +34,8 @@ from rag_fixture import (
     ECB_RATES,
     FOMC,
     MODEL,
+    MPC,
+    PROJECTIONS,
     SOURCE_CODES,
     embedder,
     local_store,
@@ -51,12 +53,14 @@ pytestmark = pytest.mark.anyio
 HOST, KEY = "qdrant.secret-host.example", "k-hunter2"
 DATES_SENTENCE = ("With a bound set, a document known only to the month or the year matches any range overlapping "
                   "its period; documents without a date are left out unless include_undated is true.")
-UNDATED_SENTENCE = ("- include_undated: true to also get the documents without a date when a bound is set (default "
-                    "false; no effect without a bound).")
+UNDATED_SENTENCE = "- include_undated: true also keeps the documents without a date under a date bound; default false."
 CITATION_SENTENCE = ("cite each passage with its `citation`, a ready-made reference: title, then source and "
                      "document-type codes and date in brackets, then the page, each part the document lacks left out.")
-HIT_KEYS = ["rank", "score", "text", "doc_id", "title", "date", "source_code", "doc_type", "language", "page",
-            "chunk_number", "citation"]
+HIT_KEYS = ["rank", "score", "text", "doc_id", "title", "date", "date_precision", "date_kind", "source_code",
+            "doc_type", "language", "page", "chunk_number", "citation"]
+PRECISION_SENTENCE = ("`date_precision` (day, month, year or null) says how much of `date` is known: a month or a "
+                      "year is written as its first day. `date_kind` (such as publication or meeting, or null) "
+                      "says what the date marks.")
 
 
 def _settings(**overrides) -> Settings:
@@ -112,7 +116,8 @@ async def test_the_tool_is_namespaced_read_only_and_described_for_a_model(backen
     for needle in ("YYYY-MM-DD", "inclusive", "does not write an answer", "counted from 1", "citation",
                    "PASSAGES", "never corrected", "JSON arrays", "server_info", "rag.source_codes",
                    "rag.doc_types", "rag.languages", "never send an empty array", "an array even for a single code",
-                   DATES_SENTENCE, UNDATED_SENTENCE, CITATION_SENTENCE,
+                   DATES_SENTENCE, UNDATED_SENTENCE, CITATION_SENTENCE, PRECISION_SENTENCE,
+                   "title, date, date_precision, date_kind, source_code,",
                    "limit: number of passages, from 1 to 20; omitted = 8."):
         assert needle in tool.description, needle
     # The default text is corpus-neutral: no bank, no code and no meaning of a code that could go stale.
@@ -156,8 +161,8 @@ async def test_the_description_says_how_a_bound_treats_a_month_or_a_year_in_the_
     async with _client(backend, rag_date_filter_mode=mode) as c:
         description = {t.name: t for t in await c.list_tools()}["rag_search"].description
     assert (DATES_SENTENCE in description) is overlap
-    legacy = ("With a bound set, a document known only to the month or the year matches only a range holding the "
-              "first day of its period; documents without a date are left out unless include_undated is true.")
+    legacy = ("With a bound set, a document known only to the month or the year is found only at the first day of "
+              "its period; documents without a date are left out unless include_undated is true.")
     assert (legacy in description) is not overlap
 
 
@@ -174,7 +179,8 @@ async def test_a_hit_carries_the_passage_its_document_and_a_citation_and_nothing
     first = data["hits"][0]
     assert list(first) == HIT_KEYS  # no point_id (64-bit), no payload, no corpus
     assert first == {"rank": 1, "score": 1.0, "text": ECB_RATES, "doc_id": "ecb/A1/2022-07-21",
-                     "title": "Monetary policy decisions", "date": "2022-07-21", "source_code": "ecb",
+                     "title": "Monetary policy decisions", "date": "2022-07-21", "date_precision": "day",
+                     "date_kind": "meeting", "source_code": "ecb",
                      "doc_type": "A1", "language": "en", "page": 1, "chunk_number": 0,
                      "citation": "Monetary policy decisions (ecb A1, 2022-07-21), p. 1"}
 
@@ -215,6 +221,52 @@ def test_human_page_is_the_stored_page_plus_one_or_nothing(stored, shown):
 def test_citation_leaves_out_what_is_missing(hit, expected):
     """What the description announces: title, then codes and date in brackets, then the page."""
     assert citation(hit) == expected
+
+
+@pytest.mark.parametrize(("date", "precision", "shown"), [
+    ("2016-07-01", "month", "July 2016"),
+    ("2016-01-01", "month", "January 2016"),
+    ("2016-12-01", "month", "December 2016"),
+    ("2016-07-14", "month", "July 2016"),  # not the first day: the month all the same
+    ("2016-07-01T00:00:00Z", "month", "July 2016"),
+    ("2016-01-01", "year", "2016"),
+    ("2016-07-01T00:00:00Z", "year", "2016"),
+    ("2016-07-01", "day", "2016-07-01"),
+    ("2016-07-01", None, "2016-07-01"),  # unknown: the stored date, as before the producers stated it
+    ("2016-07-01", "week", "2016-07-01"),  # a precision the server does not know: the stored date
+    ("2016-07-01", "", "2016-07-01"),
+    ("2016-07-01", ["month"], "2016-07-01"),
+    ("2016-13-01", "month", "2016-13-01"),  # not a month: written as stored, never guessed
+    ("2016-00-01", "month", "2016-00-01"),
+    ("2016-07", "month", "2016-07"),  # not a full date: as stored
+    ("2016", "year", "2016"),
+    ("20160701", "month", "20160701"),
+    ("2016-07-011", "month", "2016-07-011"),
+    (None, "month", None),
+    ("", "year", None),
+])
+def test_the_citation_writes_the_date_at_its_precision(date, precision, shown):
+    hit = {"title": "T", "source_code": "gb", "doc_type": "A3", "date": date, "date_precision": precision, "page": 0}
+    assert citation(hit) == (f"T (gb A3, {shown}), p. 1" if shown else "T (gb A3), p. 1")
+
+
+async def test_a_hit_says_how_precise_its_date_is_and_what_it_marks(backend):
+    """Null when the payload has neither key: the production collection until the producers' backfill
+    reaches it. A month or a year is cited as such, a day or an unknown precision as the stored date."""
+    async with _client(backend) as c:
+        async def first(text):
+            hit = (await c.call_tool("rag_search", {"query": text, "limit": 1})).data["hits"][0]
+            return hit["doc_id"], hit["date"], hit["date_precision"], hit["date_kind"], hit["citation"]
+
+        assert await first(MPC) == ("gb/A3/2016-07", "2016-07-01", "month", "meeting",
+                                    "Monetary Policy Summary (gb A3, July 2016), p. 2")
+        assert await first(PROJECTIONS) == ("ecb/E1/2015", "2015-01-01", "year", "period",
+                                            "Staff projections (ecb E1, 2015)")
+        assert await first(ECB_RATES) == ("ecb/A1/2022-07-21", "2022-07-21", "day", "meeting",
+                                          "Monetary policy decisions (ecb A1, 2022-07-21), p. 1")
+        assert await first(FOMC) == ("us/A3/2022-06-15", "2022-06-15", None, None,  # neither key stored
+                                     "Minutes of the Federal Open Market Committee (us A3, 2022-06-15), p. 5")
+        assert await first(BOE) == ("gb/B1/undated", None, None, None, "gb/B1/undated (gb B1), p. 3")  # nulls
 
 
 # -- arguments ---------------------------------------------------------------------------------------
@@ -1592,7 +1644,8 @@ class _CannedBackend:
     def search(self, *, query, filters, limit, max_limit, deadline=None):
         self.threads.append(threading.current_thread())
         hits = [{"score": 0.123456 - n / 100, "text": text, "doc_id": f"d{n}", "title": f"T{n}", "page": n,
-                 "date": "2022-01-01", "source_code": "ecb", "doc_type": "A1", "language": "en",
+                 "date": "2022-01-01", "date_precision": "month", "date_kind": "publication",
+                 "source_code": "ecb", "doc_type": "A1", "language": "en",
                  "chunk_number": n, "corpus": "central-bank", "point_id": 2**62 + n}
                 for n, text in enumerate(self.texts)]
         return {name: None for name in ("source_codes", "doc_types", "languages", "date_from", "date_to")}, hits[:limit]
@@ -1607,6 +1660,20 @@ async def test_a_result_over_the_cap_is_refused_naming_the_largest_limit_that_fi
         assert message.endswith(f"ask again with limit={fits} or less") and 1 <= fits < 8
         assert (await c.call_tool("rag_search", {"query": "q", "limit": fits})).data["count"] == fits  # it fits
         assert (await _error(c, {"query": "q", "limit": fits + 1})).startswith("[result_too_large]")  # the largest
+
+
+async def test_the_cap_counts_the_date_fields_and_the_citation_as_served():
+    """The limit named by the refusal is the largest that fits with every field of a hit, the two date
+    fields and the citation written to its precision included."""
+    backend = _CannedBackend(["x" * 300] * 6)
+    async with _client(backend, max_result_chars=2000) as c:
+        fits = int((await _error(c, {"query": "q"})).rsplit("limit=", 1)[1].split()[0])
+        served = await c.call_tool("rag_search", {"query": "q", "limit": fits})
+        assert len(served.content[0].text) <= 2000
+        hit = served.data["hits"][0]
+        assert (hit["date_precision"], hit["date_kind"]) == ("month", "publication")
+        assert hit["citation"] == "T0 (ecb A1, January 2022), p. 1"
+        assert (await _error(c, {"query": "q", "limit": fits + 1})).startswith("[result_too_large]")
 
 
 async def test_a_single_passage_over_the_cap_is_refused_not_cut():

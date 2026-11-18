@@ -640,7 +640,9 @@ class EngineRagBackend:
              "date_from": applied.date_from.isoformat() if applied.date_from else None,
              "date_to": applied.date_to.isoformat() if applied.date_to else None,
              "include_undated": applied.include_undated},
-            [hit.to_dict() for hit in hits],
+            # The engine's hit has no field for these two: they are read from the stored payload.
+            [{**hit.to_dict(), "date_precision": hit.payload.get("date_precision"),
+              "date_kind": hit.payload.get("date_kind")} for hit in hits],
         )
 
 
