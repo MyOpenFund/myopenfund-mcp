@@ -40,7 +40,7 @@ SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset; an offset is whole m
 # InvalidTimeZoneDisplacementValue); vault-query refuses the rest with a message naming its own grammar.
 MAX_SINCE_OFFSET = dt.timedelta(hours=15, minutes=59)
 
-RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first:
+RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first unless stated:
 - `runs`: one row per run (run grain), with its outcome and totals. A run with no per-source detail
   (e.g. it crashed before reaching any source) appears only here.
 - `source_runs`: one row per (run, source): counts, outcome and bounded error samples.
