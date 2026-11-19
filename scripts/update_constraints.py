@@ -93,7 +93,8 @@ def main() -> int:
     text = HEADER.format(extras=EXTRAS, py=py, plat=f"{sys.platform} {platform.machine()}") + "\n".join(pins) + "\n"
     (ROOT / "constraints.txt").write_text(text)
     plat = f"{sys.platform} {platform.machine()}"
-    (ROOT / "build-constraints.txt").write_text(BUILD_HEADER.format(py=py, plat=plat, sources="\n".join(f"#   {pin}" for pin in git_pins())) + "\n".join(build_pins) + "\n")
+    sources = "\n".join(f"#   {pin}" for pin in git_pins())
+    (ROOT / "build-constraints.txt").write_text(BUILD_HEADER.format(py=py, plat=plat, sources=sources) + "\n".join(build_pins) + "\n")
     print(f"constraints.txt: {len(pins)} pins; build-constraints.txt: {len(build_pins)} pins ({', '.join(backends)})")
     return 0
 
