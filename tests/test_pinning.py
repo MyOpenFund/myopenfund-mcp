@@ -62,6 +62,20 @@ def test_build_backends_are_pinned_and_used():
             "build-constraints.txt") in COMPOSE
 
 
+def test_build_constraints_were_generated_from_the_current_git_pins():
+    """A git dependency bumped without regenerating build-constraints.txt could bring another build
+    backend that would then float: the file records the pins it was built from."""
+    pins = re.findall(r"git\+https://github\.com/([^/@\s]+/[^/@\s]+)@([0-9a-f]{40})(?:#subdirectory=([^\s\"']+))?",
+                      PYPROJECT)
+    expected = sorted(f"{r}@{c}" + (f"#{sub}" if sub else "") for r, c, sub in set(pins))
+    recorded = sorted(re.findall(r"^#   (\S+)$", BUILD_CONSTRAINTS, re.MULTILINE))
+    assert recorded == expected, "git pins changed: run python3.13 scripts/update_constraints.py"
+
+
+def test_editable_build_requirement_is_pinned():
+    assert re.search(r"^editables==", BUILD_CONSTRAINTS, re.MULTILINE)
+
+
 # --- the checker's own logic, on fake distributions ---------------------------------------------------
 _spec = importlib.util.spec_from_file_location("check_constraints", ROOT / "scripts" / "check_constraints.py")
 checker = importlib.util.module_from_spec(_spec)
