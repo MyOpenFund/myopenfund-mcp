@@ -24,3 +24,20 @@ jobs:
       - run: pip install -e ".[vault,companies,rag,dev]"
       - run: ruff check .
       - run: python -m pytest -q
+  # The versions the deployment installs: constraints.txt (README, "Pinned versions"). The job above
+  # keeps floating within the ranges of pyproject.toml, so a coming break shows there first.
+  locked:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.18"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints.txt
+            build-constraints.txt
+      - run: pip install -c constraints.txt --build-constraint build-constraints.txt -e ".[vault,companies,rag,dev]"
+      - run: python scripts/check_constraints.py
+      - run: python -m pytest -q

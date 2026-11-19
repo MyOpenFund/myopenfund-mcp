@@ -96,6 +96,51 @@ the compose file publishes it on `127.0.0.1` of the host unless `MOF_MCP_BIND_AD
 `.env`, leave `MOF_MCP_TRANSPORT` and `MOF_MCP_HOST` unset: the image sets them. The compose file also runs it with a
 read-only root filesystem (writable `/tmp` only), no Linux capabilities and `no-new-privileges`.
 
+### Pinned versions
+
+Every rebuild of the image and every start of the `install` service installs the same Python packages,
+the ones the CI tested:
+
+- **Base image**: `PYTHON_IMAGE` in the [`Dockerfile`](Dockerfile), a tag **and** a digest
+  (`python:3.13.<patch>-slim-<debian>@sha256:...`); the variant without a built image in
+  `compose.example.yaml` uses the same value. The image's Python and pip come with it.
+- **PyPI runtime dependencies**: [`constraints.txt`](constraints.txt), the exact version of every
+  dependency of `[vault,companies,rag]` on that image (fastmcp and everything below it), passed with
+  `-c`.
+- **Build backends**: this package and its git dependencies are built from source at every install, in
+  isolated build environments that `-c` does not reach; [`build-constraints.txt`](build-constraints.txt)
+  pins their backends (hatchling, setuptools and their dependencies), passed with `--build-constraint`.
+- **Git dependencies** (`vault-query`, `my-open-data`, `company-corpus`, `rag-engine`): pinned by full
+  commit in `pyproject.toml`, as before.
+
+The `install` service passes both files of the same commit as URLs (the same `<commit>` three times):
+
+```
+pip install -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/constraints.txt \
+  --build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/build-constraints.txt \
+  'myopenfund-mcp[...] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'
+```
+
+so the host also needs outbound HTTPS to `raw.githubusercontent.com` at each start, besides `github.com`
+and PyPI.
+
+Not covered: the `git` package the build stage installs with apt (a build tool, absent at runtime), file
+hashes (pins are `==` versions, not `--require-hashes`, which pip refuses next to git requirements), and,
+outside Python, the DuckDB extensions the companies toolset downloads at start and the embedding model
+(pinned by its own revision, see [Deploying the rag toolset](#deploying-the-rag-toolset)).
+
+The CI runs the tests twice: floating within the ranges of `pyproject.toml` (Python 3.12 and 3.13, so a
+coming break shows early) and locked (`locked` job: the image's Python, both constraint files, then
+`scripts/check_constraints.py`, which fails when a runtime dependency of the server is missing from
+`constraints.txt` or installed at another version, e.g. a new dependency brought by a release, and when an
+extra it is asked to check does not exist).
+
+**Upgrading** is a deliberate change in a pull request: for the base image, look up the digest of the new
+tag (`docker buildx imagetools inspect python:<tag>`) and replace `PYTHON_IMAGE` in the Dockerfile and the
+image lines of `compose.example.yaml`; for the packages, run `python3.13 scripts/update_constraints.py` (on
+linux x86_64, the image's platform; it reads the git dependencies' build requirements from GitHub at their
+pinned commits) and commit both regenerated files. The `locked` job then tests the new set.
+
 A client connects with its token, e.g. with Claude Code:
 
 ```bash

@@ -1,19 +1,24 @@
 # Host-agnostic image: everything deployment-specific comes from MOF_* environment variables.
+# Pinned base image: tag AND digest, so a rebuild never picks up another Python or Debian silently.
+# Changing it is a deliberate bump (README, "Pinned versions"): same value in compose.example.yaml.
+ARG PYTHON_IMAGE=python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 # Build stage: git is needed only to fetch the pinned git dependencies of the extras, never at runtime.
-FROM python:3.13-slim AS build
+FROM ${PYTHON_IMAGE} AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 WORKDIR /src
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE constraints.txt build-constraints.txt ./
 COPY src ./src
 # Toolset extras installed in the image, comma-separated: vault (default), companies, rag.
 ARG MOF_EXTRAS=vault
-RUN pip install --no-cache-dir ".[${MOF_EXTRAS}]"
+# -c constraints.txt: every PyPI runtime dependency at the exact version the CI tested; --build-constraint:
+# the build backends of this package and of the git dependencies, built from source (README, "Pinned versions").
+RUN pip install --no-cache-dir -c constraints.txt --build-constraint build-constraints.txt ".[${MOF_EXTRAS}]"
 
-FROM python:3.13-slim
+FROM ${PYTHON_IMAGE}
 RUN groupadd --gid 10001 mcp && useradd --uid 10001 --gid 10001 --create-home mcp
 COPY --from=build /opt/venv /opt/venv
 # Mount point of the rag toolset's model cache (MOF_RAG_MODEL_CACHE=/models). It exists and belongs to
