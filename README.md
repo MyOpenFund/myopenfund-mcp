@@ -109,7 +109,9 @@ the ones the CI tested:
   `-c`.
 - **Build backends**: this package and its git dependencies are built from source at every install, in
   isolated build environments that `-c` does not reach; [`build-constraints.txt`](build-constraints.txt)
-  pins their backends (hatchling, setuptools and their dependencies), passed with `--build-constraint`.
+  pins their backends (hatchling, setuptools and their dependencies, plus `editables`, which hatchling
+  needs for the CI's editable install), passed with `--build-constraint`. The file records the git pins it
+  was generated from: bumping one without regenerating fails the tests.
 - **Git dependencies** (`vault-query`, `my-open-data`, `company-corpus`, `rag-engine`): pinned by full
   commit in `pyproject.toml`, as before.
 
