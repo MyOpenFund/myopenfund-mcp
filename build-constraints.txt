@@ -5,7 +5,7 @@
 #   MyOpenFund/company-corpus@06c619d7d216d230b92ea62394672f8dd443830f
 #   MyOpenFund/my-open-data@3252e97dd6808290895cc4e117685388e6d4e354
 #   MyOpenFund/rag-engine@6be21ac393d82d7c5c1a058dcad8204ae15c7289
-#   MyOpenFund/vault@fe262cbeb0a6605606c46c39fb7c53e444b15058#query
+#   MyOpenFund/vault@5f459b370ba6c93ff988a02df2523c1d2f9f2b29#query
 editables==0.6
 hatchling==1.33.0
 packaging==26.3
