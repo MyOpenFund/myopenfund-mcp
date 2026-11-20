@@ -114,7 +114,8 @@ def _build_requires() -> list[str]:
     """scripts/update_constraints.py's build_requires(): one source for what the generator pins."""
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("update_constraints", ROOT / "scripts" / "update_constraints.py")
+    path = ROOT / "scripts" / "update_constraints.py"
+    spec = importlib.util.spec_from_file_location("update_constraints", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.build_requires()

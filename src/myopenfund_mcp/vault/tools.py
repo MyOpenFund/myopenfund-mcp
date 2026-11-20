@@ -41,7 +41,8 @@ DOC_TYPE_NEEDS_CORPUS = (
     "the conversation, ask the user which corpus they mean (or infer it from context: a 10-K is a company "
     "filing, a rate decision a central-bank document); without corpus the call is refused with "
     "[invalid_argument] listing each corpus's codes and labels (vault_vocabulary lists them too)")
-DOC_TYPE_DESCRIPTION = f"Document-type code within its corpus, e.g. 'C1'; exact match; {DOC_TYPE_NEEDS_CORPUS}"
+DOC_TYPE_DESCRIPTION = (f"Document-type code within its corpus, e.g. 'C1'; exact match; "
+                        f"{DOC_TYPE_NEEDS_CORPUS}")
 GROUP_BY_DESCRIPTION = f"Field the live documents are counted by; doc_type {DOC_TYPE_NEEDS_CORPUS}"
 SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset; an offset is whole minutes, at most +/-15:59); "
                      "keeps runs FINISHED at or after it; runs still "
@@ -62,8 +63,8 @@ RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first u
 - `source_health`: expected-vs-observed publication cadence per series, the least healthy first:
   `cadence_status` overdue, then soon, then the rest; within each, most `days_late` first (unknown
   last). Each row also carries `source_bad_content_7d` (sum over 7 days, NULL when no run of the window
-  reported it) and `last_run_bad_content` (the last run's value). `source_health_total` counts every series matching corpus/source_code, so a smaller list
-  means `limit` left some out.
+  reported it) and `last_run_bad_content` (the last run's value). `source_health_total` counts
+  every series matching corpus/source_code, so a smaller list means `limit` left some out.
 `limit` applies to each of `runs`, `source_runs`, `open_discovery_errors` and `source_health`.
 A result over the server's size cap is refused, never cut: ask for a smaller `limit`, or filter by
 `source_code`."""
@@ -151,8 +152,9 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         doc_id ascending, whatever `sort_dir`. That order is fixed within a corpus only: two corpora
         can hold the same doc_id, and two such rows with equal sort values may swap between calls, so
         a page boundary between them can repeat one and skip the other; filter by corpus when paging
-        matters. `total` counts the whole filtered set; pass `next_cursor` back (same filters) to get the next page. Cursors are
-        offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped).
+        matters. `total` counts the whole filtered set; pass `next_cursor` back (same filters) to get
+        the next page. Cursors are offsets: if the vault is ingesting between two pages, a row can
+        shift (seen twice or skipped).
         A `doc_type` filter needs `corpus`: ask the user which corpus when the context does not say.
         Open a row with vault_get_document(doc_id, corpus) using the row's own `corpus`."""
         page = clamp_limit(limit, settings)

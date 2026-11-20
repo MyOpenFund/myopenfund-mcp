@@ -106,8 +106,10 @@ async def test_doc_type_without_corpus_carries_vault_querys_message_whole():
 
 async def test_doc_type_with_corpus_is_answered():
     async with _client() as c:
-        page = (await c.call_tool("vault_search_documents", {"doc_type": "A1", "corpus": "central-bank"})).data
-        stats = (await c.call_tool("vault_corpus_stats", {"group_by": "doc_type", "corpus": "central-bank"})).data
+        filters = {"doc_type": "A1", "corpus": "central-bank"}
+        page = (await c.call_tool("vault_search_documents", filters)).data
+        grouping = {"group_by": "doc_type", "corpus": "central-bank"}
+        stats = (await c.call_tool("vault_corpus_stats", grouping)).data
     assert [d["doc_id"] for d in page["documents"]] == ["fr1"]
     assert {g["key"] for g in stats["groups"]} == {"A1", "C1"}
 
@@ -196,7 +198,8 @@ async def test_a_result_over_the_cap_is_refused_not_cut():
 
 async def test_get_document_unknown_is_not_found():
     async with _client() as c:
-        assert (await c.call_tool("vault_get_document", {"doc_id": "fr1"})).data[0]["mime_type"] == "text/html"
+        fr1 = (await c.call_tool("vault_get_document", {"doc_id": "fr1"})).data
+        assert fr1[0]["mime_type"] == "text/html"
         with pytest.raises(ToolError, match=r"\[not_found\]"):
             await c.call_tool("vault_get_document", {"doc_id": "nope"})
 

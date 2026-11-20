@@ -1,7 +1,8 @@
 """An in-memory VaultReader with adversarial data.
 
 NULL date, an html row, a tombstone, a same-date pair, a run that crashed before any source
-(run grain only), an error-only source, bad_content NULL and counted, an approximate `last_seen_at`, Decimal and naive values;
+(run grain only), an error-only source, bad_content NULL and counted, an approximate `last_seen_at`,
+Decimal and naive values;
 TWINS: one doc_id held by two corpora (a doc_id is unique within its corpus only).
 """
 from __future__ import annotations
@@ -34,8 +35,10 @@ DOCS = [
 TWINS = [
     {"doc_id": "twin", "corpus": "company", "source_code": "sec", "doc_type": "A1", "title": "Form 10-K",
      "date": dt.date(2024, 2, 2), "year": 2024, "mime_type": "text/plain", "deleted_at": None,
-     "date_precision": "day", "date_kind": "publication", "entity_scheme": "cik", "entity_value": "0000320193"},
-    {"doc_id": "twin", "corpus": "central-bank", "source_code": "us", "doc_type": "A1", "title": "Rate decision",
+     "date_precision": "day", "date_kind": "publication", "entity_scheme": "cik",
+     "entity_value": "0000320193"},
+    {"doc_id": "twin", "corpus": "central-bank", "source_code": "us", "doc_type": "A1",
+     "title": "Rate decision",
      "date": dt.date(2024, 1, 1), "year": 2024, "mime_type": "application/pdf", "deleted_at": None,
      "date_precision": "year", "date_kind": None, "entity_scheme": None, "entity_value": None},
 ]
@@ -50,12 +53,14 @@ DOC_TYPE_NEEDS_CORPUS = (
 # The `vocabulary` table: the same code in two corpora with two meanings; a NULL label and family.
 VOCABULARY = [
     {"corpus": "company", "kind": "doc_type", "code": "A1", "label": "Annual report (10-K)", "family": "A"},
-    {"corpus": "central-bank", "kind": "source_code", "code": "us", "label": "Federal Reserve", "family": None},
+    {"corpus": "central-bank", "kind": "source_code", "code": "us", "label": "Federal Reserve",
+     "family": None},
     {"corpus": "central-bank", "kind": "doc_type", "code": "C1", "label": "Minutes", "family": "C"},
     {"corpus": "central-bank", "kind": "doc_type", "code": "A1", "label": "Monetary policy decision",
      "family": "A"},
     {"corpus": "company", "kind": "entity_scheme", "code": "cik", "label": None, "family": None},
-    {"corpus": "company", "kind": "doc_type", "code": "A2", "label": "Quarterly report (10-Q)", "family": "A"},
+    {"corpus": "company", "kind": "doc_type", "code": "A2", "label": "Quarterly report (10-Q)",
+     "family": "A"},
 ]
 
 # Run grain: r0 crashed before reaching any source, so it has no runs_status row.

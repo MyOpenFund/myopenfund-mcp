@@ -69,7 +69,8 @@ def test_driver_errors_become_codes_and_never_leak(pg, exc, code):
 @pytest.mark.parametrize(("exc", "missing"), [
     (psycopg2.errors.UndefinedColumn('column "bad_content" does not exist\nLINE 1: SELECT bad_content'),
      'column "bad_content" does not exist'),
-    (psycopg2.errors.UndefinedTable('relation "vocabulary" does not exist'), 'relation "vocabulary" does not exist'),
+    (psycopg2.errors.UndefinedTable('relation "vocabulary" does not exist'),
+     'relation "vocabulary" does not exist'),
 ])
 def test_an_older_vault_schema_is_named_not_reported_as_an_outage(pg, monkeypatch, caplog, exc, missing):
     def query(conn, *args, **kwargs):
@@ -146,7 +147,8 @@ def test_a_cut_codes_list_points_at_the_mcp_tool_not_the_library(pg, monkeypatch
     vault_vocabulary."""
     def refuse(conn, *args, **kwargs):
         raise vault_query.DocTypeNeedsCorpus(
-            "doc_type needs corpus: ... Codes per corpus: company: A1 = 10-K (list cut: see vault_query.list_vocabulary)")
+            "doc_type needs corpus: ... Codes per corpus: company: A1 = 10-K "
+            "(list cut: see vault_query.list_vocabulary)")
 
     monkeypatch.setattr(vault_query, "corpus_stats", refuse)
     with pytest.raises(ToolError) as info:

@@ -35,7 +35,8 @@ async def test_real_vault_read_path():
                                      {"limit": 5, "cursor": page["next_cursor"]})).data
             # A document is (corpus, doc_id): the same doc_id may be on both pages, once per corpus.
             first_ids = {(d["corpus"], d["doc_id"]) for d in page["documents"]}
-            assert nxt["returned"] > 0 and first_ids.isdisjoint((d["corpus"], d["doc_id"]) for d in nxt["documents"])
+            next_ids = {(d["corpus"], d["doc_id"]) for d in nxt["documents"]}
+            assert nxt["returned"] > 0 and first_ids.isdisjoint(next_ids)
         else:
             assert page["next_cursor"] is None
 
@@ -80,12 +81,14 @@ async def test_real_vault_query_contract():
         for tool, args in (("vault_search_documents", {"doc_type": "A1"}),
                            ("vault_corpus_stats", {"group_by": "doc_type"})):
             r = await c.call_tool(tool, args, raise_on_error=False)
-            assert r.is_error and r.content[0].text.startswith("[invalid_argument] doc_type needs corpus"), tool
+            assert r.is_error, tool
+            assert r.content[0].text.startswith("[invalid_argument] doc_type needs corpus"), tool
         page = (await c.call_tool("vault_search_documents", {"limit": 1})).data
         assert {"date_precision", "date_kind", "entity_scheme", "entity_value"} <= set(page["documents"][0])
         codes = (await c.call_tool("vault_vocabulary", {"limit": 5})).data
         assert codes["returned"] == len(codes["codes"]) <= 5
         assert all(set(v) == {"corpus", "kind", "code", "label", "family"} for v in codes["codes"])
+
 
 def test_connection_is_read_only():
     """The server-side guard (default_transaction_read_only) holds whatever the role may do."""

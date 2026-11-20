@@ -182,7 +182,8 @@ def test_build_check_wants_every_build_requirement_pinned_within_its_specifier()
 
 def test_build_check_runs_on_the_committed_files(monkeypatch):
     """The `--build` mode as the locked job runs it, with the GitHub reads of build_requires replaced."""
-    monkeypatch.setattr(checker, "_build_requires", lambda: ["editables", "hatchling>=1.25", "setuptools>=77"])
+    requirements = ["editables", "hatchling>=1.25", "setuptools>=77"]
+    monkeypatch.setattr(checker, "_build_requires", lambda: requirements)
     assert checker.main(["--build"]) == 0
     monkeypatch.setattr(checker, "_build_requires", lambda: ["hatchling>=99"])
     assert checker.main(["--build"]) == 1

@@ -80,7 +80,8 @@ class PostgresVaultReader:
                 return fn(conn, *args, **kwargs)
         except self._vq.InvalidQuery as exc:
             # A cut doc_type-needs-corpus list names the library's function; a model calls the tool.
-            error = tool_error(INVALID_ARGUMENT, str(exc).replace("vault_query.list_vocabulary", "vault_vocabulary"))
+            message = str(exc).replace("vault_query.list_vocabulary", "vault_vocabulary")
+            error = tool_error(INVALID_ARGUMENT, message)
         except self._pg.errors.QueryCanceled:
             error = tool_error(TIMEOUT, "the vault query exceeded MOF_MCP_QUERY_TIMEOUT_S (slow query, or the "
                                         "vault is being migrated); retry later or narrow the filters")
