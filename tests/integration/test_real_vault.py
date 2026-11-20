@@ -33,8 +33,9 @@ async def test_real_vault_read_path():
             assert page["next_cursor"]
             nxt = (await c.call_tool("vault_search_documents",
                                      {"limit": 5, "cursor": page["next_cursor"]})).data
-            first_ids = {d["doc_id"] for d in page["documents"]}
-            assert nxt["returned"] > 0 and first_ids.isdisjoint(d["doc_id"] for d in nxt["documents"])
+            # A document is (corpus, doc_id): the same doc_id may be on both pages, once per corpus.
+            first_ids = {(d["corpus"], d["doc_id"]) for d in page["documents"]}
+            assert nxt["returned"] > 0 and first_ids.isdisjoint((d["corpus"], d["doc_id"]) for d in nxt["documents"])
         else:
             assert page["next_cursor"] is None
 
