@@ -146,9 +146,12 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         """Find official documents (metadata, not text). Start here: filter, then open one with
         vault_get_document. Read `date` with `date_precision` (day, month or year; null = not stated:
         a year-precision date is the period's first day, not a known day) and `date_kind` (publication,
-        meeting or period); `entity_scheme` / `entity_value` name the issuing entity (e.g. cik). Rows are ordered by `sort_by` in `sort_dir`; documents with equal sort
-        values are always ordered by doc_id ascending, whatever `sort_dir`. `total` counts the
-        whole filtered set; pass `next_cursor` back (same filters) to get the next page. Cursors are
+        meeting or period); `entity_scheme` / `entity_value` name the issuing entity (e.g. cik).
+        Rows are ordered by `sort_by` in `sort_dir`; documents with equal sort values are ordered by
+        doc_id ascending, whatever `sort_dir`. That order is fixed within a corpus only: two corpora
+        can hold the same doc_id, and two such rows with equal sort values may swap between calls, so
+        a page boundary between them can repeat one and skip the other; filter by corpus when paging
+        matters. `total` counts the whole filtered set; pass `next_cursor` back (same filters) to get the next page. Cursors are
         offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped).
         A `doc_type` filter needs `corpus`: ask the user which corpus when the context does not say.
         Open a row with vault_get_document(doc_id, corpus) using the row's own `corpus`."""

@@ -476,6 +476,14 @@ async def test_search_description_warns_that_pages_can_shift_while_ingesting():
     assert "shift" in search and "ingesting" in search
 
 
+async def test_search_description_says_the_order_is_fixed_within_a_corpus_only():
+    """vault-query breaks ties by doc_id alone; a doc_id is unique within its corpus only."""
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    search = " ".join(tools["vault_search_documents"].description.split())
+    assert "within a corpus" in search and "filter by corpus" in search
+
+
 @pytest.mark.parametrize(("given", "expected"), [
     ("2026-09-01T00:00:00", dt.datetime(2026, 9, 1, tzinfo=dt.UTC)),
     ("2026-09-01T02:00:00+02:00", dt.datetime(2026, 9, 1, 2, tzinfo=dt.timezone(dt.timedelta(hours=2)))),
