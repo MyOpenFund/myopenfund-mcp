@@ -379,6 +379,17 @@ async def test_parameter_descriptions_are_present():
     assert runs["source_code"]["description"] == search["source_code"]["description"]
 
 
+async def test_search_rows_carry_the_contract_columns_and_the_description_says_how_to_read_them():
+    async with _client(FakeVaultReader(docs=TWINS)) as c:
+        tools = {t.name: t for t in await c.list_tools()}
+        rows = (await c.call_tool("vault_search_documents", {"corpus": "company"})).data["documents"]
+    assert [(r["date_precision"], r["date_kind"], r["entity_scheme"], r["entity_value"]) for r in rows] == [
+        ("day", "publication", "cik", "0000320193")]
+    search = tools["vault_search_documents"].description
+    for column in ("date_precision", "date_kind", "entity_scheme", "entity_value"):
+        assert column in search, column
+
+
 async def test_search_description_warns_that_pages_can_shift_while_ingesting():
     async with _client() as c:
         tools = {t.name: t for t in await c.list_tools()}

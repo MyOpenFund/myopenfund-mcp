@@ -123,7 +123,9 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
             description="Also return withdrawn documents (tombstones, with `deleted_at` set)")] = False,
     ) -> dict:
         """Find official documents (metadata, not text). Start here: filter, then open one with
-        vault_get_document. Rows are ordered by `sort_by` in `sort_dir`; documents with equal sort
+        vault_get_document. Read `date` with `date_precision` (day, month or year; null = not stated:
+        a year-precision date is the period's first day, not a known day) and `date_kind` (publication,
+        meeting or period); `entity_scheme` / `entity_value` name the issuing entity (e.g. cik). Rows are ordered by `sort_by` in `sort_dir`; documents with equal sort
         values are always ordered by doc_id ascending, whatever `sort_dir`. `total` counts the
         whole filtered set; pass `next_cursor` back (same filters) to get the next page. Cursors are
         offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped).

@@ -186,7 +186,8 @@ PASS_THROUGH = [
     ("search_documents",
      {"filters": {"corpus": "amf"}, "sort_by": "date", "sort_dir": "asc", "limit": 9, "offset": 3, "include_deleted": True},
      (({"corpus": "amf"},), {"sort_by": "date", "sort_dir": "asc", "limit": 9, "offset": 3, "include_deleted": True,
-                                 "columns": vault_query.SEARCH_COLUMNS})),
+                                 "columns": (*vault_query.SEARCH_COLUMNS, "date_precision", "date_kind",
+                                             "entity_scheme", "entity_value")})),
     ("get_document", {"doc_id": "d1", "corpus": "amf"}, (("d1",), {"corpus": "amf"})),
     ("corpus_stats", {"group_by": "year", "corpus": "amf", "limit": 12},
      (("year",), {"corpus": "amf", "limit": 12})),
@@ -201,6 +202,14 @@ PASS_THROUGH = [
      ((), {"corpus": "amf", "source_code": None, "limit": 4, "max_text_chars": 50})),
     ("freshness", {}, ((), {})),
 ]
+
+
+def test_search_projection_adds_the_contract_columns_to_vault_querys(pg):
+    SEARCH_COLUMNS = _reader().search_columns
+    assert SEARCH_COLUMNS[:len(vault_query.SEARCH_COLUMNS)] == vault_query.SEARCH_COLUMNS
+    assert {"date_precision", "date_kind", "entity_scheme", "entity_value"} <= set(SEARCH_COLUMNS)
+    assert len(set(SEARCH_COLUMNS)) == len(SEARCH_COLUMNS) and set(SEARCH_COLUMNS) <= vault_query.ALL_COLUMNS
+    assert "extra" not in SEARCH_COLUMNS and "local_path" not in SEARCH_COLUMNS
 
 
 def test_pass_through_covers_every_reader_method():

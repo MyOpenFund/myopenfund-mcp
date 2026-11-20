@@ -11,6 +11,12 @@ from typing import Any, Protocol
 
 from ..errors import BACKEND_UNAVAILABLE, INVALID_ARGUMENT, TIMEOUT, tool_error
 
+# Documents-contract columns added to vault-query's SEARCH_COLUMNS in search results: what `date`
+# means (`date_precision`: a year-precision date is 1 January; `date_kind`: publication or period) and
+# who issued the document (`entity_scheme`, `entity_value`, e.g. cik 0000320193), which a reader needs
+# to pick a document from a list. A few short values per row; `extra` stays in get_document.
+CONTRACT_SEARCH_COLUMNS = ("date_precision", "date_kind", "entity_scheme", "entity_value")
+
 
 class VaultReader(Protocol):
     def search_documents(self, *, filters: dict, sort_by: str, sort_dir: str, limit: int,
@@ -35,6 +41,8 @@ class PostgresVaultReader:
         self._pg, self._vq = psycopg2, vault_query
         self._url, self._timeout_ms = database_url, query_timeout_s * 1000
         self._connect_timeout_s = connect_timeout_s
+        self.search_columns = (*vault_query.SEARCH_COLUMNS,
+                               *(c for c in CONTRACT_SEARCH_COLUMNS if c not in vault_query.SEARCH_COLUMNS))
 
     def _options(self) -> str:
         # The DSN's own options (e.g. search_path) are kept; ours are appended so that, for the same GUC,
@@ -83,7 +91,7 @@ class PostgresVaultReader:
     def search_documents(self, *, filters, sort_by, sort_dir, limit, offset, include_deleted):
         return self._run(self._vq.search_documents, filters, sort_by=sort_by, sort_dir=sort_dir,
                          limit=limit, offset=offset, include_deleted=include_deleted,
-                         columns=self._vq.SEARCH_COLUMNS)
+                         columns=self.search_columns)
 
     def get_document(self, doc_id, corpus=None):
         return self._run(self._vq.get_document, doc_id, corpus=corpus)
