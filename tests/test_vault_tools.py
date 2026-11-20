@@ -504,7 +504,7 @@ def test_installed_vault_query_breaks_ties_by_doc_id_then_corpus():
     import inspect
     from importlib.metadata import version
 
-    import vault_query.documents as documents
+    from vault_query import documents
 
     assert version("vault-query") == "0.5.1"
     assert "NULLS LAST, doc_id, corpus" in inspect.getsource(documents.search_documents)
