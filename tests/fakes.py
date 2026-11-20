@@ -1,7 +1,9 @@
 """An in-memory VaultReader with adversarial data.
 
 NULL date, an html row, a tombstone, a same-date pair, a run that crashed before any source
-(run grain only), an error-only source, an approximate `last_seen_at`, Decimal and naive values.
+(run grain only), an error-only source, bad_content NULL and counted, an approximate `last_seen_at`,
+Decimal and naive values;
+TWINS: one doc_id held by two corpora (a doc_id is unique within its corpus only).
 """
 from __future__ import annotations
 
@@ -12,16 +14,53 @@ from myopenfund_mcp.errors import INVALID_ARGUMENT, tool_error
 
 DOCS = [
     {"doc_id": "us1", "corpus": "central-bank", "source_code": "us", "doc_type": "C1", "title": "FOMC statement",
-     "date": dt.date(2010, 1, 13), "year": 2010, "mime_type": "application/pdf", "deleted_at": None},
+     "date": dt.date(2010, 1, 13), "year": 2010, "mime_type": "application/pdf", "deleted_at": None,
+     "date_precision": "day", "date_kind": "meeting", "entity_scheme": None, "entity_value": None},
     {"doc_id": "us2", "corpus": "central-bank", "source_code": "us", "doc_type": "C1", "title": "FOMC minutes",
-     "date": dt.date(2010, 1, 13), "year": 2010, "mime_type": "application/pdf", "deleted_at": None},
+     "date": dt.date(2010, 1, 13), "year": 2010, "mime_type": "application/pdf", "deleted_at": None,
+     "date_precision": "day", "date_kind": "publication", "entity_scheme": None, "entity_value": None},
     {"doc_id": "us3", "corpus": "central-bank", "source_code": "us", "doc_type": "C1", "title": "Undated",
-     "date": None, "year": None, "mime_type": "application/pdf", "deleted_at": None},
+     "date": None, "year": None, "mime_type": "application/pdf", "deleted_at": None,
+     "date_precision": None, "date_kind": None, "entity_scheme": None, "entity_value": None},
     {"doc_id": "fr1", "corpus": "central-bank", "source_code": "fr", "doc_type": "A1", "title": "Décision",
-     "date": dt.date(2011, 5, 1), "year": 2011, "mime_type": "text/html", "deleted_at": None},
+     "date": dt.date(2011, 5, 1), "year": 2011, "mime_type": "text/html", "deleted_at": None,
+     "date_precision": "month", "date_kind": "publication", "entity_scheme": None, "entity_value": None},
     {"doc_id": "us9", "corpus": "central-bank", "source_code": "us", "doc_type": "C1", "title": "Withdrawn",
      "date": dt.date(2009, 3, 1), "year": 2009, "mime_type": "application/pdf",
-     "deleted_at": dt.datetime(2026, 9, 1, tzinfo=dt.UTC)},
+     "deleted_at": dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+     "date_precision": None, "date_kind": None, "entity_scheme": None, "entity_value": None},
+]
+
+# The same doc_id in two corpora, listed out of corpus order (vault-query orders by corpus).
+TWINS = [
+    {"doc_id": "twin", "corpus": "company", "source_code": "sec", "doc_type": "A1", "title": "Form 10-K",
+     "date": dt.date(2024, 2, 2), "year": 2024, "mime_type": "text/plain", "deleted_at": None,
+     "date_precision": "day", "date_kind": "publication", "entity_scheme": "cik",
+     "entity_value": "0000320193"},
+    {"doc_id": "twin", "corpus": "central-bank", "source_code": "us", "doc_type": "A1",
+     "title": "Rate decision",
+     "date": dt.date(2024, 1, 1), "year": 2024, "mime_type": "application/pdf", "deleted_at": None,
+     "date_precision": "year", "date_kind": None, "entity_scheme": None, "entity_value": None},
+]
+
+# vault-query's DocTypeNeedsCorpus message, as it words it from the `vocabulary` table.
+DOC_TYPE_NEEDS_CORPUS = (
+    "doc_type needs corpus: a doc_type code means something only within its corpus (the same code can "
+    "name different document types in two corpora); pass corpus with doc_type, asking the user when the "
+    "corpus is not clear from context. Codes per corpus: central-bank: A1 = Monetary policy decision, "
+    "C1 = Minutes; company: A1 = Annual report (10-K), A2 = Quarterly report (10-Q)")
+
+# The `vocabulary` table: the same code in two corpora with two meanings; a NULL label and family.
+VOCABULARY = [
+    {"corpus": "company", "kind": "doc_type", "code": "A1", "label": "Annual report (10-K)", "family": "A"},
+    {"corpus": "central-bank", "kind": "source_code", "code": "us", "label": "Federal Reserve",
+     "family": None},
+    {"corpus": "central-bank", "kind": "doc_type", "code": "C1", "label": "Minutes", "family": "C"},
+    {"corpus": "central-bank", "kind": "doc_type", "code": "A1", "label": "Monetary policy decision",
+     "family": "A"},
+    {"corpus": "company", "kind": "entity_scheme", "code": "cik", "label": None, "family": None},
+    {"corpus": "company", "kind": "doc_type", "code": "A2", "label": "Quarterly report (10-Q)",
+     "family": "A"},
 ]
 
 # Run grain: r0 crashed before reaching any source, so it has no runs_status row.
@@ -40,7 +79,13 @@ SOURCE_RUNS = [
      "started_at": dt.datetime(2026, 10, 2, 5, 0, tzinfo=dt.UTC),
      "finished_at": dt.datetime(2026, 10, 2, 5, 9, tzinfo=dt.UTC), "outcome": "failed", "exit_code": 1,
      "docs_seen": 10, "docs_new": None, "docs_failed": 3, "fetch_errors": 3, "truncated": True,
-     "error_samples": ["HTTP 404 on " + "x" * 50] * 9},
+     "error_samples": ["HTTP 404 on " + "x" * 50] * 9, "bad_content": None},
+    # bad_content (vault-query 0.4.0): the part of docs_failed whose URL served the wrong bytes.
+    {"run_id": "r1", "tool": "vault", "command": "ingest", "corpus": "central-bank", "source_code": "us",
+     "started_at": dt.datetime(2026, 10, 2, 5, 0, tzinfo=dt.UTC),
+     "finished_at": dt.datetime(2026, 10, 2, 5, 9, tzinfo=dt.UTC), "outcome": "degraded", "exit_code": 0,
+     "docs_seen": 40, "docs_new": 2, "docs_failed": 3, "fetch_errors": 1, "truncated": False,
+     "error_samples": [], "bad_content": 2},
 ]
 
 # Error-only source "xx": no document, no health row. Its last_seen_at is an ingestion-time approximation.
@@ -55,7 +100,7 @@ ERRORS = [
 
 def health_row(source_code: str, doc_type: str = "C1", *, cadence_status: str | None = "on-track",
                days_late: int | None = 0, corpus: str = "central-bank") -> dict:
-    """One row of the vault's `source_health` view, with its 28 columns."""
+    """One row of the vault's `source_health` view, with its 30 columns (bad_content ones last)."""
     return {
         "corpus": corpus, "source_code": source_code, "doc_type": doc_type,
         "expected_interval_days": Decimal("45.5"), "expected_per_year": Decimal("8.0"), "n_3y": 24,
@@ -70,6 +115,7 @@ def health_row(source_code: str, doc_type: str = "C1", *, cadence_status: str | 
         "source_docs_new_median_per_run_90d": Decimal("NaN"), "source_open_discovery_errors": 3,
         "source_open_discovery_attempts": 12,
         "source_last_discovery_error_at": dt.datetime(2026, 11, 2, 4, 3, tzinfo=dt.UTC),
+        "source_bad_content_7d": None, "last_run_bad_content": 0,
     }
 
 
@@ -90,20 +136,31 @@ class FakeVaultReader:
     def search_documents(self, *, filters, sort_by, sort_dir, limit, offset, include_deleted):
         self.calls.append(("search", filters, sort_by, sort_dir, limit, offset, include_deleted))
         self._maybe_fail()
+        if filters.get("doc_type") is not None and filters.get("corpus") is None:
+            raise tool_error(INVALID_ARGUMENT, DOC_TYPE_NEEDS_CORPUS)
         rows = [d for d in self.docs if include_deleted or d["deleted_at"] is None]
         rows = [d for d in rows if all(d.get(k) == v for k, v in filters.items() if v is not None and k in d)]
         if filters.get("q"):
             rows = [d for d in rows if filters["q"].lower() in (d["title"] or "").lower()]
         return len(rows), rows[offset:offset + limit]
 
-    def get_document(self, doc_id):
-        self.calls.append(("get", doc_id))
+    def get_document(self, doc_id, corpus=None):
+        self.calls.append(("get", doc_id, corpus))
         self._maybe_fail()
-        return next((d for d in self.docs if d["doc_id"] == doc_id), None)
+        rows = [d for d in self.docs if d["doc_id"] == doc_id and corpus in (None, d["corpus"])]
+        return sorted(rows, key=lambda d: d["corpus"])
+
+    def list_vocabulary(self, *, corpus, kind, limit):
+        self.calls.append(("vocabulary", corpus, kind, limit))
+        self._maybe_fail()
+        rows = [v for v in VOCABULARY if corpus in (None, v["corpus"]) and kind in (None, v["kind"])]
+        return sorted(rows, key=lambda v: (v["corpus"], v["kind"], v["code"]))[:limit]
 
     def corpus_stats(self, *, group_by, corpus, limit):
         self.calls.append(("stats", group_by, corpus, limit))
         self._maybe_fail()
+        if group_by == "doc_type" and corpus is None:
+            raise tool_error(INVALID_ARGUMENT, DOC_TYPE_NEEDS_CORPUS)
         groups: dict = {}
         live = [d for d in self.docs if d["deleted_at"] is None and corpus in (None, d["corpus"])]
         for d in live:

@@ -47,7 +47,9 @@ BUILD_HEADER = """\
 #: Build requirements no pyproject declares: hatchling asks for `editables` when it builds an
 #: editable install (the CI's `pip install -e`), so it is pinned with the backends.
 EXTRA_BUILD_REQUIRES = ("editables",)
-GIT_DEP = re.compile(r"git\+https://github\.com/([^/@\s]+/[^/@\s]+)@([0-9a-f]{40})(?:#subdirectory=([^\s\"']+))?")
+# A `.git` suffix on the repository URL is not part of the repo name (raw.githubusercontent.com has none).
+GIT_DEP = re.compile(r"git\+https://github\.com/([^/@\s]+/[^/@\s]+?)(?:\.git)?@([0-9a-f]{40})"
+                     r"(?:#subdirectory=([^\s\"']+))?")
 
 
 def build_requires() -> list[str]:

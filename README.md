@@ -111,7 +111,10 @@ the ones the CI tested:
   isolated build environments that `-c` does not reach; [`build-constraints.txt`](build-constraints.txt)
   pins their backends (hatchling, setuptools and their dependencies, plus `editables`, which hatchling
   needs for the CI's editable install), passed with `--build-constraint`. The file records the git pins it
-  was generated from: bumping one without regenerating fails the tests.
+  was generated from: bumping one without regenerating fails the tests. That test compares the recorded
+  list only; the `locked` job also runs `scripts/check_constraints.py --build`, which reads every build
+  requirement (this package's, and each git dependency's at its pinned commit) and fails when one is not
+  pinned in the file at a version its specifier allows.
 - **Git dependencies** (`vault-query`, `my-open-data`, `company-corpus`, `rag-engine`): pinned by full
   commit in `pyproject.toml`, as before.
 
@@ -135,7 +138,9 @@ The CI runs the tests twice: floating within the ranges of `pyproject.toml` (Pyt
 coming break shows early) and locked (`locked` job: the image's Python, both constraint files, then
 `scripts/check_constraints.py`, which fails when a runtime dependency of the server is missing from
 `constraints.txt` or installed at another version, e.g. a new dependency brought by a release, and when an
-extra it is asked to check does not exist).
+extra it is asked to check does not exist, then `scripts/check_constraints.py --build`, which reads the git
+dependencies' build requirements from `raw.githubusercontent.com`). A test checks that the job's Python is
+the patch of `PYTHON_IMAGE`.
 
 **Upgrading** is a deliberate change in a pull request: for the base image, look up the digest of the new
 tag (`docker buildx imagetools inspect python:<tag>`) and replace `PYTHON_IMAGE` in the Dockerfile and the
@@ -360,29 +365,50 @@ Qdrant (checked behind a recording proxy that refuses everything: no request in 
 
 Tool names carry their toolset prefix. All v1 tools are read-only (`readOnlyHint`). Only
 `vault_search_documents` is paged: it returns `next_cursor` to pass back unchanged with the same filters.
-`vault_corpus_stats` and `vault_runs_status` only bound their lists with `limit` (no cursor). Every
+`vault_corpus_stats`, `vault_runs_status` and `vault_vocabulary` only bound their lists with `limit` (no cursor). Every
 `limit` defaults to `MOF_MCP_DEFAULT_ROWS`; a value outside `[1, MOF_MCP_MAX_ROWS]` is refused, not
-clamped. String arguments `doc_id`, `text`
-and `cursor` are at most 200 characters.
+clamped. String arguments `doc_id`, `text`, `cursor` and the `corpus` of `vault_get_document` and
+`vault_vocabulary` are at most 200 characters.
 
 | Tool | Purpose | Key arguments |
 |---|---|---|
 | `server_info` | What this deployment offers: enabled toolsets, your tier, version, data freshness (last vault ingest). Call it first. Open to every authenticated caller. | none |
-| `vault_search_documents` | Find official documents (metadata, not text). Start here: filter, then open one with `vault_get_document`. Rows are ordered by `sort_by` in `sort_dir`; equal sort values are always ordered by `doc_id` ascending, whatever `sort_dir`. `total` counts the whole filtered set. Cursors are offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped). | `corpus` (e.g. `central-bank`), `source_code` (publisher, e.g. `us` for the Fed), `doc_type`, `language`, `year`, `mime_type`, `date_from` / `date_to` (YYYY-MM-DD, inclusive), `text` (case-insensitive substring of the title, matched literally: `%` and `_` are ordinary characters), `sort_by` (`date` default, `year`, `corpus`, `source_code`, `doc_type`, `title`, `created_at`), `sort_dir` (`desc` default), `limit`, `cursor`, `include_deleted` (also return withdrawn documents, with `deleted_at` set) |
-| `vault_get_document` | Every stored fact of one document: dates, the document's URL (`document_url`, PDF preferred, HTML accepted) and the page it was found on (`source_url`), publisher, type, `extra`. | `doc_id` |
-| `vault_corpus_stats` | Live-document counts grouped by one field, largest first (NULL is a real group). | `group_by` (`source_code` default, `corpus`, `doc_type`, `language`, `year`, `provenance`, `mime_type`), `corpus`, `limit` |
-| `vault_runs_status` | Is the pipeline healthy? Four lists, newest first unless stated: `runs` (one row per run, with outcome and totals; a run that crashed before reaching any source appears only here), `source_runs` (one row per run and source: counts, outcome, bounded error samples), `open_discovery_errors` (unresolved discovery failures; while `seen_at_is_ingestion_time` is true, `last_seen_at` is approximate), `source_health` (expected-vs-observed publication cadence per series, the least healthy first: `cadence_status` overdue, then soon, then the rest, each by most `days_late` first, unknown last), and `source_health_total` (every series matching `corpus` / `source_code`, so a shorter list means `limit` left some out). A result over `MOF_MCP_MAX_RESULT_CHARS` is refused with `[result_too_large]`: lower `limit` or filter by `source_code`. | `corpus`, `source_code`, `since` (ISO 8601, UTC if no offset, an explicit offset is kept: whole minutes, at most ±15:59; keeps runs *finished* at or after it, leaves out runs still in flight; applies to `runs` and `source_runs` only), `limit` (applies to each of `runs`, `source_runs`, `open_discovery_errors`, `source_health`) |
+| `vault_search_documents` | Find official documents (metadata, not text). Start here: filter, then open one with `vault_get_document`. Rows are ordered by `sort_by` in `sort_dir`; equal sort values are ordered by `doc_id` ascending, whatever `sort_dir`; that order is fixed within a corpus only (vault-query breaks ties by `doc_id`, and two corpora can hold the same `doc_id`: two such rows with equal sort values may swap between calls, so a page boundary between them can repeat one and skip the other; filter by `corpus` when paging matters, until the vault adds `corpus` to the tie-break). `total` counts the whole filtered set. Cursors are offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped). Rows carry, besides the identity, title, dates, type and URLs, the documents-contract columns `date_precision` (`day`, `month`, `year`, or null = not stated: a month or year date is the period's first day), `date_kind` (`publication`, `meeting`, `period`) and `entity_scheme` / `entity_value` (the issuing entity, e.g. `cik` / `0000320193`). | `corpus` (e.g. `central-bank`), `source_code` (publisher, e.g. `us` for the Fed), `doc_type` (a code within its corpus: **needs `corpus`**, see below), `language`, `year`, `mime_type`, `date_from` / `date_to` (YYYY-MM-DD, inclusive), `text` (case-insensitive substring of the title, matched literally: `%` and `_` are ordinary characters), `sort_by` (`date` default, `year`, `corpus`, `source_code`, `doc_type`, `title`, `created_at`), `sort_dir` (`desc` default), `limit`, `cursor`, `include_deleted` (also return withdrawn documents, with `deleted_at` set) |
+| `vault_get_document` | Every stored fact of a document: dates (with `date_precision`, `date_kind`), the document's URL (`document_url`, PDF preferred, HTML accepted) and the page it was found on (`source_url`), publisher, type, issuing entity, `extra`. A doc_id is unique within its corpus only, so it returns a **list**: with `corpus`, at most one document (the one of that corpus); without, one per corpus holding that doc_id, ordered by corpus, each with its `corpus`. None: `[not_found]` (with `corpus`, the message says to omit it to look in every corpus). The text block is the JSON list; `structuredContent` is `{"result": [...]}` (MCP structured output must be an object). | `doc_id`, `corpus` (pass the `corpus` of the search row) |
+| `vault_corpus_stats` | Live-document counts grouped by one field, largest first (NULL is a real group). Grouping by `doc_type` needs `corpus`. | `group_by` (`source_code` default, `corpus`, `doc_type`, `language`, `year`, `provenance`, `mime_type`), `corpus`, `limit` |
+| `vault_vocabulary` | What the codes mean: each corpus's declared codes with their labels, rows `{corpus, kind, code, label, family}` ordered by corpus, kind, code, with `returned` and `truncated` (true when `limit` cut the list: filter by corpus and kind). For turning the user's words ("10-K", "rate decision") into a corpus's `doc_type`. A corpus that has not declared its codes yet has no rows: `vault_corpus_stats(group_by="doc_type", corpus=...)` shows the codes its documents use. | `corpus`, `kind` (`doc_type`, `source_code`, `provenance`, `entity_scheme`), `limit` |
+| `vault_runs_status` | Is the pipeline healthy? Four lists, newest first unless stated: `runs` (one row per run, with outcome and totals; a run that crashed before reaching any source appears only here), `source_runs` (one row per run and source: counts, outcome, bounded error samples; `bad_content` is the part of `docs_failed` where the server sent the wrong bytes, e.g. an HTML page for a PDF, NULL = not reported, never 0), `open_discovery_errors` (unresolved discovery failures; while `seen_at_is_ingestion_time` is true, `last_seen_at` is approximate), `source_health` (expected-vs-observed publication cadence per series, the least healthy first: `cadence_status` overdue, then soon, then the rest, each by most `days_late` first, unknown last; each row also carries `source_bad_content_7d`, the 7-day sum, NULL when no run of the window reported it, and `last_run_bad_content`), and `source_health_total` (every series matching `corpus` / `source_code`, so a shorter list means `limit` left some out). A result over `MOF_MCP_MAX_RESULT_CHARS` is refused with `[result_too_large]`: lower `limit` or filter by `source_code`. | `corpus`, `source_code`, `since` (ISO 8601, UTC if no offset, an explicit offset is kept: whole minutes, at most ±15:59; keeps runs *finished* at or after it, leaves out runs still in flight; applies to `runs` and `source_runs` only), `limit` (applies to each of `runs`, `source_runs`, `open_discovery_errors`, `source_health`) |
 
-Resource: `vault://documents/{doc_id}`, one document's metadata as JSON (same content as
-`vault_get_document`).
+**`doc_type` needs `corpus`.** A doc_type code means something only within its corpus (central-bank `A1`
+and company `A1` are different document types). `vault_search_documents` with `doc_type` and no `corpus`,
+and `vault_corpus_stats` grouped by `doc_type` without `corpus`, answer `[invalid_argument] doc_type needs
+corpus: ...` with vault-query's message, which lists each corpus's codes and labels. The tool descriptions
+tell the model to ask the user which corpus when the conversation does not make it clear, or infer it.
+
+Resource: `vault://documents/{doc_id}`, the metadata of the documents with that doc_id as a JSON list, one
+per corpus holding it (same content as `vault_get_document` without `corpus`).
+
+**Changes for clients (vault-query 0.5.0, vault `12ffd11`).** `vault_get_document` and the resource return
+a list (was one object); `vault_get_document` takes `corpus`; `doc_type` without `corpus` is refused (see
+above); search and document rows carry `date_precision`, `date_kind`, `entity_scheme`, `entity_value`; new
+tool `vault_vocabulary`.
 
 The `vault_*` tools and the resource exist only when `MOF_VAULT_DATABASE_URL` is set; the `[vault]` extra
 must then be installed, or the server refuses to start (`MOF_VAULT_DATABASE_URL is set but the [vault]
 extra is not installed`). Timestamps in results are UTC: the server's database session runs with
 `timezone=UTC`, whatever the database or role default.
 
+**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0: documents
+keyed `(corpus, doc_id)`, columns `date_precision` / `date_kind` / `entity_scheme` / `entity_value`, table
+`vocabulary`; `runs_sources.bad_content`). Deploy the vault (and run its ingestion, which applies the
+schema) before this server. Against an older schema, a tool that reads a missing column or table answers
+`[schema_outdated] the vault lacks a column or table this server reads (see README, Minimum vault schema)`,
+not `backend_unavailable`; the server log names the missing column or table, and `server_info` reports
+`"freshness_error": "schema_outdated"`.
+
 If the vault database is down, `server_info` still answers (version, tier, toolsets) with `freshness`
-null and `"freshness_error": "backend_unavailable"`; the server log names the exception class only.
+null and `freshness_error` set to the error's code (`backend_unavailable`, `timeout`, `schema_outdated`);
+the server log names the exception class only.
 
 ### Passage search (rag)
 
@@ -691,9 +717,10 @@ branch on the code and show the message.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
-| `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
+| `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a `doc_type` filter or grouping without `corpus` (the message lists each corpus's codes: ask the user which corpus, or infer it), a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
+| `not_found` | No document with that `doc_id` (in that `corpus`, when one is given: omit `corpus` to look in every corpus). | Find ids with `vault_search_documents`. |
 | `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
+| `schema_outdated` | The vault database lacks a column or table the pinned vault-query reads: the vault is older than this server (see Minimum vault schema under [Tools](#tools)). | Deploy the vault (and run its ingestion) first; check the deployment. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
 | `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free), `internal_error` (the search failed with an error the server does not expect; the log names its class). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `internal_error`, retry and report it if it lasts; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
 | `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |

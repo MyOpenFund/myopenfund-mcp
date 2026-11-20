@@ -14,7 +14,7 @@ from . import __version__
 from .audit import AuditMiddleware
 from .auth import HashedTokenVerifier, caller_tier, parse_tokens
 from .config import ConfigError, Settings
-from .errors import BACKEND_UNAVAILABLE
+from .errors import BACKEND_UNAVAILABLE, error_code
 from .paging import jsonable
 
 log = logging.getLogger("myopenfund_mcp.server")
@@ -129,7 +129,8 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
     async def server_info() -> dict:
         """What this deployment offers: enabled toolsets, your tier, version, data freshness.
 
-        If the vault cannot be read, `freshness` is null and `freshness_error` says why; the rest still answers.
+        If the vault cannot be read, `freshness` is null and `freshness_error` holds the error code (e.g.
+        backend_unavailable, timeout, schema_outdated); the rest still answers.
         With the rag toolset: `rag` (collection, embedding model, engine version, default and maximum
         limit, `status`: ready, or unavailable with a `reason`; and `source_codes`, `doc_types`,
         `languages`: the exact values rag_search accepts for these filters, null while not known).
@@ -154,7 +155,7 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
             except Exception as exc:  # noqa: BLE001 -- an outage must not hide the tier and toolsets
                 # The class only: an exception's text can hold the DSN.
                 log.warning("server_info: freshness read failed (%s)", type(exc).__name__)
-                info["freshness_error"] = BACKEND_UNAVAILABLE
+                info["freshness_error"] = error_code(exc, BACKEND_UNAVAILABLE)
         if companies_store is not None:
             try:
                 with anyio.fail_after(settings.companies_query_timeout_s):

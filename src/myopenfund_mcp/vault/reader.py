@@ -6,16 +6,25 @@ the server: a runaway query is cancelled by Postgres, not by hoping.
 """
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Any, Protocol
 
-from ..errors import BACKEND_UNAVAILABLE, INVALID_ARGUMENT, TIMEOUT, tool_error
+from ..errors import BACKEND_UNAVAILABLE, INVALID_ARGUMENT, SCHEMA_OUTDATED, TIMEOUT, tool_error
+
+log = logging.getLogger(__name__)
+
+# Documents-contract columns added to vault-query's SEARCH_COLUMNS in search results: what `date`
+# means (`date_precision`: a year-precision date is 1 January; `date_kind`: publication or period) and
+# who issued the document (`entity_scheme`, `entity_value`, e.g. cik 0000320193), which a reader needs
+# to pick a document from a list. A few short values per row; `extra` stays in get_document.
+CONTRACT_SEARCH_COLUMNS = ("date_precision", "date_kind", "entity_scheme", "entity_value")
 
 
 class VaultReader(Protocol):
     def search_documents(self, *, filters: dict, sort_by: str, sort_dir: str, limit: int,
                          offset: int, include_deleted: bool) -> tuple[int, list[dict]]: ...
-    def get_document(self, doc_id: str) -> dict | None: ...
+    def get_document(self, doc_id: str, corpus: str | None = None) -> list[dict]: ...
     def corpus_stats(self, *, group_by: str, corpus: str | None, limit: int) -> dict: ...
     def runs_status(self, *, corpus: str | None, source_code: str | None, since: Any, limit: int,
                     max_error_samples: int, max_text_chars: int) -> list[dict]: ...
@@ -24,6 +33,7 @@ class VaultReader(Protocol):
     def open_discovery_errors(self, *, corpus: str | None, source_code: str | None, limit: int,
                               max_text_chars: int) -> list[dict]: ...
     def freshness(self) -> dict: ...
+    def list_vocabulary(self, *, corpus: str | None, kind: str | None, limit: int) -> list[dict]: ...
 
 
 class PostgresVaultReader:
@@ -35,6 +45,8 @@ class PostgresVaultReader:
         self._pg, self._vq = psycopg2, vault_query
         self._url, self._timeout_ms = database_url, query_timeout_s * 1000
         self._connect_timeout_s = connect_timeout_s
+        self.search_columns = (*vault_query.SEARCH_COLUMNS,
+                               *(c for c in CONTRACT_SEARCH_COLUMNS if c not in vault_query.SEARCH_COLUMNS))
 
     def _options(self) -> str:
         # The DSN's own options (e.g. search_path) are kept; ours are appended so that, for the same GUC,
@@ -67,13 +79,24 @@ class PostgresVaultReader:
             with self._connection() as conn:
                 return fn(conn, *args, **kwargs)
         except self._vq.InvalidQuery as exc:
-            error = tool_error(INVALID_ARGUMENT, str(exc))
+            # A cut doc_type-needs-corpus list names the library's function; a model calls the tool.
+            message = str(exc).replace("vault_query.list_vocabulary", "vault_vocabulary")
+            error = tool_error(INVALID_ARGUMENT, message)
         except self._pg.errors.QueryCanceled:
             error = tool_error(TIMEOUT, "the vault query exceeded MOF_MCP_QUERY_TIMEOUT_S (slow query, or the "
                                         "vault is being migrated); retry later or narrow the filters")
         except self._pg.DataError:
             # Fixed text: the driver's message can echo the refused value.
             error = tool_error(INVALID_ARGUMENT, "a value was refused by the database; check its format")
+        except (self._pg.errors.UndefinedColumn, self._pg.errors.UndefinedTable) as exc:
+            # The pinned vault-query reads a column or table the vault does not have: most likely this
+            # server was deployed before the vault (README, "Minimum vault schema"). The client gets a
+            # fixed text; the log names the missing object (the server's primary message: schema names,
+            # never the DSN).
+            missing = exc.diag.message_primary or str(exc).splitlines()[0]
+            log.error("vault schema: %s (deploy the vault, and run its ingestion, first)", missing)
+            error = tool_error(SCHEMA_OUTDATED, "the vault lacks a column or table this server reads "
+                                                "(see README, Minimum vault schema)")
         except self._pg.Error:
             # Never the driver's text: a connection error can carry DSN fragments (vault api/db.py::_redact).
             error = tool_error(BACKEND_UNAVAILABLE, "the vault database is unreachable or refused the query")
@@ -83,10 +106,10 @@ class PostgresVaultReader:
     def search_documents(self, *, filters, sort_by, sort_dir, limit, offset, include_deleted):
         return self._run(self._vq.search_documents, filters, sort_by=sort_by, sort_dir=sort_dir,
                          limit=limit, offset=offset, include_deleted=include_deleted,
-                         columns=self._vq.SEARCH_COLUMNS)
+                         columns=self.search_columns)
 
-    def get_document(self, doc_id):
-        return self._run(self._vq.get_document, doc_id)
+    def get_document(self, doc_id, corpus=None):
+        return self._run(self._vq.get_document, doc_id, corpus=corpus)
 
     def corpus_stats(self, *, group_by, corpus, limit):
         return self._run(self._vq.corpus_stats, group_by, corpus=corpus, limit=limit)
@@ -107,3 +130,6 @@ class PostgresVaultReader:
 
     def freshness(self):
         return self._run(self._vq.freshness)
+
+    def list_vocabulary(self, *, corpus, kind, limit):
+        return self._run(self._vq.list_vocabulary, corpus, kind=kind, limit=limit)

@@ -66,6 +66,28 @@ def test_driver_errors_become_codes_and_never_leak(pg, exc, code):
     _assert_clean(info, code)
 
 
+@pytest.mark.parametrize(("exc", "missing"), [
+    (psycopg2.errors.UndefinedColumn('column "bad_content" does not exist\nLINE 1: SELECT bad_content'),
+     'column "bad_content" does not exist'),
+    (psycopg2.errors.UndefinedTable('relation "vocabulary" does not exist'),
+     'relation "vocabulary" does not exist'),
+])
+def test_an_older_vault_schema_is_named_not_reported_as_an_outage(pg, monkeypatch, caplog, exc, missing):
+    def query(conn, *args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(vault_query, "list_vocabulary", query)
+    with pytest.raises(ToolError) as info:
+        _reader().list_vocabulary(corpus=None, kind=None, limit=5)
+    _assert_clean(info, "schema_outdated")
+    assert str(info.value) == ("[schema_outdated] the vault lacks a column or table this server reads "
+                               "(see README, Minimum vault schema)")
+    assert pg["conns"][0].closed
+    # The operator learns which one from the server log (the client gets the fixed text).
+    logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.vault.reader"]
+    assert logged == [f"vault schema: {missing} (deploy the vault, and run its ingestion, first)"]
+
+
 def test_timeout_message_names_the_setting_and_the_migration_case(pg):
     pg["exc"] = psycopg2.errors.QueryCanceled("canceling statement")
     with pytest.raises(ToolError) as info:
@@ -100,6 +122,38 @@ def test_invalid_query_becomes_invalid_argument_and_closes_the_connection(pg, mo
     assert str(info.value) == "[invalid_argument] sort_by must be one of [...]"
     assert info.value.__context__ is None
     assert pg["conns"][0].closed
+
+
+@pytest.mark.parametrize("name,call", [
+    ("search_documents", {"filters": {"doc_type": "A1"}, "sort_by": "date", "sort_dir": "desc", "limit": 5,
+                          "offset": 0, "include_deleted": False}),
+    ("corpus_stats", {"group_by": "doc_type", "corpus": None, "limit": 5}),
+])
+def test_doc_type_needs_corpus_keeps_vault_querys_message(pg, monkeypatch, name, call):
+    message = "doc_type needs corpus: ... Codes per corpus: central-bank: A1 = Decision; company: A1 = 10-K"
+
+    def refuse(conn, *args, **kwargs):
+        raise vault_query.DocTypeNeedsCorpus(message)
+
+    monkeypatch.setattr(vault_query, name, refuse)
+    with pytest.raises(ToolError) as info:
+        getattr(_reader(), name)(**call)
+    assert str(info.value) == f"[invalid_argument] {message}"
+    assert info.value.__context__ is None and pg["conns"][0].closed
+
+
+def test_a_cut_codes_list_points_at_the_mcp_tool_not_the_library(pg, monkeypatch):
+    """vault-query's message ends with its own function's name when the list is cut; a model can only call
+    vault_vocabulary."""
+    def refuse(conn, *args, **kwargs):
+        raise vault_query.DocTypeNeedsCorpus(
+            "doc_type needs corpus: ... Codes per corpus: company: A1 = 10-K "
+            "(list cut: see vault_query.list_vocabulary)")
+
+    monkeypatch.setattr(vault_query, "corpus_stats", refuse)
+    with pytest.raises(ToolError) as info:
+        _reader().corpus_stats(group_by="doc_type", corpus=None, limit=5)
+    assert str(info.value).endswith("company: A1 = 10-K (list cut: see vault_vocabulary)")
 
 
 def test_query_failure_closes_the_connection(pg, monkeypatch):
@@ -168,8 +222,9 @@ PASS_THROUGH = [
     ("search_documents",
      {"filters": {"corpus": "amf"}, "sort_by": "date", "sort_dir": "asc", "limit": 9, "offset": 3, "include_deleted": True},
      (({"corpus": "amf"},), {"sort_by": "date", "sort_dir": "asc", "limit": 9, "offset": 3, "include_deleted": True,
-                                 "columns": vault_query.SEARCH_COLUMNS})),
-    ("get_document", {"doc_id": "d1"}, (("d1",), {})),
+                                 "columns": (*vault_query.SEARCH_COLUMNS, "date_precision", "date_kind",
+                                             "entity_scheme", "entity_value")})),
+    ("get_document", {"doc_id": "d1", "corpus": "amf"}, (("d1",), {"corpus": "amf"})),
     ("corpus_stats", {"group_by": "year", "corpus": "amf", "limit": 12},
      (("year",), {"corpus": "amf", "limit": 12})),
     ("runs_status",
@@ -182,7 +237,25 @@ PASS_THROUGH = [
     ("open_discovery_errors", {"corpus": "amf", "source_code": None, "limit": 4, "max_text_chars": 50},
      ((), {"corpus": "amf", "source_code": None, "limit": 4, "max_text_chars": 50})),
     ("freshness", {}, ((), {})),
+    ("list_vocabulary", {"corpus": "amf", "kind": "doc_type", "limit": 6},
+     (("amf",), {"kind": "doc_type", "limit": 6})),
 ]
+
+
+def test_vocabulary_kinds_match_vault_query():
+    import typing
+
+    from myopenfund_mcp.vault.tools import VocabularyKind
+
+    assert set(typing.get_args(VocabularyKind)) == set(vault_query.VOCABULARY_KINDS)
+
+
+def test_search_projection_adds_the_contract_columns_to_vault_querys(pg):
+    SEARCH_COLUMNS = _reader().search_columns
+    assert SEARCH_COLUMNS[:len(vault_query.SEARCH_COLUMNS)] == vault_query.SEARCH_COLUMNS
+    assert {"date_precision", "date_kind", "entity_scheme", "entity_value"} <= set(SEARCH_COLUMNS)
+    assert len(set(SEARCH_COLUMNS)) == len(SEARCH_COLUMNS) and set(SEARCH_COLUMNS) <= vault_query.ALL_COLUMNS
+    assert "extra" not in SEARCH_COLUMNS and "local_path" not in SEARCH_COLUMNS
 
 
 def test_pass_through_covers_every_reader_method():
