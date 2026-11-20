@@ -257,6 +257,22 @@ async def test_runs_status_bundles_runs_source_runs_errors_and_health():
     assert ("recent_runs", None, None, 5) in reader.calls
 
 
+async def test_runs_status_keeps_bad_content_null_apart_from_a_count():
+    async with _client() as c:
+        data = (await c.call_tool("vault_runs_status", {})).data
+    assert [(r["source_code"], r["bad_content"]) for r in data["source_runs"]] == [("xx", None), ("us", 2)]
+    health = data["source_health"][0]
+    assert health["source_bad_content_7d"] is None and health["last_run_bad_content"] == 0
+
+
+async def test_runs_status_description_explains_bad_content():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    runs = tools["vault_runs_status"].description
+    assert "bad_content" in runs and "docs_failed" in runs and "not reported" in runs
+    assert "source_bad_content_7d" in runs and "last_run_bad_content" in runs
+
+
 async def test_runs_status_values_are_json_safe():
     async with _client() as c:
         data = (await c.call_tool("vault_runs_status", {"since": "2026-09-01T00:00:00Z"})).data

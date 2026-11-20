@@ -54,12 +54,15 @@ RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first u
 - `runs`: one row per run (run grain), with its outcome and totals. A run with no per-source detail
   (e.g. it crashed before reaching any source) appears only here.
 - `source_runs`: one row per (run, source): counts, outcome and bounded error samples.
+  `bad_content` is the part of `docs_failed` where the server sent the wrong bytes (e.g. an HTML page
+  for a PDF), as opposed to a dead URL; NULL means not reported (another producer, an older run), not 0.
 - `open_discovery_errors`: unresolved discovery failures, most recently seen first. While an error's
   `seen_at_is_ingestion_time` is true, its `last_seen_at` is approximate (the time it was ingested,
   not the time it was last observed).
 - `source_health`: expected-vs-observed publication cadence per series, the least healthy first:
   `cadence_status` overdue, then soon, then the rest; within each, most `days_late` first (unknown
-  last). `source_health_total` counts every series matching corpus/source_code, so a smaller list
+  last). Each row also carries `source_bad_content_7d` (sum over 7 days, NULL when no run of the window
+  reported it) and `last_run_bad_content` (the last run's value). `source_health_total` counts every series matching corpus/source_code, so a smaller list
   means `limit` left some out.
 `limit` applies to each of `runs`, `source_runs`, `open_discovery_errors` and `source_health`.
 A result over the server's size cap is refused, never cut: ask for a smaller `limit`, or filter by
