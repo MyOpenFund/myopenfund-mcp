@@ -9,7 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Protocol
 
-from ..errors import BACKEND_UNAVAILABLE, INVALID_ARGUMENT, TIMEOUT, tool_error
+from ..errors import BACKEND_UNAVAILABLE, INVALID_ARGUMENT, SCHEMA_OUTDATED, TIMEOUT, tool_error
 
 # Documents-contract columns added to vault-query's SEARCH_COLUMNS in search results: what `date`
 # means (`date_precision`: a year-precision date is 1 January; `date_kind`: publication or period) and
@@ -83,6 +83,10 @@ class PostgresVaultReader:
         except self._pg.DataError:
             # Fixed text: the driver's message can echo the refused value.
             error = tool_error(INVALID_ARGUMENT, "a value was refused by the database; check its format")
+        except (self._pg.errors.UndefinedColumn, self._pg.errors.UndefinedTable):
+            # The pinned vault-query reads a column or table the vault does not have yet: the server was
+            # deployed before the vault (README, "Minimum vault schema"). Fixed text: the driver's names it.
+            error = tool_error(SCHEMA_OUTDATED, "the vault schema is older than this server expects (see README)")
         except self._pg.Error:
             # Never the driver's text: a connection error can carry DSN fragments (vault api/db.py::_redact).
             error = tool_error(BACKEND_UNAVAILABLE, "the vault database is unreachable or refused the query")

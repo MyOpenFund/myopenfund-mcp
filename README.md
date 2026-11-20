@@ -381,6 +381,13 @@ must then be installed, or the server refuses to start (`MOF_VAULT_DATABASE_URL 
 extra is not installed`). Timestamps in results are UTC: the server's database session runs with
 `timezone=UTC`, whatever the database or role default.
 
+**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0: documents
+keyed `(corpus, doc_id)`, columns `date_precision` / `date_kind` / `entity_scheme` / `entity_value`, table
+`vocabulary`; `runs_sources.bad_content`). Deploy the vault (and run its ingestion, which applies the
+schema) before this server. Against an older schema, a tool that reads a missing column or table answers
+`[schema_outdated] the vault schema is older than this server expects (see README)`, not
+`backend_unavailable`.
+
 If the vault database is down, `server_info` still answers (version, tier, toolsets) with `freshness`
 null and `"freshness_error": "backend_unavailable"`; the server log names the exception class only.
 
@@ -694,6 +701,7 @@ branch on the code and show the message.
 | `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id`. | Find ids with `vault_search_documents`. |
 | `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
+| `schema_outdated` | The vault database lacks a column or table the pinned vault-query reads: the vault is older than this server (see Minimum vault schema under [Tools](#tools)). | Deploy the vault (and run its ingestion) first; check the deployment. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
 | `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free), `internal_error` (the search failed with an error the server does not expect; the log names its class). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `internal_error`, retry and report it if it lasts; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
 | `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |

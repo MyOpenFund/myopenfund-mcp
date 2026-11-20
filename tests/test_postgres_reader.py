@@ -66,6 +66,23 @@ def test_driver_errors_become_codes_and_never_leak(pg, exc, code):
     _assert_clean(info, code)
 
 
+@pytest.mark.parametrize("exc", [
+    psycopg2.errors.UndefinedColumn('column "bad_content" does not exist hunter2'),
+    psycopg2.errors.UndefinedTable('relation "vocabulary" does not exist hunter2'),
+])
+def test_an_older_vault_schema_is_named_not_reported_as_an_outage(pg, monkeypatch, exc):
+    def query(conn, *args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(vault_query, "list_vocabulary", query)
+    with pytest.raises(ToolError) as info:
+        _reader().list_vocabulary(corpus=None, kind=None, limit=5)
+    _assert_clean(info, "schema_outdated")
+    assert str(info.value) == ("[schema_outdated] the vault schema is older than this server expects "
+                               "(see README)")
+    assert pg["conns"][0].closed
+
+
 def test_timeout_message_names_the_setting_and_the_migration_case(pg):
     pg["exc"] = psycopg2.errors.QueryCanceled("canceling statement")
     with pytest.raises(ToolError) as info:
