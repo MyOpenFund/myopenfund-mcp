@@ -55,6 +55,8 @@ async def test_real_vault_read_path():
         assert set(runs) == {*lists, "source_health_total"}
         assert all(isinstance(runs[k], list) and len(runs[k]) <= 5 for k in lists)
         assert runs["source_health_total"] >= len(runs["source_health"])
+        if runs["source_runs"]:  # vault-query 0.4.0: present, NULL when the producer did not report it
+            assert "bad_content" in runs["source_runs"][0]
 
 
 
