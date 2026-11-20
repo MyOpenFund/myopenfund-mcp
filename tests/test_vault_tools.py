@@ -489,12 +489,25 @@ async def test_search_description_warns_that_pages_can_shift_while_ingesting():
     assert "shift" in search and "ingesting" in search
 
 
-async def test_search_description_says_the_order_is_fixed_within_a_corpus_only():
-    """vault-query breaks ties by doc_id alone; a doc_id is unique within its corpus only."""
+async def test_search_description_states_the_total_order():
+    """vault-query 0.5.1 breaks ties by doc_id, then corpus: the description says pages are a
+    total order (no repeat, no skip) and no longer tells the model to filter by corpus for it."""
     async with _client() as c:
         tools = {t.name: t for t in await c.list_tools()}
     search = " ".join(tools["vault_search_documents"].description.split())
-    assert "within a corpus" in search and "filter by corpus" in search
+    assert "doc_id, then corpus" in search and "never repeat or skip" in search
+    assert "within a corpus only" not in search
+
+
+def test_installed_vault_query_breaks_ties_by_doc_id_then_corpus():
+    """The pin is vault-query 0.5.1 (eff1aec): its search ORDER BY ends with doc_id, corpus."""
+    import inspect
+    from importlib.metadata import version
+
+    from vault_query import documents
+
+    assert version("vault-query") == "0.5.1"
+    assert "NULLS LAST, doc_id, corpus" in inspect.getsource(documents.search_documents)
 
 
 @pytest.mark.parametrize(("given", "expected"), [
