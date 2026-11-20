@@ -18,6 +18,14 @@ def test_base_image_is_pinned_by_tag_and_digest():
     assert re.fullmatch(r"python:3\.13\.\d+-slim-[a-z]+@sha256:[0-9a-f]{64}", IMAGE)
 
 
+def test_locked_ci_job_runs_the_images_python():
+    """The `locked` job stands for the deployed image: same Python, to the patch."""
+    workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text()
+    locked = workflow.split("\n  locked:\n", 1)[1]
+    version = re.search(r'python-version: "([^"]+)"', locked).group(1)
+    assert version == re.match(r"python:(\d+\.\d+\.\d+)-", IMAGE).group(1)
+
+
 def test_every_stage_uses_the_pinned_image():
     froms = re.findall(r"^FROM (\S+)", DOCKERFILE, re.MULTILINE)
     assert froms == ["${PYTHON_IMAGE}", "${PYTHON_IMAGE}"]
