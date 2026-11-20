@@ -106,6 +106,14 @@ async def _documents(reader: VaultReader, doc_id: str, corpus: str | None) -> li
     return rows
 
 
+def _documents_cap_hint(rows: list[dict], *, via: str) -> str:
+    """How to get a smaller vault_get_document result: one corpus, when the list holds several; else
+    nothing smaller exists (the tool has no limit)."""
+    if len(rows) > 1:
+        return f"{via} pass `corpus` (one of {sorted({r.get('corpus') for r in rows})}) to get one document"
+    return "this one document is larger than MOF_MCP_MAX_RESULT_CHARS; the operator can raise it"
+
+
 async def _call(fn, /, **kwargs):
     """Readers are blocking (psycopg2): run them off the event loop."""
     return await anyio.to_thread.run_sync(partial(fn, **kwargs))
@@ -170,7 +178,8 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
             description="The document's corpus (the `corpus` of its search row), e.g. 'central-bank'; "
                         "omitted = every corpus holding this doc_id", max_length=MAX_ARG_CHARS)] = None,
     ) -> list[dict]:
-        return cap_result(await _documents(reader, doc_id, corpus), settings)
+        rows = await _documents(reader, doc_id, corpus)
+        return cap_result(rows, settings, hint=_documents_cap_hint(rows, via="call again and"))
 
     @vault.tool(auth=read, annotations=READ_ONLY)
     async def corpus_stats(
@@ -243,4 +252,5 @@ def register_vault_resources(root: FastMCP, reader: VaultReader, settings: Setti
         if not rows:
             raise ResourceError(f"[{NOT_FOUND}] no document {doc_id!r}")
         # The exact string the cap measured (paging.result_chars basis).
-        return json.dumps(cap_result(rows, settings), ensure_ascii=False, separators=(",", ":"))
+        hint = _documents_cap_hint(rows, via="call vault_get_document and")
+        return json.dumps(cap_result(rows, settings, hint=hint), ensure_ascii=False, separators=(",", ":"))

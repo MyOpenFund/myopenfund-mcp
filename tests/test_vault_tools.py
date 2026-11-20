@@ -162,6 +162,29 @@ async def test_vocabulary_description_and_doc_type_point_to_each_other():
     assert "vault_vocabulary" in doc_type
 
 
+async def test_get_document_over_the_cap_says_to_pass_corpus_not_a_limit():
+    """Two corpora each under the cap, together over it: corpus is the way to a smaller result."""
+    twins = [{**t, "title": "x" * 600} for t in TWINS]
+    async with _client(FakeVaultReader(docs=twins), max_result_chars=1300) as c:
+        with pytest.raises(ToolError) as caught:
+            await c.call_tool("vault_get_document", {"doc_id": "twin"})
+        one = (await c.call_tool("vault_get_document", {"doc_id": "twin", "corpus": "company"})).data
+        with pytest.raises(Exception) as resource:
+            await c.read_resource("vault://documents/twin")
+    assert str(caught.value).startswith("[result_too_large] ")
+    assert "pass `corpus`" in str(caught.value) and "limit" not in str(caught.value)
+    assert [d["corpus"] for d in one] == ["company"]
+    assert "vault_get_document" in str(resource.value) and "corpus" in str(resource.value)
+
+
+async def test_one_document_over_the_cap_does_not_suggest_corpus():
+    big = {**DOCS[0], "doc_id": "big", "title": "x" * 5000}
+    async with _client(FakeVaultReader(docs=[big]), max_result_chars=1000) as c:
+        with pytest.raises(ToolError) as caught:
+            await c.call_tool("vault_get_document", {"doc_id": "big", "corpus": "central-bank"})
+    assert "MOF_MCP_MAX_RESULT_CHARS" in str(caught.value) and "limit" not in str(caught.value)
+
+
 async def test_a_result_over_the_cap_is_refused_not_cut():
     big = {**DOCS[0], "doc_id": "big", "title": "x" * 5000}
     async with _client(FakeVaultReader(docs=[big]), max_result_chars=1000) as c:
