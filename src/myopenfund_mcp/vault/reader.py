@@ -15,7 +15,7 @@ from ..errors import BACKEND_UNAVAILABLE, INVALID_ARGUMENT, TIMEOUT, tool_error
 class VaultReader(Protocol):
     def search_documents(self, *, filters: dict, sort_by: str, sort_dir: str, limit: int,
                          offset: int, include_deleted: bool) -> tuple[int, list[dict]]: ...
-    def get_document(self, doc_id: str) -> dict | None: ...
+    def get_document(self, doc_id: str, corpus: str | None = None) -> list[dict]: ...
     def corpus_stats(self, *, group_by: str, corpus: str | None, limit: int) -> dict: ...
     def runs_status(self, *, corpus: str | None, source_code: str | None, since: Any, limit: int,
                     max_error_samples: int, max_text_chars: int) -> list[dict]: ...
@@ -85,8 +85,8 @@ class PostgresVaultReader:
                          limit=limit, offset=offset, include_deleted=include_deleted,
                          columns=self._vq.SEARCH_COLUMNS)
 
-    def get_document(self, doc_id):
-        return self._run(self._vq.get_document, doc_id)
+    def get_document(self, doc_id, corpus=None):
+        return self._run(self._vq.get_document, doc_id, corpus=corpus)
 
     def corpus_stats(self, *, group_by, corpus, limit):
         return self._run(self._vq.corpus_stats, group_by, corpus=corpus, limit=limit)

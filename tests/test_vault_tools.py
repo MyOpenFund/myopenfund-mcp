@@ -4,7 +4,7 @@ import logging
 import sys
 
 import pytest
-from fakes import DOCS, MANY_HEALTH, FakeVaultReader, health_row, invalid_query_reader
+from fakes import DOCS, MANY_HEALTH, TWINS, FakeVaultReader, health_row, invalid_query_reader
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
@@ -97,9 +97,42 @@ async def test_a_result_over_the_cap_is_refused_not_cut():
 
 async def test_get_document_unknown_is_not_found():
     async with _client() as c:
-        assert (await c.call_tool("vault_get_document", {"doc_id": "fr1"})).data["mime_type"] == "text/html"
+        assert (await c.call_tool("vault_get_document", {"doc_id": "fr1"})).data[0]["mime_type"] == "text/html"
         with pytest.raises(ToolError, match=r"\[not_found\]"):
             await c.call_tool("vault_get_document", {"doc_id": "nope"})
+
+
+async def test_get_document_without_corpus_returns_one_row_per_corpus():
+    reader = FakeVaultReader(docs=DOCS + TWINS)
+    async with _client(reader) as c:
+        result = await c.call_tool("vault_get_document", {"doc_id": "twin"})
+    assert [(d["corpus"], d["title"]) for d in result.data] == [("central-bank", "Rate decision"),
+                                                                ("company", "Form 10-K")]
+    assert reader.calls == [("get", "twin", None)]
+    # The text block the model reads is the list itself, not a wrapper.
+    assert json.loads(result.content[0].text) == result.data
+
+
+async def test_get_document_with_corpus_returns_that_corpus_only():
+    reader = FakeVaultReader(docs=DOCS + TWINS)
+    async with _client(reader) as c:
+        rows = (await c.call_tool("vault_get_document", {"doc_id": "twin", "corpus": "company"})).data
+        single = (await c.call_tool("vault_get_document", {"doc_id": "us1", "corpus": "central-bank"})).data
+        with pytest.raises(ToolError, match=r"^\[not_found\] no document 'us1' in corpus 'company'"):
+            await c.call_tool("vault_get_document", {"doc_id": "us1", "corpus": "company"})
+    assert [(d["corpus"], d["entity_value"], d["date_precision"]) for d in rows] == [
+        ("company", "0000320193", "day")]
+    assert [d["doc_id"] for d in single] == ["us1"]
+    assert ("get", "twin", "company") in reader.calls
+
+
+async def test_get_document_description_says_it_returns_a_list():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    get = tools["vault_get_document"]
+    assert "one per corpus" in get.description and "at most one" in get.description
+    assert get.input_schema["properties"]["corpus"].get("description")
+    assert get.input_schema["required"] == ["doc_id"]
 
 
 async def test_corpus_stats_counts_live_documents_with_null_as_a_group():
@@ -120,8 +153,14 @@ async def test_document_resource_is_on_the_root_uri():
         assert templates == ["vault://documents/{doc_id}"]
         with pytest.raises(Exception, match=r"^\[not_found\] "):
             await c.read_resource("vault://documents/nope")
-    doc = json.loads(contents[0].text)
-    assert doc["doc_id"] == "us1" and doc["date"] == "2010-01-13"
+    docs = json.loads(contents[0].text)
+    assert [(d["doc_id"], d["date"]) for d in docs] == [("us1", "2010-01-13")]
+
+
+async def test_document_resource_lists_every_corpus_holding_the_doc_id():
+    async with _client(FakeVaultReader(docs=DOCS + TWINS)) as c:
+        contents = await c.read_resource("vault://documents/twin")
+    assert [d["corpus"] for d in json.loads(contents[0].text)] == ["central-bank", "company"]
 
 
 async def test_runs_status_bundles_runs_source_runs_errors_and_health():
@@ -364,14 +403,16 @@ async def test_date_from_after_date_to_is_refused():
 
 
 @pytest.mark.parametrize(("tool", "arg"), [("vault_get_document", "doc_id"),
+                                           ("vault_get_document", "corpus"),
                                            ("vault_search_documents", "text"),
                                            ("vault_search_documents", "cursor")])
 async def test_string_arguments_are_length_capped(tool, arg):
+    required = {"doc_id": "us1"} if tool == "vault_get_document" else {}
     async with _client() as c:
         with pytest.raises(ToolError, match="at most 200 characters"):
-            await c.call_tool(tool, {arg: "a" * 201})
+            await c.call_tool(tool, {**required, arg: "a" * 201})
         if arg != "cursor":
-            await c.call_tool(tool, {arg: "a" * 200}, raise_on_error=False)
+            await c.call_tool(tool, {**required, arg: "a" * 200}, raise_on_error=False)
 
 
 async def test_resource_body_is_the_compact_json_the_cap_measures():

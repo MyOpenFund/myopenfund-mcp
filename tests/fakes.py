@@ -1,7 +1,8 @@
 """An in-memory VaultReader with adversarial data.
 
 NULL date, an html row, a tombstone, a same-date pair, a run that crashed before any source
-(run grain only), an error-only source, an approximate `last_seen_at`, Decimal and naive values.
+(run grain only), an error-only source, an approximate `last_seen_at`, Decimal and naive values;
+TWINS: one doc_id held by two corpora (a doc_id is unique within its corpus only).
 """
 from __future__ import annotations
 
@@ -22,6 +23,16 @@ DOCS = [
     {"doc_id": "us9", "corpus": "central-bank", "source_code": "us", "doc_type": "C1", "title": "Withdrawn",
      "date": dt.date(2009, 3, 1), "year": 2009, "mime_type": "application/pdf",
      "deleted_at": dt.datetime(2026, 9, 1, tzinfo=dt.UTC)},
+]
+
+# The same doc_id in two corpora, listed out of corpus order (vault-query orders by corpus).
+TWINS = [
+    {"doc_id": "twin", "corpus": "company", "source_code": "sec", "doc_type": "A1", "title": "Form 10-K",
+     "date": dt.date(2024, 2, 2), "year": 2024, "mime_type": "text/plain", "deleted_at": None,
+     "date_precision": "day", "date_kind": "publication", "entity_scheme": "cik", "entity_value": "0000320193"},
+    {"doc_id": "twin", "corpus": "central-bank", "source_code": "us", "doc_type": "A1", "title": "Rate decision",
+     "date": dt.date(2024, 1, 1), "year": 2024, "mime_type": "application/pdf", "deleted_at": None,
+     "date_precision": "year", "date_kind": None, "entity_scheme": None, "entity_value": None},
 ]
 
 # Run grain: r0 crashed before reaching any source, so it has no runs_status row.
@@ -96,10 +107,11 @@ class FakeVaultReader:
             rows = [d for d in rows if filters["q"].lower() in (d["title"] or "").lower()]
         return len(rows), rows[offset:offset + limit]
 
-    def get_document(self, doc_id):
-        self.calls.append(("get", doc_id))
+    def get_document(self, doc_id, corpus=None):
+        self.calls.append(("get", doc_id, corpus))
         self._maybe_fail()
-        return next((d for d in self.docs if d["doc_id"] == doc_id), None)
+        rows = [d for d in self.docs if d["doc_id"] == doc_id and corpus in (None, d["corpus"])]
+        return sorted(rows, key=lambda d: d["corpus"])
 
     def corpus_stats(self, *, group_by, corpus, limit):
         self.calls.append(("stats", group_by, corpus, limit))

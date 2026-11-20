@@ -54,6 +54,13 @@ RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first u
 `limit` applies to each of `runs`, `source_runs`, `open_discovery_errors` and `source_health`.
 A result over the server's size cap is refused, never cut: ask for a smaller `limit`, or filter by
 `source_code`."""
+GET_DOCUMENT_DESCRIPTION = """Every stored fact of a document: dates (`date`, with `date_precision` and
+`date_kind`), the document's URL and the page it was found on, publisher, type, issuing entity
+(`entity_scheme`, `entity_value`, e.g. cik), `extra`.
+A doc_id is unique within its corpus only, so this returns a LIST: with `corpus`, at most one
+document (the one of that corpus); without `corpus`, one per corpus holding this doc_id, ordered by
+corpus, each carrying its `corpus`. Pass the `corpus` of the search row you came from.
+No document: [not_found]."""
 # Rank of a `source_health.cadence_status` in the list (lower first); any other value, NULL included,
 # ranks after these.
 HEALTH_STATUS_RANK = {"overdue": 0, "soon": 1}
@@ -67,6 +74,15 @@ def _least_healthy_first(rows: list[dict]) -> list[dict]:
         return (HEALTH_STATUS_RANK.get(row.get("cadence_status"), len(HEALTH_STATUS_RANK)),
                 days_late is None, -(days_late or 0))
     return sorted(rows, key=key)
+
+
+async def _documents(reader: VaultReader, doc_id: str, corpus: str | None) -> list[dict]:
+    """vault-query's list (one row per corpus holding doc_id, or the one in `corpus`); none is not_found."""
+    rows = await _call(reader.get_document, doc_id=doc_id, corpus=corpus)
+    if not rows:
+        where = "" if corpus is None else f" in corpus {corpus!r}"
+        raise tool_error(NOT_FOUND, f"no document {doc_id!r}{where}; find ids with vault_search_documents")
+    return rows
 
 
 async def _call(fn, /, **kwargs):
@@ -122,14 +138,15 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         return cap_result({"total": total, "returned": len(rows), "next_cursor": next_cursor,
                            "documents": rows}, settings)
 
-    @vault.tool(auth=read, annotations=READ_ONLY)
-    async def get_document(doc_id: Annotated[str, Field(
-            description="doc_id from vault_search_documents", max_length=MAX_ARG_CHARS)]) -> dict:
-        """Every stored fact of one document: dates, source and PDF URLs, publisher, type, `extra`."""
-        row = await _call(reader.get_document, doc_id=doc_id)
-        if row is None:
-            raise tool_error(NOT_FOUND, f"no document {doc_id!r}; find ids with vault_search_documents")
-        return cap_result(row, settings)
+    @vault.tool(auth=read, annotations=READ_ONLY, description=GET_DOCUMENT_DESCRIPTION)
+    async def get_document(
+        doc_id: Annotated[str, Field(description="doc_id from vault_search_documents",
+                                     max_length=MAX_ARG_CHARS)],
+        corpus: Annotated[str | None, Field(
+            description="The document's corpus (the `corpus` of its search row), e.g. 'central-bank'; "
+                        "omitted = every corpus holding this doc_id", max_length=MAX_ARG_CHARS)] = None,
+    ) -> list[dict]:
+        return cap_result(await _documents(reader, doc_id, corpus), settings)
 
     @vault.tool(auth=read, annotations=READ_ONLY)
     async def corpus_stats(
@@ -181,9 +198,10 @@ def register_vault_resources(root: FastMCP, reader: VaultReader, settings: Setti
     @root.resource("vault://documents/{doc_id}", mime_type="application/json",
                    auth=tier_check("read", auth_enabled=auth_enabled))
     async def document(doc_id: str) -> str:
-        """One document's metadata as JSON (same content as vault_get_document)."""
-        row = await _call(reader.get_document, doc_id=doc_id)
-        if row is None:
+        """The metadata of the documents with this doc_id, one per corpus holding it, as a JSON list
+        (same content as vault_get_document without corpus)."""
+        rows = await _call(reader.get_document, doc_id=doc_id, corpus=None)
+        if not rows:
             raise ResourceError(f"[{NOT_FOUND}] no document {doc_id!r}")
         # The exact string the cap measured (paging.result_chars basis).
-        return json.dumps(cap_result(row, settings), ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(cap_result(rows, settings), ensure_ascii=False, separators=(",", ":"))

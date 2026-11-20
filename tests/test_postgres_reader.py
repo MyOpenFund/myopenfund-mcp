@@ -169,7 +169,7 @@ PASS_THROUGH = [
      {"filters": {"corpus": "amf"}, "sort_by": "date", "sort_dir": "asc", "limit": 9, "offset": 3, "include_deleted": True},
      (({"corpus": "amf"},), {"sort_by": "date", "sort_dir": "asc", "limit": 9, "offset": 3, "include_deleted": True,
                                  "columns": vault_query.SEARCH_COLUMNS})),
-    ("get_document", {"doc_id": "d1"}, (("d1",), {})),
+    ("get_document", {"doc_id": "d1", "corpus": "amf"}, (("d1",), {"corpus": "amf"})),
     ("corpus_stats", {"group_by": "year", "corpus": "amf", "limit": 12},
      (("year",), {"corpus": "amf", "limit": 12})),
     ("runs_status",

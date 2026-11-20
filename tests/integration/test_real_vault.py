@@ -39,8 +39,12 @@ async def test_real_vault_read_path():
             assert page["next_cursor"] is None
 
         doc_id = page["documents"][0]["doc_id"]
-        doc = (await c.call_tool("vault_get_document", {"doc_id": doc_id})).data
-        assert doc["doc_id"] == doc_id
+        corpus = page["documents"][0]["corpus"]
+        docs = (await c.call_tool("vault_get_document", {"doc_id": doc_id})).data
+        assert docs and all(d["doc_id"] == doc_id for d in docs)
+        assert corpus in [d["corpus"] for d in docs]
+        one = (await c.call_tool("vault_get_document", {"doc_id": doc_id, "corpus": corpus})).data
+        assert [(d["doc_id"], d["corpus"]) for d in one] == [(doc_id, corpus)]
 
         stats = (await c.call_tool("vault_corpus_stats", {"group_by": "source_code"})).data
         assert stats["total"] == live
