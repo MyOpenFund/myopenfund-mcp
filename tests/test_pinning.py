@@ -70,14 +70,27 @@ def test_build_backends_are_pinned_and_used():
             "build-constraints.txt") in COMPOSE
 
 
+def _script(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+updater = _script("update_constraints")
+
+
 def test_build_constraints_were_generated_from_the_current_git_pins():
     """A git dependency bumped without regenerating build-constraints.txt could bring another build
-    backend that would then float: the file records the pins it was built from."""
-    pins = re.findall(r"git\+https://github\.com/([^/@\s]+/[^/@\s]+)@([0-9a-f]{40})(?:#subdirectory=([^\s\"']+))?",
-                      PYPROJECT)
-    expected = sorted(f"{r}@{c}" + (f"#{sub}" if sub else "") for r, c, sub in set(pins))
+    backend that would then float: the file records the pins it was built from. The recorded list is
+    compared here; whether the backends are pinned within what each pin asks is the `--build` check."""
     recorded = sorted(re.findall(r"^#   (\S+)$", BUILD_CONSTRAINTS, re.MULTILINE))
-    assert recorded == expected, "git pins changed: run python3.13 scripts/update_constraints.py"
+    assert recorded == updater.git_pins(), "git pins changed: run python3.13 scripts/update_constraints.py"
+
+
+def test_git_dep_pattern_strips_a_dot_git_suffix():
+    url = "git+https://github.com/MyOpenFund/vault.git@" + "a" * 40 + "#subdirectory=query"
+    assert updater.GIT_DEP.findall(url) == [("MyOpenFund/vault", "a" * 40, "query")]
 
 
 def test_editable_build_requirement_is_pinned():
@@ -85,9 +98,7 @@ def test_editable_build_requirement_is_pinned():
 
 
 # --- the checker's own logic, on fake distributions ---------------------------------------------------
-_spec = importlib.util.spec_from_file_location("check_constraints", ROOT / "scripts" / "check_constraints.py")
-checker = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(checker)
+checker = _script("check_constraints")
 
 
 class FakeMetadata:
@@ -157,3 +168,21 @@ def test_read_constraints_refuses_a_range(tmp_path):
     f.write_text("foo>=1.0\n")
     with pytest.raises(SystemExit):
         checker.read_constraints(f)
+
+
+def test_build_check_wants_every_build_requirement_pinned_within_its_specifier():
+    pins = {"hatchling": "1.33.0", "setuptools": "84.2.1", "editables": "0.6"}
+    assert checker.check_build(pins, ["hatchling>=1.25", "setuptools>=77", "editables"]) == []
+    assert checker.check_build(pins, ["hatchling>=2", "flit_core>=3.2", "Setuptools<80"]) == [
+        "flit-core (flit_core>=3.2): not in build-constraints.txt",
+        "hatchling: build-constraints.txt says 1.33.0, outside hatchling>=2",
+        "setuptools: build-constraints.txt says 84.2.1, outside Setuptools<80",
+    ]
+
+
+def test_build_check_runs_on_the_committed_files(monkeypatch):
+    """The `--build` mode as the locked job runs it, with the GitHub reads of build_requires replaced."""
+    monkeypatch.setattr(checker, "_build_requires", lambda: ["editables", "hatchling>=1.25", "setuptools>=77"])
+    assert checker.main(["--build"]) == 0
+    monkeypatch.setattr(checker, "_build_requires", lambda: ["hatchling>=99"])
+    assert checker.main(["--build"]) == 1

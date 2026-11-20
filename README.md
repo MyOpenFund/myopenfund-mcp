@@ -111,7 +111,10 @@ the ones the CI tested:
   isolated build environments that `-c` does not reach; [`build-constraints.txt`](build-constraints.txt)
   pins their backends (hatchling, setuptools and their dependencies, plus `editables`, which hatchling
   needs for the CI's editable install), passed with `--build-constraint`. The file records the git pins it
-  was generated from: bumping one without regenerating fails the tests.
+  was generated from: bumping one without regenerating fails the tests. That test compares the recorded
+  list only; the `locked` job also runs `scripts/check_constraints.py --build`, which reads every build
+  requirement (this package's, and each git dependency's at its pinned commit) and fails when one is not
+  pinned in the file at a version its specifier allows.
 - **Git dependencies** (`vault-query`, `my-open-data`, `company-corpus`, `rag-engine`): pinned by full
   commit in `pyproject.toml`, as before.
 
@@ -135,7 +138,9 @@ The CI runs the tests twice: floating within the ranges of `pyproject.toml` (Pyt
 coming break shows early) and locked (`locked` job: the image's Python, both constraint files, then
 `scripts/check_constraints.py`, which fails when a runtime dependency of the server is missing from
 `constraints.txt` or installed at another version, e.g. a new dependency brought by a release, and when an
-extra it is asked to check does not exist).
+extra it is asked to check does not exist, then `scripts/check_constraints.py --build`, which reads the git
+dependencies' build requirements from `raw.githubusercontent.com`). A test checks that the job's Python is
+the patch of `PYTHON_IMAGE`.
 
 **Upgrading** is a deliberate change in a pull request: for the base image, look up the digest of the new
 tag (`docker buildx imagetools inspect python:<tag>`) and replace `PYTHON_IMAGE` in the Dockerfile and the

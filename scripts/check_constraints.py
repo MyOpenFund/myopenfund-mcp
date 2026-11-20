@@ -1,12 +1,19 @@
 """Check that the running environment matches constraints.txt for every dependency of the server.
 
     python scripts/check_constraints.py [--extras vault,companies,rag]
+    python scripts/check_constraints.py --build
+
 
 Walks the installed requirement tree of myopenfund-mcp[extras] (markers evaluated for this interpreter)
 and fails when a PyPI dependency is not listed in constraints.txt or is installed at another version.
 `pip install -c` already refuses a listed package at another version; what it cannot see is a NEW
 dependency (a release that adds one), which would float. Git dependencies are pinned by commit in
 pyproject.toml and only walked through. Dev tools (pytest, ruff) are not part of the tree and float.
+
+`--build` checks build-constraints.txt instead: every `[build-system] requires` of this package and of
+each git dependency at its pinned commit (read from GitHub, as scripts/update_constraints.py does) must
+be pinned there, at a version its specifier allows. A git dependency bumped to a commit that wants
+another backend, or a newer one, fails here instead of floating in the isolated build environment.
 """
 from __future__ import annotations
 
@@ -87,11 +94,43 @@ def check(pins: dict[str, str], tree: dict[str, metadata.Distribution]) -> list[
     return problems
 
 
+def check_build(pins: dict[str, str], requirements: list[str]) -> list[str]:
+    """One line per build requirement missing from the pins or pinned outside its specifier."""
+    problems = []
+    for raw in requirements:
+        req = Requirement(raw)
+        name = canonicalize_name(req.name)
+        if name not in pins:
+            problems.append(f"{name} ({raw}): not in build-constraints.txt")
+        elif not req.specifier.contains(pins[name], prereleases=True):
+            problems.append(f"{name}: build-constraints.txt says {pins[name]}, outside {raw}")
+    return sorted(problems)
+
+
+def _build_requires() -> list[str]:
+    """scripts/update_constraints.py's build_requires(): one source for what the generator pins."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("update_constraints", ROOT / "scripts" / "update_constraints.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_requires()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--extras", default="vault,companies,rag")
     parser.add_argument("--constraints", default=str(ROOT / "constraints.txt"))
+    parser.add_argument("--build", action="store_true",
+                        help="check build-constraints.txt against the build requirements instead")
     args = parser.parse_args(argv)
+    if args.build:
+        requirements = _build_requires()
+        problems = check_build(read_constraints(ROOT / "build-constraints.txt"), requirements)
+        for line in problems:
+            print(line, file=sys.stderr)
+        print(f"{len(requirements)} build requirements checked, {len(problems)} problem(s)")
+        return 1 if problems else 0
     pins = read_constraints(Path(args.constraints))
     tree = walk(SELF, {e.strip() for e in args.extras.split(",") if e.strip()})
     problems = check(pins, tree)

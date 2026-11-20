@@ -40,4 +40,6 @@ jobs:
             build-constraints.txt
       - run: pip install -c constraints.txt --build-constraint build-constraints.txt -e ".[vault,companies,rag,dev]"
       - run: python scripts/check_constraints.py
+      # Reads the git dependencies' build requirements from raw.githubusercontent.com at their pinned commits.
+      - run: python scripts/check_constraints.py --build
       - run: python -m pytest -q
