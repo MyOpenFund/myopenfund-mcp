@@ -100,7 +100,7 @@ async def test_read_tier_cannot_see_or_call_an_act_tool(http_url):
 async def test_document_resource_readable_with_read_token(http_url):
     async with Client(http_url, auth=AGENT_TOKEN) as c:
         contents = await c.read_resource("vault://documents/us1")
-    assert json.loads(contents[0].text)["doc_id"] == "us1"
+    assert [d["doc_id"] for d in json.loads(contents[0].text)] == ["us1"]
 
 
 async def test_wrong_token_is_refused(http_url):
