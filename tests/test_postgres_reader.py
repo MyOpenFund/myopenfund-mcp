@@ -66,11 +66,12 @@ def test_driver_errors_become_codes_and_never_leak(pg, exc, code):
     _assert_clean(info, code)
 
 
-@pytest.mark.parametrize("exc", [
-    psycopg2.errors.UndefinedColumn('column "bad_content" does not exist hunter2'),
-    psycopg2.errors.UndefinedTable('relation "vocabulary" does not exist hunter2'),
+@pytest.mark.parametrize(("exc", "missing"), [
+    (psycopg2.errors.UndefinedColumn('column "bad_content" does not exist\nLINE 1: SELECT bad_content'),
+     'column "bad_content" does not exist'),
+    (psycopg2.errors.UndefinedTable('relation "vocabulary" does not exist'), 'relation "vocabulary" does not exist'),
 ])
-def test_an_older_vault_schema_is_named_not_reported_as_an_outage(pg, monkeypatch, exc):
+def test_an_older_vault_schema_is_named_not_reported_as_an_outage(pg, monkeypatch, caplog, exc, missing):
     def query(conn, *args, **kwargs):
         raise exc
 
@@ -78,9 +79,12 @@ def test_an_older_vault_schema_is_named_not_reported_as_an_outage(pg, monkeypatc
     with pytest.raises(ToolError) as info:
         _reader().list_vocabulary(corpus=None, kind=None, limit=5)
     _assert_clean(info, "schema_outdated")
-    assert str(info.value) == ("[schema_outdated] the vault schema is older than this server expects "
-                               "(see README)")
+    assert str(info.value) == ("[schema_outdated] the vault lacks a column or table this server reads "
+                               "(see README, Minimum vault schema)")
     assert pg["conns"][0].closed
+    # The operator learns which one from the server log (the client gets the fixed text).
+    logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.vault.reader"]
+    assert logged == [f"vault schema: {missing} (deploy the vault, and run its ingestion, first)"]
 
 
 def test_timeout_message_names_the_setting_and_the_migration_case(pg):

@@ -402,11 +402,13 @@ extra is not installed`). Timestamps in results are UTC: the server's database s
 keyed `(corpus, doc_id)`, columns `date_precision` / `date_kind` / `entity_scheme` / `entity_value`, table
 `vocabulary`; `runs_sources.bad_content`). Deploy the vault (and run its ingestion, which applies the
 schema) before this server. Against an older schema, a tool that reads a missing column or table answers
-`[schema_outdated] the vault schema is older than this server expects (see README)`, not
-`backend_unavailable`.
+`[schema_outdated] the vault lacks a column or table this server reads (see README, Minimum vault schema)`,
+not `backend_unavailable`; the server log names the missing column or table, and `server_info` reports
+`"freshness_error": "schema_outdated"`.
 
 If the vault database is down, `server_info` still answers (version, tier, toolsets) with `freshness`
-null and `"freshness_error": "backend_unavailable"`; the server log names the exception class only.
+null and `freshness_error` set to the error's code (`backend_unavailable`, `timeout`, `schema_outdated`);
+the server log names the exception class only.
 
 ### Passage search (rag)
 

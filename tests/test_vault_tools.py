@@ -17,7 +17,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from myopenfund_mcp.config import ConfigError, Settings
-from myopenfund_mcp.errors import BACKEND_UNAVAILABLE, tool_error
+from myopenfund_mcp.errors import BACKEND_UNAVAILABLE, SCHEMA_OUTDATED, tool_error
 from myopenfund_mcp.paging import MAX_OFFSET, encode_cursor
 from myopenfund_mcp.server import build_server
 
@@ -405,6 +405,13 @@ async def test_unexpected_errors_are_masked_for_tools_server_info_and_the_resour
     assert "tool=server_info client=local outcome=ok" in lines[5]
     logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.server"]
     assert any("RuntimeError" in line for line in logged), logged
+
+
+async def test_server_info_freshness_error_is_the_readers_code():
+    reader = FakeVaultReader(fail_with=tool_error(SCHEMA_OUTDATED, "the vault lacks a column or table"))
+    async with _client(reader) as c:
+        info = (await c.call_tool("server_info", {})).data
+    assert info["freshness"] is None and info["freshness_error"] == "schema_outdated"
 
 
 async def test_server_info_survives_a_vault_outage():
