@@ -23,7 +23,8 @@ from myopenfund_mcp.server import build_server
 
 pytestmark = pytest.mark.anyio
 
-VAULT_TOOLS = {"vault_search_documents", "vault_get_document", "vault_corpus_stats", "vault_runs_status"}
+VAULT_TOOLS = {"vault_search_documents", "vault_get_document", "vault_corpus_stats", "vault_runs_status",
+               "vault_vocabulary"}
 
 
 def _client(reader=None, **settings):
@@ -120,6 +121,45 @@ async def test_descriptions_tell_the_model_doc_type_needs_a_corpus():
                  tools["vault_corpus_stats"].description):
         assert "corpus" in text and "ask the user" in text, text
     assert "invalid_argument" in doc_type and "invalid_argument" in group_by
+
+
+async def test_vocabulary_lists_codes_with_labels_per_corpus():
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        every = (await c.call_tool("vault_vocabulary", {})).data
+        company = (await c.call_tool("vault_vocabulary", {"corpus": "company", "kind": "doc_type"})).data
+    assert [(v["corpus"], v["kind"], v["code"]) for v in every["codes"]] == [
+        ("central-bank", "doc_type", "A1"), ("central-bank", "doc_type", "C1"),
+        ("central-bank", "source_code", "us"), ("company", "doc_type", "A1"), ("company", "doc_type", "A2"),
+        ("company", "entity_scheme", "cik")]
+    assert (every["returned"], every["truncated"]) == (6, False)
+    assert [(v["code"], v["label"], v["family"]) for v in company["codes"]] == [
+        ("A1", "Annual report (10-K)", "A"), ("A2", "Quarterly report (10-Q)", "A")]
+    # One row more than the page is read, to tell a full page from a cut one.
+    assert reader.calls == [("vocabulary", None, None, 51), ("vocabulary", "company", "doc_type", 51)]
+
+
+async def test_vocabulary_says_when_limit_cut_the_list():
+    async with _client() as c:
+        cut = (await c.call_tool("vault_vocabulary", {"limit": 2})).data
+        exact = (await c.call_tool("vault_vocabulary", {"limit": 6})).data
+        with pytest.raises(ToolError, match=r"^\[invalid_argument\] limit"):
+            await c.call_tool("vault_vocabulary", {"limit": 0})
+        with pytest.raises(ToolError):
+            await c.call_tool("vault_vocabulary", {"kind": "language"})
+    assert (cut["returned"], cut["truncated"], len(cut["codes"])) == (2, True, 2)
+    assert (exact["returned"], exact["truncated"]) == (6, False)
+
+
+async def test_vocabulary_description_and_doc_type_point_to_each_other():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    vocabulary = tools["vault_vocabulary"]
+    assert vocabulary.annotations.read_only_hint is True
+    assert "within its corpus" in vocabulary.description and "vault_corpus_stats" in vocabulary.description
+    assert "truncated" in vocabulary.description
+    doc_type = tools["vault_search_documents"].input_schema["properties"]["doc_type"]["description"]
+    assert "vault_vocabulary" in doc_type
 
 
 async def test_a_result_over_the_cap_is_refused_not_cut():
@@ -307,7 +347,7 @@ async def test_unexpected_errors_are_masked_for_tools_server_info_and_the_resour
     async with _client(FakeVaultReader(fail_with=LEAK)) as c:
         messages = []
         for name, args in [("vault_search_documents", {}), ("vault_get_document", {"doc_id": "us1"}),
-                           ("vault_corpus_stats", {}), ("vault_runs_status", {})]:
+                           ("vault_corpus_stats", {}), ("vault_runs_status", {}), ("vault_vocabulary", {})]:
             with pytest.raises(ToolError) as caught:
                 await c.call_tool(name, args)
             messages.append(str(caught.value))
@@ -321,9 +361,9 @@ async def test_unexpected_errors_are_masked_for_tools_server_info_and_the_resour
         assert "hunter2" not in message and "postgres://" not in message, message
     assert info["freshness"] is None and info["freshness_error"] == "backend_unavailable"
     lines = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.audit"]
-    assert len(lines) == 5
-    assert sum("outcome=error" in line for line in lines) == 4
-    assert "tool=server_info client=local outcome=ok" in lines[4]
+    assert len(lines) == 6
+    assert sum("outcome=error" in line for line in lines) == 5
+    assert "tool=server_info client=local outcome=ok" in lines[5]
     logged = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.server"]
     assert any("RuntimeError" in line for line in logged), logged
 

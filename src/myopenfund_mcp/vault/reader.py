@@ -30,6 +30,7 @@ class VaultReader(Protocol):
     def open_discovery_errors(self, *, corpus: str | None, source_code: str | None, limit: int,
                               max_text_chars: int) -> list[dict]: ...
     def freshness(self) -> dict: ...
+    def list_vocabulary(self, *, corpus: str | None, kind: str | None, limit: int) -> list[dict]: ...
 
 
 class PostgresVaultReader:
@@ -115,3 +116,6 @@ class PostgresVaultReader:
 
     def freshness(self):
         return self._run(self._vq.freshness)
+
+    def list_vocabulary(self, *, corpus, kind, limit):
+        return self._run(self._vq.list_vocabulary, corpus, kind=kind, limit=limit)

@@ -201,7 +201,17 @@ PASS_THROUGH = [
     ("open_discovery_errors", {"corpus": "amf", "source_code": None, "limit": 4, "max_text_chars": 50},
      ((), {"corpus": "amf", "source_code": None, "limit": 4, "max_text_chars": 50})),
     ("freshness", {}, ((), {})),
+    ("list_vocabulary", {"corpus": "amf", "kind": "doc_type", "limit": 6},
+     (("amf",), {"kind": "doc_type", "limit": 6})),
 ]
+
+
+def test_vocabulary_kinds_match_vault_query():
+    import typing
+
+    from myopenfund_mcp.vault.tools import VocabularyKind
+
+    assert set(typing.get_args(VocabularyKind)) == set(vault_query.VOCABULARY_KINDS)
 
 
 def test_search_projection_adds_the_contract_columns_to_vault_querys(pg):

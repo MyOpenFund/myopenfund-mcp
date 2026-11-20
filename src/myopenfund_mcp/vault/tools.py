@@ -18,6 +18,8 @@ from ..paging import MAX_OFFSET, cap_result, clamp_limit, decode_cursor, encode_
 from .reader import VaultReader
 
 SortField = Literal["date", "year", "corpus", "source_code", "doc_type", "title", "created_at"]
+# vault_query.VOCABULARY_KINDS (a test keeps them equal): the column each declared code is for.
+VocabularyKind = Literal["source_code", "doc_type", "provenance", "entity_scheme"]
 GroupField = Literal["corpus", "source_code", "doc_type", "language", "year", "provenance", "mime_type"]
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 MAX_ARG_CHARS = 200  # doc_id, text and cursor: longer strings are refused by schema validation
@@ -38,7 +40,7 @@ DOC_TYPE_NEEDS_CORPUS = (
     "needs `corpus`: a code means something only within its corpus. When the corpus is not clear from "
     "the conversation, ask the user which corpus they mean (or infer it from context: a 10-K is a company "
     "filing, a rate decision a central-bank document); without corpus the call is refused with "
-    "[invalid_argument] listing each corpus's codes and labels")
+    "[invalid_argument] listing each corpus's codes and labels (vault_vocabulary lists them too)")
 DOC_TYPE_DESCRIPTION = f"Document-type code within its corpus, e.g. 'C1'; exact match; {DOC_TYPE_NEEDS_CORPUS}"
 GROUP_BY_DESCRIPTION = f"Field the live documents are counted by; doc_type {DOC_TYPE_NEEDS_CORPUS}"
 SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset; an offset is whole minutes, at most +/-15:59); "
@@ -62,6 +64,14 @@ RUNS_STATUS_DESCRIPTION = """Is the pipeline healthy? Four lists, newest first u
 `limit` applies to each of `runs`, `source_runs`, `open_discovery_errors` and `source_health`.
 A result over the server's size cap is refused, never cut: ask for a smaller `limit`, or filter by
 `source_code`."""
+VOCABULARY_DESCRIPTION = """What the codes mean: the codes each corpus declares, with their labels, as rows
+{corpus, kind, code, label, family} ordered by corpus, kind, code. `kind` is the column a code is for
+(doc_type, source_code, provenance, entity_scheme); `family` groups doc_types when the corpus declares
+families. A code means something only within its corpus (central-bank A1 and company A1 are different
+document types): use this to turn the user's words (e.g. "10-K", "rate decision") into the doc_type of
+a corpus before filtering vault_search_documents. A corpus that has not declared its codes yet has no
+rows: vault_corpus_stats(group_by="doc_type", corpus=...) shows the codes its documents use.
+`truncated` true means `limit` cut the list: filter by corpus and kind."""
 GET_DOCUMENT_DESCRIPTION = """Every stored fact of a document: dates (`date`, with `date_precision` and
 `date_kind`), the document's URL and the page it was found on, publisher, type, issuing entity
 (`entity_scheme`, `entity_value`, e.g. cik), `extra`.
@@ -170,6 +180,20 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         Grouping by doc_type needs `corpus`: ask the user which corpus when the context does not say."""
         return cap_result(await _call(reader.corpus_stats, group_by=group_by, corpus=corpus,
                                       limit=clamp_limit(limit, settings)), settings)
+
+    @vault.tool(auth=read, annotations=READ_ONLY, description=VOCABULARY_DESCRIPTION)
+    async def vocabulary(
+        corpus: Annotated[str | None, Field(description=f"{CORPUS_DESCRIPTION}; omitted = every corpus",
+                                            max_length=MAX_ARG_CHARS)] = None,
+        kind: Annotated[VocabularyKind | None, Field(
+            description="Only the codes of this column; omitted = every kind")] = None,
+        limit: Annotated[int | None, Field(description=LIMIT_DESCRIPTION)] = None,
+    ) -> dict:
+        page = clamp_limit(limit, settings)
+        # One row more than the page tells a full list from a cut one (vault-query has no total).
+        rows = await _call(reader.list_vocabulary, corpus=corpus, kind=kind, limit=page + 1)
+        return cap_result({"returned": min(len(rows), page), "truncated": len(rows) > page,
+                           "codes": rows[:page]}, settings, hint="filter by corpus and kind")
 
     @vault.tool(auth=read, annotations=READ_ONLY, description=RUNS_STATUS_DESCRIPTION)
     async def runs_status(

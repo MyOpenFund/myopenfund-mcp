@@ -42,6 +42,17 @@ DOC_TYPE_NEEDS_CORPUS = (
     "corpus is not clear from context. Codes per corpus: central-bank: A1 = Monetary policy decision, "
     "C1 = Minutes; company: A1 = Annual report (10-K), A2 = Quarterly report (10-Q)")
 
+# The `vocabulary` table: the same code in two corpora with two meanings; a NULL label and family.
+VOCABULARY = [
+    {"corpus": "company", "kind": "doc_type", "code": "A1", "label": "Annual report (10-K)", "family": "A"},
+    {"corpus": "central-bank", "kind": "source_code", "code": "us", "label": "Federal Reserve", "family": None},
+    {"corpus": "central-bank", "kind": "doc_type", "code": "C1", "label": "Minutes", "family": "C"},
+    {"corpus": "central-bank", "kind": "doc_type", "code": "A1", "label": "Monetary policy decision",
+     "family": "A"},
+    {"corpus": "company", "kind": "entity_scheme", "code": "cik", "label": None, "family": None},
+    {"corpus": "company", "kind": "doc_type", "code": "A2", "label": "Quarterly report (10-Q)", "family": "A"},
+]
+
 # Run grain: r0 crashed before reaching any source, so it has no runs_status row.
 RECENT_RUNS = [
     {"run_id": "r1", "tool": "vault", "command": "ingest", "corpus": "central-bank",
@@ -121,6 +132,12 @@ class FakeVaultReader:
         self._maybe_fail()
         rows = [d for d in self.docs if d["doc_id"] == doc_id and corpus in (None, d["corpus"])]
         return sorted(rows, key=lambda d: d["corpus"])
+
+    def list_vocabulary(self, *, corpus, kind, limit):
+        self.calls.append(("vocabulary", corpus, kind, limit))
+        self._maybe_fail()
+        rows = [v for v in VOCABULARY if corpus in (None, v["corpus"]) and kind in (None, v["kind"])]
+        return sorted(rows, key=lambda v: (v["corpus"], v["kind"], v["code"]))[:limit]
 
     def corpus_stats(self, *, group_by, corpus, limit):
         self.calls.append(("stats", group_by, corpus, limit))
