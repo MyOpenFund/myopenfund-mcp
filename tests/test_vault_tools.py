@@ -210,6 +210,8 @@ async def test_get_document_without_corpus_returns_one_row_per_corpus():
     assert reader.calls == [("get", "twin", None)]
     # The text block the model reads is the list itself, not a wrapper.
     assert json.loads(result.content[0].text) == result.data
+    # MCP structured output must be an object: the list is wrapped as {"result": [...]} (README says so).
+    assert result.structured_content == {"result": json.loads(result.content[0].text)}
 
 
 async def test_get_document_with_corpus_returns_that_corpus_only():
@@ -217,7 +219,8 @@ async def test_get_document_with_corpus_returns_that_corpus_only():
     async with _client(reader) as c:
         rows = (await c.call_tool("vault_get_document", {"doc_id": "twin", "corpus": "company"})).data
         single = (await c.call_tool("vault_get_document", {"doc_id": "us1", "corpus": "central-bank"})).data
-        with pytest.raises(ToolError, match=r"^\[not_found\] no document 'us1' in corpus 'company'"):
+        with pytest.raises(ToolError, match=r"^\[not_found\] no document 'us1' in corpus 'company'; omit "
+                                            r"corpus to look in every corpus"):
             await c.call_tool("vault_get_document", {"doc_id": "us1", "corpus": "company"})
     assert [(d["corpus"], d["entity_value"], d["date_precision"]) for d in rows] == [
         ("company", "0000320193", "day")]
@@ -545,6 +548,7 @@ async def test_date_from_after_date_to_is_refused():
 
 @pytest.mark.parametrize(("tool", "arg"), [("vault_get_document", "doc_id"),
                                            ("vault_get_document", "corpus"),
+                                           ("vault_vocabulary", "corpus"),
                                            ("vault_search_documents", "text"),
                                            ("vault_search_documents", "cursor")])
 async def test_string_arguments_are_length_capped(tool, arg):

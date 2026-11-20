@@ -141,6 +141,19 @@ def test_doc_type_needs_corpus_keeps_vault_querys_message(pg, monkeypatch, name,
     assert info.value.__context__ is None and pg["conns"][0].closed
 
 
+def test_a_cut_codes_list_points_at_the_mcp_tool_not_the_library(pg, monkeypatch):
+    """vault-query's message ends with its own function's name when the list is cut; a model can only call
+    vault_vocabulary."""
+    def refuse(conn, *args, **kwargs):
+        raise vault_query.DocTypeNeedsCorpus(
+            "doc_type needs corpus: ... Codes per corpus: company: A1 = 10-K (list cut: see vault_query.list_vocabulary)")
+
+    monkeypatch.setattr(vault_query, "corpus_stats", refuse)
+    with pytest.raises(ToolError) as info:
+        _reader().corpus_stats(group_by="doc_type", corpus=None, limit=5)
+    assert str(info.value).endswith("company: A1 = 10-K (list cut: see vault_vocabulary)")
+
+
 def test_query_failure_closes_the_connection(pg, monkeypatch):
     def freshness(conn):
         raise psycopg2.errors.QueryCanceled("canceling statement")

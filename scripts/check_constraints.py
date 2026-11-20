@@ -95,10 +95,13 @@ def check(pins: dict[str, str], tree: dict[str, metadata.Distribution]) -> list[
 
 
 def check_build(pins: dict[str, str], requirements: list[str]) -> list[str]:
-    """One line per build requirement missing from the pins or pinned outside its specifier."""
+    """One line per build requirement missing from the pins or pinned outside its specifier; a requirement
+    whose environment marker is false on this interpreter (the image's Python) is skipped."""
     problems = []
     for raw in requirements:
         req = Requirement(raw)
+        if req.marker is not None and not req.marker.evaluate():  # not installed on this interpreter
+            continue
         name = canonicalize_name(req.name)
         if name not in pins:
             problems.append(f"{name} ({raw}): not in build-constraints.txt")

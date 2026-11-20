@@ -186,3 +186,10 @@ def test_build_check_runs_on_the_committed_files(monkeypatch):
     assert checker.main(["--build"]) == 0
     monkeypatch.setattr(checker, "_build_requires", lambda: ["hatchling>=99"])
     assert checker.main(["--build"]) == 1
+
+
+def test_build_check_skips_a_requirement_whose_marker_does_not_apply():
+    pins = {"hatchling": "1.33.0"}
+    assert checker.check_build(pins, ['hatchling>=1.25', 'tomli>=1; python_version < "3.11"']) == []
+    assert checker.check_build(pins, ['tomli>=1; python_version >= "3.11"']) == [
+        'tomli (tomli>=1; python_version >= "3.11"): not in build-constraints.txt']

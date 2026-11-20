@@ -101,7 +101,7 @@ async def _documents(reader: VaultReader, doc_id: str, corpus: str | None) -> li
     """vault-query's list (one row per corpus holding doc_id, or the one in `corpus`); none is not_found."""
     rows = await _call(reader.get_document, doc_id=doc_id, corpus=corpus)
     if not rows:
-        where = "" if corpus is None else f" in corpus {corpus!r}"
+        where = "" if corpus is None else f" in corpus {corpus!r}; omit corpus to look in every corpus"
         raise tool_error(NOT_FOUND, f"no document {doc_id!r}{where}; find ids with vault_search_documents")
     return rows
 
