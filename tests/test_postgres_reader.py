@@ -102,6 +102,24 @@ def test_invalid_query_becomes_invalid_argument_and_closes_the_connection(pg, mo
     assert pg["conns"][0].closed
 
 
+@pytest.mark.parametrize("name,call", [
+    ("search_documents", {"filters": {"doc_type": "A1"}, "sort_by": "date", "sort_dir": "desc", "limit": 5,
+                          "offset": 0, "include_deleted": False}),
+    ("corpus_stats", {"group_by": "doc_type", "corpus": None, "limit": 5}),
+])
+def test_doc_type_needs_corpus_keeps_vault_querys_message(pg, monkeypatch, name, call):
+    message = "doc_type needs corpus: ... Codes per corpus: central-bank: A1 = Decision; company: A1 = 10-K"
+
+    def refuse(conn, *args, **kwargs):
+        raise vault_query.DocTypeNeedsCorpus(message)
+
+    monkeypatch.setattr(vault_query, name, refuse)
+    with pytest.raises(ToolError) as info:
+        getattr(_reader(), name)(**call)
+    assert str(info.value) == f"[invalid_argument] {message}"
+    assert info.value.__context__ is None and pg["conns"][0].closed
+
+
 def test_query_failure_closes_the_connection(pg, monkeypatch):
     def freshness(conn):
         raise psycopg2.errors.QueryCanceled("canceling statement")

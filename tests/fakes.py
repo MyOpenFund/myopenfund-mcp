@@ -35,6 +35,13 @@ TWINS = [
      "date_precision": "year", "date_kind": None, "entity_scheme": None, "entity_value": None},
 ]
 
+# vault-query's DocTypeNeedsCorpus message, as it words it from the `vocabulary` table.
+DOC_TYPE_NEEDS_CORPUS = (
+    "doc_type needs corpus: a doc_type code means something only within its corpus (the same code can "
+    "name different document types in two corpora); pass corpus with doc_type, asking the user when the "
+    "corpus is not clear from context. Codes per corpus: central-bank: A1 = Monetary policy decision, "
+    "C1 = Minutes; company: A1 = Annual report (10-K), A2 = Quarterly report (10-Q)")
+
 # Run grain: r0 crashed before reaching any source, so it has no runs_status row.
 RECENT_RUNS = [
     {"run_id": "r1", "tool": "vault", "command": "ingest", "corpus": "central-bank",
@@ -101,6 +108,8 @@ class FakeVaultReader:
     def search_documents(self, *, filters, sort_by, sort_dir, limit, offset, include_deleted):
         self.calls.append(("search", filters, sort_by, sort_dir, limit, offset, include_deleted))
         self._maybe_fail()
+        if filters.get("doc_type") is not None and filters.get("corpus") is None:
+            raise tool_error(INVALID_ARGUMENT, DOC_TYPE_NEEDS_CORPUS)
         rows = [d for d in self.docs if include_deleted or d["deleted_at"] is None]
         rows = [d for d in rows if all(d.get(k) == v for k, v in filters.items() if v is not None and k in d)]
         if filters.get("q"):
@@ -116,6 +125,8 @@ class FakeVaultReader:
     def corpus_stats(self, *, group_by, corpus, limit):
         self.calls.append(("stats", group_by, corpus, limit))
         self._maybe_fail()
+        if group_by == "doc_type" and corpus is None:
+            raise tool_error(INVALID_ARGUMENT, DOC_TYPE_NEEDS_CORPUS)
         groups: dict = {}
         live = [d for d in self.docs if d["deleted_at"] is None and corpus in (None, d["corpus"])]
         for d in live:

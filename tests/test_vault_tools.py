@@ -4,7 +4,15 @@ import logging
 import sys
 
 import pytest
-from fakes import DOCS, MANY_HEALTH, TWINS, FakeVaultReader, health_row, invalid_query_reader
+from fakes import (
+    DOC_TYPE_NEEDS_CORPUS,
+    DOCS,
+    MANY_HEALTH,
+    TWINS,
+    FakeVaultReader,
+    health_row,
+    invalid_query_reader,
+)
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
@@ -84,6 +92,34 @@ async def test_reader_invalid_query_surfaces_as_invalid_argument():
     async with _client(invalid_query_reader()) as c:
         with pytest.raises(ToolError, match=r"^\[invalid_argument\] unknown sort field"):
             await c.call_tool("vault_search_documents", {})
+
+
+async def test_doc_type_without_corpus_carries_vault_querys_message_whole():
+    async with _client() as c:
+        for tool, args in [("vault_search_documents", {"doc_type": "A1"}),
+                           ("vault_corpus_stats", {"group_by": "doc_type"})]:
+            with pytest.raises(ToolError) as caught:
+                await c.call_tool(tool, args)
+            assert str(caught.value) == f"[invalid_argument] {DOC_TYPE_NEEDS_CORPUS}", tool
+
+
+async def test_doc_type_with_corpus_is_answered():
+    async with _client() as c:
+        page = (await c.call_tool("vault_search_documents", {"doc_type": "A1", "corpus": "central-bank"})).data
+        stats = (await c.call_tool("vault_corpus_stats", {"group_by": "doc_type", "corpus": "central-bank"})).data
+    assert [d["doc_id"] for d in page["documents"]] == ["fr1"]
+    assert {g["key"] for g in stats["groups"]} == {"A1", "C1"}
+
+
+async def test_descriptions_tell_the_model_doc_type_needs_a_corpus():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    doc_type = tools["vault_search_documents"].input_schema["properties"]["doc_type"]["description"]
+    group_by = tools["vault_corpus_stats"].input_schema["properties"]["group_by"]["description"]
+    for text in (doc_type, group_by, tools["vault_search_documents"].description,
+                 tools["vault_corpus_stats"].description):
+        assert "corpus" in text and "ask the user" in text, text
+    assert "invalid_argument" in doc_type and "invalid_argument" in group_by
 
 
 async def test_a_result_over_the_cap_is_refused_not_cut():

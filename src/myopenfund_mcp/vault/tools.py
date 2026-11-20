@@ -32,7 +32,15 @@ SOURCE_CODE_DESCRIPTION = "Publisher code, e.g. 'us' (Fed), 'fr'"
 TEXT_DESCRIPTION = "Case-insensitive substring of the title, matched literally (% and _ are ordinary characters)"
 SORT_BY_DESCRIPTION = "Field the rows are ordered by"
 SORT_DIR_DESCRIPTION = "asc (oldest / smallest first) or desc (newest / largest first)"
-GROUP_BY_DESCRIPTION = "Field the live documents are counted by"
+# doc_type codes belong to their corpus (documents contract): central-bank `A1` and company `A1` share a
+# name, not a meaning. vault-query refuses doc_type without corpus with a message listing each corpus's codes.
+DOC_TYPE_NEEDS_CORPUS = (
+    "needs `corpus`: a code means something only within its corpus. When the corpus is not clear from "
+    "the conversation, ask the user which corpus they mean (or infer it from context: a 10-K is a company "
+    "filing, a rate decision a central-bank document); without corpus the call is refused with "
+    "[invalid_argument] listing each corpus's codes and labels")
+DOC_TYPE_DESCRIPTION = f"Document-type code within its corpus, e.g. 'C1'; exact match; {DOC_TYPE_NEEDS_CORPUS}"
+GROUP_BY_DESCRIPTION = f"Field the live documents are counted by; doc_type {DOC_TYPE_NEEDS_CORPUS}"
 SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset; an offset is whole minutes, at most +/-15:59); "
                      "keeps runs FINISHED at or after it; runs still "
                      "in flight are left out when since is given; applies to `runs` and `source_runs` only")
@@ -98,8 +106,7 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
     async def search_documents(
         corpus: Annotated[str | None, Field(description=CORPUS_DESCRIPTION)] = None,
         source_code: Annotated[str | None, Field(description=SOURCE_CODE_DESCRIPTION)] = None,
-        doc_type: Annotated[str | None, Field(
-            description="Publisher's document-type code, e.g. 'C1'; exact match")] = None,
+        doc_type: Annotated[str | None, Field(description=DOC_TYPE_DESCRIPTION)] = None,
         language: Annotated[str | None, Field(description="Language code, e.g. 'en', 'fr'; exact match")] = None,
         year: Annotated[int | None, Field(description="Publication year, e.g. 2010")] = None,
         mime_type: Annotated[str | None, Field(
@@ -119,7 +126,9 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         vault_get_document. Rows are ordered by `sort_by` in `sort_dir`; documents with equal sort
         values are always ordered by doc_id ascending, whatever `sort_dir`. `total` counts the
         whole filtered set; pass `next_cursor` back (same filters) to get the next page. Cursors are
-        offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped)."""
+        offsets: if the vault is ingesting between two pages, a row can shift (seen twice or skipped).
+        A `doc_type` filter needs `corpus`: ask the user which corpus when the context does not say.
+        Open a row with vault_get_document(doc_id, corpus) using the row's own `corpus`."""
         page = clamp_limit(limit, settings)
         offset = decode_cursor(cursor)
         if text is not None and "\x00" in text:  # vault-query would name it `q`, its own name
@@ -155,7 +164,8 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
             description="Count only this corpus, e.g. 'central-bank'; omitted = every corpus")] = None,
         limit: Annotated[int | None, Field(description=STATS_LIMIT_DESCRIPTION)] = None,
     ) -> dict:
-        """Live-document counts grouped by one field, largest first (NULL is a real group)."""
+        """Live-document counts grouped by one field, largest first (NULL is a real group).
+        Grouping by doc_type needs `corpus`: ask the user which corpus when the context does not say."""
         return cap_result(await _call(reader.corpus_stats, group_by=group_by, corpus=corpus,
                                       limit=clamp_limit(limit, settings)), settings)
 
