@@ -1,4 +1,4 @@
-"""A real my-open-data store in tmp_path, written by the real writer and publisher.
+"""A real open-data-store in tmp_path, written by the real writer and publisher.
 
 Adversarial on purpose (no perfect-world fixture):
 - Apple's FY2024 revenue is restated by the FY2025 10-K (a later vintage of the same key), and
@@ -16,10 +16,10 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pyarrow as pa
-from myopendata.config import StoreConfig
-from myopendata.contracts.standard import ENTITY_OBSERVATIONS, FILING_STATEMENTS, FUNDAMENTALS
-from myopendata.publisher import approve_contract, publish_pending
-from myopendata.writer import write_batch
+from open_data_store.config import StoreConfig
+from open_data_store.contracts.standard import ENTITY_OBSERVATIONS, FILING_STATEMENTS, FUNDAMENTALS
+from open_data_store.publisher import approve_contract, publish_pending
+from open_data_store.writer import write_batch
 
 NOW = datetime(2026, 11, 9, 8, 0, tzinfo=UTC)
 AAPL, JPM, NWG, APPLE_LIKE = "0000320193", "0000019617", "0000844150", "0000999999"

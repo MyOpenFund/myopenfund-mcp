@@ -173,7 +173,7 @@ def test_reopens_after_a_backend_failure(cfg):
     opened = []
 
     def factory(c):
-        from myopendata.reader import Store
+        from open_data_store.reader import Store
         opened.append(1)
         return Store.open(c)
 
@@ -486,7 +486,7 @@ class _CountingStore:
 
 
 def _counting(cfg, calls, hidden=frozenset()):
-    from myopendata.reader import Store
+    from open_data_store.reader import Store
     return CompaniesStore(str(cfg.data_root), cfg.catalog,
                           store_factory=lambda c: _CountingStore(Store.open(c), calls, hidden))
 
@@ -622,7 +622,7 @@ def test_close_when_idle_closes_at_once(tmp_path):
 
 
 def test_a_discard_mid_call_on_the_real_store(cfg):
-    """my-open-data's Store: a discard between two queries of another call must not close the
+    """open-data-store's Store: a discard between two queries of another call must not close the
     DuckDB connection that call still uses."""
     s = CompaniesStore(str(cfg.data_root), cfg.catalog)
     between, go_on, out = threading.Event(), threading.Event(), {}

@@ -48,7 +48,7 @@ def test_constraints_are_exact_pins_without_urls():
     assert bad == []
     names = [line.split("==")[0].lower() for line in lines]
     assert names == sorted(names) and len(names) == len(set(names))
-    assert not {"myopenfund-mcp", "vault-query", "my-open-data", "company-corpus", "rag-engine"} & set(names)
+    assert not {"myopenfund-mcp", "vault-query", "open-data-store", "company-corpus", "rag-engine"} & set(names)
 
 
 def test_git_dependencies_are_pinned_by_full_commit():
@@ -64,7 +64,7 @@ def test_build_backends_are_pinned_and_used():
     lines = [line for line in BUILD_CONSTRAINTS.splitlines() if line and not line.startswith("#")]
     names = {line.split("==")[0].lower() for line in lines}
     assert all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*==\S+", line) for line in lines)
-    assert {"hatchling", "setuptools"} <= names  # this package and rag-engine/my-open-data; vault-query, company-corpus
+    assert {"hatchling", "setuptools"} <= names  # this package and rag-engine/open-data-store; vault-query, company-corpus
     assert "--build-constraint build-constraints.txt" in DOCKERFILE and "build-constraints.txt ./" in DOCKERFILE
     assert ("--build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/"
             "build-constraints.txt") in COMPOSE
