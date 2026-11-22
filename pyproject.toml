@@ -14,8 +14,8 @@ dependencies = ["fastmcp>=4.1.4,<5"]
 [project.optional-dependencies]
 vault = ["vault-query @ git+https://github.com/MyOpenFund/vault@eff1aec859dad0e9db4b3d4a2f8eeaebd9481f1f#subdirectory=query"]
 companies = [
-  "open-data-store[reader] @ git+https://github.com/MyOpenFund/open-data-store@85df6e479677023e0b6dabc90bdd7c45a56f0fa8",
-  "company-corpus @ git+https://github.com/MyOpenFund/company-corpus@55cb0d55ecca735473cc31002fe440bdee842d7f",
+  "open-data-store[reader] @ git+https://github.com/MyOpenFund/open-data-store@9279b32794d77bcc68031926329f1cd4d4282e6c",
+  "company-corpus @ git+https://github.com/MyOpenFund/company-corpus@862d2bd805a8152989bcf3e87fa5799d5fd0d29b",
 ]
 # [onnx]: queries are embedded on the ONNX runtime (CPU), without PyTorch.
 rag = ["rag-engine[onnx] @ git+https://github.com/MyOpenFund/rag-engine@6be21ac393d82d7c5c1a058dcad8204ae15c7289"]
