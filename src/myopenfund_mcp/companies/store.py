@@ -1,6 +1,6 @@
-"""The only module that imports my-open-data and company-corpus (layer rule: public interfaces only).
+"""The only module that imports open-data-store and company-corpus (layer rule: public interfaces only).
 
-Blocking (DuckDB): the tools call it in a worker thread under a time budget. One my-open-data
+Blocking (DuckDB): the tools call it in a worker thread under a time budget. One open-data-store
 ``Store`` per process, opened lazily and reopened after a backend failure (``Store.read_asof``
 takes a cursor per call, so threads share it safely). A semaphore bounds concurrent calls, and an
 abandoned (timed-out) call keeps its slot until it ends, so calls never pile up. A Store is never
@@ -11,7 +11,7 @@ Arguments are checked before any query: filter and column names against ``descri
 filter value against its column's declared type (wrong values would otherwise surface as DuckDB
 conversion errors, i.e. as a backend failure).
 
-Errors: my-open-data's ``UnknownDataset`` -> :class:`StoreUnknownDataset`, its argument
+Errors: open-data-store's ``UnknownDataset`` -> :class:`StoreUnknownDataset`, its argument
 ``ValueError`` (bad filter, column, limit, naive ``as_of``...) and DuckDB ``DataError`` (a value the
 checks missed) -> :class:`StoreBadArgument`; all keep the Store open. Arrow errors (``ArrowInvalid``
 is a ``ValueError``) and company-corpus's selection errors are data or backend faults, not the
@@ -182,14 +182,14 @@ def _metric_catalog() -> tuple[dict, ...]:
 
 
 def _published(description: dict) -> bool:
-    """Whether an approved dataset has a published table: my-open-data's ``describe`` lists only
+    """Whether an approved dataset has a published table: open-data-store's ``describe`` lists only
     the columns of the published table (none before the first publication), and ``read_asof`` on
     an unpublished dataset is a catalogue error. Unpublished reads as empty here."""
     return bool(description["columns"])
 
 
 def _open(cfg):
-    from myopendata.reader import Store
+    from open_data_store.reader import Store
 
     return Store.open(cfg)
 
@@ -197,9 +197,9 @@ def _open(cfg):
 class CompaniesStore:
     def __init__(self, data_root: str, catalog: str, *, max_concurrency: int = 2,
                  q4_rule: str = "ytd9", store_factory=None):
-        # ImportError here = [companies] extra missing (my-open-data or company-corpus)
+        # ImportError here = [companies] extra missing (open-data-store or company-corpus)
         import company_corpus.concepts.store_summaries  # noqa: F401
-        from myopendata.config import StoreConfig
+        from open_data_store.config import StoreConfig
 
         if q4_rule not in Q4_RULES:
             raise ValueError(f"q4_rule must be one of {', '.join(Q4_RULES)}, got {q4_rule!r}")
@@ -284,7 +284,7 @@ class CompaniesStore:
 
     def _run(self, fn):
         from duckdb import DataError
-        from myopendata.reader.api import UnknownDataset
+        from open_data_store.reader.api import UnknownDataset
         from pyarrow.lib import ArrowException
 
         with self._slots:
@@ -301,7 +301,7 @@ class CompaniesStore:
             except DataError:  # a value the checks missed: the caller's mistake, Store is fine
                 raise StoreBadArgument(_DATA_ERROR_MESSAGE) from None
             except Exception as exc:
-                # my-open-data's argument checks raise ValueError; Arrow's ValueErrors
+                # open-data-store's argument checks raise ValueError; Arrow's ValueErrors
                 # (ArrowInvalid...) are data/backend faults and take the backend path below.
                 if isinstance(exc, ValueError) and not isinstance(exc, ArrowException):
                     if self._names_the_catalogue(exc):

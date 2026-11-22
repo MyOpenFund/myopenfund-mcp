@@ -144,7 +144,7 @@ async def test_without_a_store_datasets_is_not_configured():
     assert "companies_freshness" not in info and not any(n.startswith("datasets_") for n in names)
 
 
-@pytest.mark.parametrize("missing", ["myopendata.config", "company_corpus.concepts.store_summaries"])
+@pytest.mark.parametrize("missing", ["open_data_store.config", "company_corpus.concepts.store_summaries"])
 def test_configured_without_the_extra_refuses_to_start(monkeypatch, missing):
     monkeypatch.setitem(sys.modules, missing, None)  # import -> ImportError
     with pytest.raises(ConfigError, match=r"^MOF_COMPANIES_CATALOG is set but the \[companies\] extra"):

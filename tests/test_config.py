@@ -117,9 +117,9 @@ def test_connect_timeout_bounds_are_inclusive():
 
 def test_companies_settings_from_env():
     s = Settings.from_env({"MOF_COMPANIES_CATALOG": "postgres:dbname=lake_catalog host=h user=lake_reader password=p",
-                           "MOF_COMPANIES_DATA_ROOT": "/data/my_open_data",
+                           "MOF_COMPANIES_DATA_ROOT": "/data/open_data_store",
                            "MOF_COMPANIES_MAX_COMPANIES": "5"})
-    assert s.companies_data_root == "/data/my_open_data" and s.companies_max_companies == 5
+    assert s.companies_data_root == "/data/open_data_store" and s.companies_max_companies == 5
     assert s.companies_query_timeout_s == 20 and s.companies_max_concurrency == 2
     assert "password" not in repr(s)
 

@@ -22,7 +22,7 @@ services:
     # With the companies/datasets toolsets: DuckDB downloads and loads its ducklake and postgres
     # extensions under $HOME/.duckdb at each start, so HOME must be writable (e.g. HOME=/tmp) and
     # /tmp must allow exec (tmpfs: ["/tmp:exec"]); this needs outbound HTTPS to extensions.duckdb.org.
-    # Mount the store's lake/ read-only, as a uid that can read it (my-open-data files may be 0700).
+    # Mount the store's lake/ read-only, as a uid that can read it (open-data-store files may be 0700).
     environment:
       # The ONNX runtime of the rag toolset would send usage events to its publisher: off. (The server
       # also sets it for itself; an explicit value here wins.) Harmless without the rag toolset.

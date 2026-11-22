@@ -1,4 +1,4 @@
-"""Opt-in: the companies and datasets read path against a real my-open-data store.
+"""Opt-in: the companies and datasets read path against a real open-data-store.
 
     MOF_MCP_IT_COMPANIES_CATALOG=<catalogue connection string> \
     MOF_MCP_IT_COMPANIES_DATA_ROOT=<where this host sees the store files> \

@@ -115,7 +115,7 @@ the ones the CI tested:
   list only; the `locked` job also runs `scripts/check_constraints.py --build`, which reads every build
   requirement (this package's, and each git dependency's at its pinned commit) and fails when one is not
   pinned in the file at a version its specifier allows.
-- **Git dependencies** (`vault-query`, `my-open-data`, `company-corpus`, `rag-engine`): pinned by full
+- **Git dependencies** (`vault-query`, `open-data-store`, `company-corpus`, `rag-engine`): pinned by full
   commit in `pyproject.toml`, as before.
 
 The `install` service passes both files of the same commit as URLs (the same `<commit>` three times):
@@ -659,7 +659,7 @@ and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH_S`
 
 ### Companies and datasets
 
-The `companies_*` and `datasets_*` tools (read-only, over the published my-open-data store) exist only when
+The `companies_*` and `datasets_*` tools (read-only, over the published open-data-store) exist only when
 `MOF_COMPANIES_CATALOG` and `MOF_COMPANIES_DATA_ROOT` are set; the `[companies]` extra must then be installed
 (from a checkout, `pip install ".[vault,companies]"`, or from the git URL,
 `pip install "myopenfund-mcp[companies] @ git+https://github.com/MyOpenFund/myopenfund-mcp"`; the extra pins two
@@ -667,7 +667,7 @@ git dependencies, so git must be available). The
 store is read-only (as the `lake_reader` role); nothing is ever written. In a hardened container, DuckDB
 downloads and loads its `ducklake` and `postgres` extensions under `$HOME/.duckdb` at each start: `HOME` must be
 writable, a tmpfs holding it must allow exec (`/tmp:exec`), and the container needs outbound HTTPS to
-`extensions.duckdb.org`. The process must also be able to read the store's `lake/` files (my-open-data creates
+`extensions.duckdb.org`. The process must also be able to read the store's `lake/` files (open-data-store creates
 them `0700` for its own uid). Configuration:
 `MOF_COMPANIES_CATALOG`, `MOF_COMPANIES_DATA_ROOT`, `MOF_COMPANIES_QUERY_TIMEOUT_S`,
 `MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY`, `MOF_COMPANIES_Q4_RULE` (see [Configuration and limits](#configuration-and-limits)).
@@ -778,7 +778,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_MCP_MAX_RESULT_CHARS` | `200000` | Largest tool result in characters (at least 1000); larger results are refused. The cap measures the result's text block (compact JSON); the protocol also carries the same data as structured content, so a response on the wire is roughly twice that size. |
 | `MOF_MCP_MAX_ERROR_SAMPLES` | `5` | Error samples kept per row of `vault_runs_status`. |
 | `MOF_MCP_MAX_TEXT_CHARS` | `2000` | Each error text in `vault_runs_status` is cut to this length. |
-| `MOF_COMPANIES_CATALOG` | unset | my-open-data catalogue connection string as the read-only `lake_reader` role (`postgres:dbname=<db> host=<host> port=5432 user=lake_reader password=<password>`); unset = no companies or datasets toolsets. Needs `MOF_COMPANIES_DATA_ROOT` too. |
+| `MOF_COMPANIES_CATALOG` | unset | open-data-store catalogue connection string as the read-only `lake_reader` role (`postgres:dbname=<db> host=<host> port=5432 user=lake_reader password=<password>`); unset = no companies or datasets toolsets. Needs `MOF_COMPANIES_DATA_ROOT` too. |
 | `MOF_COMPANIES_DATA_ROOT` | unset | Folder holding `lake/` as this host sees it; read-only is enough. Needs `MOF_COMPANIES_CATALOG` too. |
 | `MOF_COMPANIES_QUERY_TIMEOUT_S` | `20` | Seconds one companies tool call may spend on all its store reads before it answers `[timeout]` (1-3600). |
 | `MOF_COMPANIES_MAX_COMPANIES` | `10` | Most companies a single call may name (1-100). |

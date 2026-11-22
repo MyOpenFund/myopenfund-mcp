@@ -128,7 +128,7 @@ class Settings:
     max_result_chars: int = 200_000  # MOF_MCP_MAX_RESULT_CHARS: larger results are refused, not cut
     max_error_samples: int = 5  # MOF_MCP_MAX_ERROR_SAMPLES: error samples kept per runs_status row
     max_text_chars: int = 2000  # MOF_MCP_MAX_TEXT_CHARS: each error text cut to this length
-    # MOF_COMPANIES_CATALOG: my-open-data catalogue as lake_reader; unset = no companies/datasets toolsets
+    # MOF_COMPANIES_CATALOG: open-data-store catalogue as lake_reader; unset = no companies/datasets toolsets
     companies_catalog: str | None = field(default=None, repr=False)
     companies_data_root: str | None = None  # MOF_COMPANIES_DATA_ROOT: where this host sees the store files
     companies_query_timeout_s: int = 20  # MOF_COMPANIES_QUERY_TIMEOUT_S: time budget per store call

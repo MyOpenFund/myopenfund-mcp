@@ -353,9 +353,9 @@ async def test_descriptions_are_directive(store):
 
 @pytest.fixture
 def empty_store(tmp_path):
-    from myopendata.config import StoreConfig
-    from myopendata.contracts.standard import ENTITY_OBSERVATIONS, FILING_STATEMENTS, FUNDAMENTALS
-    from myopendata.publisher import approve_contract
+    from open_data_store.config import StoreConfig
+    from open_data_store.contracts.standard import ENTITY_OBSERVATIONS, FILING_STATEMENTS, FUNDAMENTALS
+    from open_data_store.publisher import approve_contract
 
     cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
     for contract in (ENTITY_OBSERVATIONS, FUNDAMENTALS, FILING_STATEMENTS):
