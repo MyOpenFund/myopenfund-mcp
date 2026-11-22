@@ -1,4 +1,4 @@
-"""A real open-data-store store in tmp_path, written by the real writer and publisher.
+"""A real open-data-store in tmp_path, written by the real writer and publisher.
 
 Adversarial on purpose (no perfect-world fixture):
 - Apple's FY2024 revenue is restated by the FY2025 10-K (a later vintage of the same key), and
