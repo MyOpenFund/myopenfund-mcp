@@ -47,6 +47,9 @@ GROUP_BY_DESCRIPTION = f"Field the live documents are counted by; doc_type {DOC_
 SINCE_DESCRIPTION = ("ISO 8601 timestamp (UTC if no offset; an offset is whole minutes, at most +/-15:59); "
                      "keeps runs FINISHED at or after it; runs still "
                      "in flight are left out when since is given; applies to `runs` and `source_runs` only")
+UNTIL_DESCRIPTION = ("ISO 8601 timestamp, same form as since (offset at most +/-15:59); keeps runs FINISHED at or "
+                     "before it, so a page of `limit` rows can start in the past; runs still in flight are left "
+                     "out when until is given; applies to `runs` and `source_runs` only")
 # The largest UTC offset Postgres's timestamptz accepts (16:00 and beyond raise
 # InvalidTimeZoneDisplacementValue); vault-query refuses the rest with a message naming its own grammar.
 MAX_SINCE_OFFSET = dt.timedelta(hours=15, minutes=59)
@@ -86,6 +89,19 @@ No document: [not_found]."""
 # Rank of a `source_health.cadence_status` in the list (lower first); any other value, NULL included,
 # ranks after these.
 HEALTH_STATUS_RANK = {"overdue": 0, "soon": 1}
+
+
+def _utc_bound(name: str, value: dt.datetime | None) -> dt.datetime | None:
+    """A naive bound is UTC (SINCE_DESCRIPTION); an offset the database cannot take is refused."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    utc_offset = value.utcoffset()
+    if abs(utc_offset) > MAX_SINCE_OFFSET or utc_offset % dt.timedelta(minutes=1):
+        raise tool_error(INVALID_ARGUMENT, f"{name}: the UTC offset must be whole minutes, at most "
+                                           "+/-15:59 (the database's limit)")
+    return value
 
 
 def _least_healthy_first(rows: list[dict]) -> list[dict]:
@@ -215,19 +231,14 @@ def build_vault_toolset(reader: VaultReader, settings: Settings, *, auth_enabled
         corpus: Annotated[str | None, Field(description=CORPUS_DESCRIPTION)] = None,
         source_code: Annotated[str | None, Field(description=SOURCE_CODE_DESCRIPTION)] = None,
         since: Annotated[dt.datetime | None, Field(description=SINCE_DESCRIPTION)] = None,
+        until: Annotated[dt.datetime | None, Field(description=UNTIL_DESCRIPTION)] = None,
         limit: Annotated[int | None, Field(description=RUNS_LIMIT_DESCRIPTION)] = None,
     ) -> dict:
         page = clamp_limit(limit, settings)
-        if since is not None and since.tzinfo is None:
-            since = since.replace(tzinfo=dt.UTC)  # a naive since is UTC (SINCE_DESCRIPTION)
-        if since is not None:
-            utc_offset = since.utcoffset()
-            if abs(utc_offset) > MAX_SINCE_OFFSET or utc_offset % dt.timedelta(minutes=1):
-                raise tool_error(INVALID_ARGUMENT, "since: the UTC offset must be whole minutes, at most "
-                                                   "+/-15:59 (the database's limit)")
-        runs = await _call(reader.recent_runs, corpus=corpus, since=since, limit=page)
+        since, until = _utc_bound("since", since), _utc_bound("until", until)
+        runs = await _call(reader.recent_runs, corpus=corpus, since=since, until=until, limit=page)
         source_runs = await _call(reader.runs_status, corpus=corpus, source_code=source_code, since=since,
-                                  limit=page, max_error_samples=settings.max_error_samples,
+                                  until=until, limit=page, max_error_samples=settings.max_error_samples,
                                   max_text_chars=settings.max_text_chars)
         errors = await _call(reader.open_discovery_errors, corpus=corpus, source_code=source_code,
                              limit=page, max_text_chars=settings.max_text_chars)

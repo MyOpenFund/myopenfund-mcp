@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 dependencies = ["fastmcp>=4.1.4,<5"]
 
 [project.optional-dependencies]
-vault = ["vault-query @ git+https://github.com/MyOpenFund/vault@eff1aec859dad0e9db4b3d4a2f8eeaebd9481f1f#subdirectory=query"]
+vault = ["vault-query @ git+https://github.com/MyOpenFund/vault@4c948ae1395f24740bee4f284359b7f64aa207ed#subdirectory=query"]
 companies = [
   "open-data-store[reader] @ git+https://github.com/MyOpenFund/open-data-store@7a86987908c177a3f38e285b828cc03ed40f6f8b",
   "company-corpus @ git+https://github.com/MyOpenFund/company-corpus@c46db1de920ef58543c6a0f98663539989539ba8",

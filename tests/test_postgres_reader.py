@@ -118,7 +118,7 @@ def test_invalid_query_becomes_invalid_argument_and_closes_the_connection(pg, mo
 
     monkeypatch.setattr(vault_query, "recent_runs", recent_runs)
     with pytest.raises(ToolError) as info:
-        _reader().recent_runs(corpus=None, since="yesterday", limit=5)
+        _reader().recent_runs(corpus=None, since="yesterday", until=None, limit=5)
     assert str(info.value) == "[invalid_argument] sort_by must be one of [...]"
     assert info.value.__context__ is None
     assert pg["conns"][0].closed
@@ -228,11 +228,13 @@ PASS_THROUGH = [
     ("corpus_stats", {"group_by": "year", "corpus": "amf", "limit": 12},
      (("year",), {"corpus": "amf", "limit": 12})),
     ("runs_status",
-     {"corpus": "amf", "source_code": "s", "since": "2026-10-01T00:00:00+00:00", "limit": 7,
+     {"corpus": "amf", "source_code": "s", "since": "2026-10-01T00:00:00+00:00",
+      "until": "2026-10-02T00:00:00+00:00", "limit": 7,
           "max_error_samples": 3, "max_text_chars": 100},
-     ((), {"corpus": "amf", "source_code": "s", "since": "2026-10-01T00:00:00+00:00", "limit": 7,
+     ((), {"corpus": "amf", "source_code": "s", "since": "2026-10-01T00:00:00+00:00",
+      "until": "2026-10-02T00:00:00+00:00", "limit": 7,
                "max_error_samples": 3, "max_text_chars": 100})),
-    ("recent_runs", {"corpus": "amf", "since": None, "limit": 2}, ((), {"corpus": "amf", "since": None, "limit": 2})),
+    ("recent_runs", {"corpus": "amf", "since": None, "until": None, "limit": 2}, ((), {"corpus": "amf", "since": None, "until": None, "limit": 2})),
     ("source_health", {"corpus": "amf", "source_code": None}, ((), {"corpus": "amf", "source_code": None})),
     ("open_discovery_errors", {"corpus": "amf", "source_code": None, "limit": 4, "max_text_chars": 50},
      ((), {"corpus": "amf", "source_code": None, "limit": 4, "max_text_chars": 50})),

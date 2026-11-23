@@ -128,6 +128,7 @@ MANY_HEALTH = [health_row(f"s{i:02d}") for i in range(79)]
 class FakeVaultReader:
     def __init__(self, docs=DOCS, *, health=HEALTH, fail_with: Exception | None = None):
         self.docs, self.health, self.calls, self.fail_with = list(docs), list(health), [], fail_with
+        self.untils: list = []
 
     def _maybe_fail(self):
         if self.fail_with is not None:
@@ -168,14 +169,16 @@ class FakeVaultReader:
         return {"total": len(live), "group_by": group_by,
                 "groups": [{"key": k, "count": v} for k, v in groups.items()][:limit]}
 
-    def runs_status(self, *, corpus, source_code, since, limit, max_error_samples, max_text_chars):
+    def runs_status(self, *, corpus, source_code, since, until=None, limit, max_error_samples, max_text_chars):
+        self.untils.append(until)
         self.calls.append(("runs_status", corpus, source_code, since, limit, max_error_samples, max_text_chars))
         self._maybe_fail()
         rows = [r for r in SOURCE_RUNS if source_code in (None, r["source_code"])]
         return [{**r, "error_samples": [s[:max_text_chars] for s in r["error_samples"][:max_error_samples]]}
                 for r in rows][:limit]
 
-    def recent_runs(self, *, corpus, since, limit):
+    def recent_runs(self, *, corpus, since, until=None, limit):
+        self.untils.append(until)
         self.calls.append(("recent_runs", corpus, since, limit))
         self._maybe_fail()
         return [r for r in RECENT_RUNS if corpus in (None, r["corpus"])][:limit]

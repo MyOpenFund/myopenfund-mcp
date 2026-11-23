@@ -500,13 +500,13 @@ async def test_search_description_states_the_total_order():
 
 
 def test_installed_vault_query_breaks_ties_by_doc_id_then_corpus():
-    """The pin is vault-query 0.5.1 (eff1aec): its search ORDER BY ends with doc_id, corpus."""
+    """The pin is vault-query 0.6.0 (4c948ae): its search ORDER BY ends with doc_id, corpus."""
     import inspect
     from importlib.metadata import version
 
     from vault_query import documents
 
-    assert version("vault-query") == "0.5.1"
+    assert version("vault-query") == "0.6.0"
     assert "NULLS LAST, doc_id, corpus" in inspect.getsource(documents.search_documents)
 
 
@@ -625,3 +625,30 @@ async def test_runs_status_refuses_an_offset_with_seconds():
         with pytest.raises(ToolError):
             await c.call_tool("vault_runs_status", {"since": "2026-10-01T00:00:00+05:00:30"})
     assert not reader.calls
+
+
+@pytest.mark.parametrize(("given", "expected"), [
+    ("2026-09-01T06:00:00", dt.datetime(2026, 9, 1, 6, tzinfo=dt.UTC)),
+    ("2026-09-01T08:00:00+02:00", dt.datetime(2026, 9, 1, 8, tzinfo=dt.timezone(dt.timedelta(hours=2)))),
+])
+async def test_runs_status_until_reaches_both_run_reads(given, expected):
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        await c.call_tool("vault_runs_status", {"until": given})
+    assert reader.untils == [expected, expected]
+    assert all(u.utcoffset() == expected.utcoffset() for u in reader.untils)
+
+
+async def test_runs_status_refuses_an_until_offset_postgres_cannot_take():
+    reader = FakeVaultReader()
+    async with _client(reader) as c:
+        with pytest.raises(ToolError, match=r"^\[invalid_argument\] until: the UTC offset"):
+            await c.call_tool("vault_runs_status", {"until": "2026-10-01T00:00:00+16:00"})
+    assert not reader.calls
+
+
+async def test_until_description_states_the_inclusive_bound():
+    async with _client() as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    until = tools["vault_runs_status"].input_schema["properties"]["until"]["description"]
+    assert "at or before" in until and "in flight" in until and "15:59" in until
