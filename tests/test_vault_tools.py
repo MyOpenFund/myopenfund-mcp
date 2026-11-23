@@ -500,7 +500,7 @@ async def test_search_description_states_the_total_order():
 
 
 def test_installed_vault_query_breaks_ties_by_doc_id_then_corpus():
-    """The pin is vault-query 0.6.0 (4c948ae): its search ORDER BY ends with doc_id, corpus."""
+    """The pin is vault-query 0.6.0 (d3c4497): its search ORDER BY ends with doc_id, corpus."""
     import inspect
     from importlib.metadata import version
 

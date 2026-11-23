@@ -398,7 +398,7 @@ must then be installed, or the server refuses to start (`MOF_VAULT_DATABASE_URL 
 extra is not installed`). Timestamps in results are UTC: the server's database session runs with
 `timezone=UTC`, whatever the database or role default.
 
-**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0, pinned at 0.6.0 `4c948ae`, which takes `until` on run reads and breaks search sort ties by `doc_id, corpus`: documents
+**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0, pinned at 0.6.0 `d3c4497`, which takes `until` on run reads and breaks search sort ties by `doc_id, corpus`: documents
 keyed `(corpus, doc_id)`, columns `date_precision` / `date_kind` / `entity_scheme` / `entity_value`, table
 `vocabulary`; `runs_sources.bad_content`). Deploy the vault (and run its ingestion, which applies the
 schema) before this server. Against an older schema, a tool that reads a missing column or table answers
