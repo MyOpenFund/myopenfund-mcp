@@ -26,9 +26,9 @@ class VaultReader(Protocol):
                          offset: int, include_deleted: bool) -> tuple[int, list[dict]]: ...
     def get_document(self, doc_id: str, corpus: str | None = None) -> list[dict]: ...
     def corpus_stats(self, *, group_by: str, corpus: str | None, limit: int) -> dict: ...
-    def runs_status(self, *, corpus: str | None, source_code: str | None, since: Any, limit: int,
+    def runs_status(self, *, corpus: str | None, source_code: str | None, since: Any, until: Any, limit: int,
                     max_error_samples: int, max_text_chars: int) -> list[dict]: ...
-    def recent_runs(self, *, corpus: str | None, since: Any, limit: int) -> list[dict]: ...
+    def recent_runs(self, *, corpus: str | None, since: Any, until: Any, limit: int) -> list[dict]: ...
     def source_health(self, *, corpus: str | None, source_code: str | None) -> list[dict]: ...
     def open_discovery_errors(self, *, corpus: str | None, source_code: str | None, limit: int,
                               max_text_chars: int) -> list[dict]: ...
@@ -114,12 +114,12 @@ class PostgresVaultReader:
     def corpus_stats(self, *, group_by, corpus, limit):
         return self._run(self._vq.corpus_stats, group_by, corpus=corpus, limit=limit)
 
-    def runs_status(self, *, corpus, source_code, since, limit, max_error_samples, max_text_chars):
+    def runs_status(self, *, corpus, source_code, since, until, limit, max_error_samples, max_text_chars):
         return self._run(self._vq.runs_status, corpus=corpus, source_code=source_code, since=since,
-                         limit=limit, max_error_samples=max_error_samples, max_text_chars=max_text_chars)
+                         until=until, limit=limit, max_error_samples=max_error_samples, max_text_chars=max_text_chars)
 
-    def recent_runs(self, *, corpus, since, limit):
-        return self._run(self._vq.recent_runs, corpus=corpus, since=since, limit=limit)
+    def recent_runs(self, *, corpus, since, until, limit):
+        return self._run(self._vq.recent_runs, corpus=corpus, since=since, until=until, limit=limit)
 
     def source_health(self, *, corpus, source_code):
         return self._run(self._vq.source_health, corpus=corpus, source_code=source_code)
