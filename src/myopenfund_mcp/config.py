@@ -7,8 +7,10 @@ the server at start with the variable named — never a silent fallback.
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -22,6 +24,26 @@ Q4_RULES = ("ytd9", "sum_of_quarters")
 # rag-engine's ways of applying a date bound (rag_engine.config.DATE_FILTER_MODES), the default first.
 # Written out here: this module never imports the [rag] extra.
 RAG_DATE_FILTER_MODES = ("auto", "interval", "legacy")
+COMPANIES_SOURCES = ("auto", "store", "sec")  # MOF_COMPANIES_SOURCE: auto = the store when configured, else SEC
+CACHE_MODES = ("on", "off")  # MOF_CACHE
+# rag-engine's ONNX execution providers (OnnxEmbedder `provider`); written out, like the modes above.
+ONNX_PROVIDERS = ("cpu", "coreml")
+#: Largest MOF_SEC_MAX_RPS: SEC's fair-access limit is 10 requests per second.
+SEC_MAX_RPS_LIMIT = 10.0
+_FORM = re.compile(r"[A-Za-z0-9][A-Za-z0-9./-]{0,19}")
+
+
+def default_cache_dir() -> str:
+    """The per-user cache folder of the platform plus ``myopenfund-mcp``: ``$XDG_CACHE_HOME`` or
+    ``~/.cache`` on Linux, ``~/Library/Caches`` on macOS, ``%LOCALAPPDATA%`` on Windows."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Caches")
+    elif sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
+    return os.path.join(base, "myopenfund-mcp")
 
 
 def _get(env: Mapping[str, str], name: str) -> str | None:
@@ -54,6 +76,20 @@ def _int(
 def _optional_int(env: Mapping[str, str], name: str, minimum: int = 1, maximum: int | None = None) -> int | None:
     """An integer with no default: unset or empty stays None (the library's own choice applies)."""
     return None if _get(env, name) is None else _int(env, name, minimum, minimum, maximum)
+
+
+def _float(env: Mapping[str, str], name: str, default: float, maximum: float) -> float:
+    """A decimal number in (0, maximum]; the raw value is named in the error only when it is not a secret
+    (none of the callers' values is)."""
+    raw = _get(env, name)
+    if raw is None:
+        return default
+    if re.fullmatch(r"[0-9]+(\.[0-9]+)?", raw) is None:
+        raise ConfigError(f"{name} must be a number above 0 and at most {maximum:g}, got {raw!r}")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0 or value > maximum:
+        raise ConfigError(f"{name} must be above 0 and at most {maximum:g}, got {raw!r}")
+    return value
 
 
 _TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
@@ -178,6 +214,31 @@ class Settings:
     # MOF_RAG_DATE_FILTER_RETRY_S: in auto mode, seconds before a collection whose payload schema could not
     # be read is asked again (meanwhile the last answer, or legacy, is used)
     rag_date_filter_retry_s: int = 30
+    # --- no-vault mode: SEC data fetched live, filings indexed on this machine ---
+    # MOF_SEC_CONTACT: e-mail or name sent in the User-Agent, as SEC's fair-access rules ask; kept out of
+    # repr, never logged or echoed
+    sec_contact: str | None = field(default=None, repr=False)
+    sec_max_rps: float = 5.0  # MOF_SEC_MAX_RPS: requests per second to SEC, above 0 and at most 10
+    sec_timeout_s: int = 30  # MOF_SEC_TIMEOUT_S: seconds one request to SEC may take
+    sec_retries: int = 4  # MOF_SEC_RETRIES: retries of a failed request (0 = none)
+    sec_call_budget_s: int = 50  # MOF_SEC_CALL_BUDGET_S: time budget of one tool call that fetches from SEC
+    # MOF_COMPANIES_SOURCE: auto (the store when MOF_COMPANIES_CATALOG is set, SEC when MOF_SEC_CONTACT is,
+    # neither = no companies toolset) | store | sec
+    companies_source: str = "auto"
+    cache: str = "on"  # MOF_CACHE: on | off (off = nothing kept between calls)
+    cache_dir: str = field(default_factory=default_cache_dir)  # MOF_CACHE_DIR: platform cache dir
+    cache_max_gb: int = 20  # MOF_CACHE_MAX_GB: size above which the oldest cached files are removed
+    cache_ttl_submissions_h: int = 24  # MOF_CACHE_TTL_SUBMISSIONS_H: hours a filing list is reused
+    cache_ttl_companyfacts_h: int = 24  # MOF_CACHE_TTL_COMPANYFACTS_H: hours a company-facts file is reused
+    filings_max_docs: int = 40  # MOF_FILINGS_MAX_DOCS: filings downloaded and indexed by one call
+    index_workers: int = 1  # MOF_INDEX_WORKERS: filings indexed in parallel
+    rag_onnx_provider: str = "cpu"  # MOF_RAG_ONNX_PROVIDER: cpu | coreml
+    search_rrf_k: int = 60  # MOF_SEARCH_RRF_K: constant k of the reciprocal-rank fusion of a search
+    search_candidates: int = 50  # MOF_SEARCH_CANDIDATES: passages each retriever hands to the fusion
+    search_eigenmind: bool = False  # MOF_SEARCH_EIGENMIND: add the graph retriever to a search (off until evaluated)
+    filings_default_forms: str = "10-K"  # MOF_FILINGS_DEFAULT_FORMS: comma-separated form types
+    chunk_max_tokens: int = 480  # MOF_CHUNK_MAX_TOKENS: largest passage, in tokens
+    chunk_overlap_tokens: int = 32  # MOF_CHUNK_OVERLAP_TOKENS: tokens shared by neighbouring passages
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -226,7 +287,53 @@ class Settings:
             rag_date_filter_mode=_get(env, "MOF_RAG_DATE_FILTER_MODE") or "auto",
             rag_date_filter_refresh_s=_int(env, "MOF_RAG_DATE_FILTER_REFRESH_S", 300, minimum=0, maximum=86_400),
             rag_date_filter_retry_s=_int(env, "MOF_RAG_DATE_FILTER_RETRY_S", 30, maximum=3600),
+            sec_contact=_get(env, "MOF_SEC_CONTACT"),
+            sec_max_rps=_float(env, "MOF_SEC_MAX_RPS", 5.0, SEC_MAX_RPS_LIMIT),
+            sec_timeout_s=_int(env, "MOF_SEC_TIMEOUT_S", 30, maximum=600),
+            sec_retries=_int(env, "MOF_SEC_RETRIES", 4, minimum=0, maximum=20),
+            sec_call_budget_s=_int(env, "MOF_SEC_CALL_BUDGET_S", 50, maximum=3600),
+            companies_source=_get(env, "MOF_COMPANIES_SOURCE") or "auto",
+            cache=_get(env, "MOF_CACHE") or "on",
+            cache_dir=_get(env, "MOF_CACHE_DIR") or default_cache_dir(),
+            cache_max_gb=_int(env, "MOF_CACHE_MAX_GB", 20, maximum=100_000),
+            cache_ttl_submissions_h=_int(env, "MOF_CACHE_TTL_SUBMISSIONS_H", 24, maximum=8760),
+            cache_ttl_companyfacts_h=_int(env, "MOF_CACHE_TTL_COMPANYFACTS_H", 24, maximum=8760),
+            filings_max_docs=_int(env, "MOF_FILINGS_MAX_DOCS", 40, maximum=1000),
+            index_workers=_int(env, "MOF_INDEX_WORKERS", 1, maximum=32),
+            rag_onnx_provider=_get(env, "MOF_RAG_ONNX_PROVIDER") or "cpu",
+            search_rrf_k=_int(env, "MOF_SEARCH_RRF_K", 60, maximum=1000),
+            search_candidates=_int(env, "MOF_SEARCH_CANDIDATES", 50, maximum=1000),
+            search_eigenmind=_bool(env, "MOF_SEARCH_EIGENMIND", False),
+            filings_default_forms=_get(env, "MOF_FILINGS_DEFAULT_FORMS") or "10-K",
+            chunk_max_tokens=_int(env, "MOF_CHUNK_MAX_TOKENS", 480, minimum=16, maximum=8192),
+            chunk_overlap_tokens=_int(env, "MOF_CHUNK_OVERLAP_TOKENS", 32, minimum=0, maximum=2048),
         )
+        if settings.companies_source not in COMPANIES_SOURCES:
+            raise ConfigError(f"MOF_COMPANIES_SOURCE must be one of {', '.join(COMPANIES_SOURCES)}, "
+                              f"got {settings.companies_source!r}")
+        if settings.companies_source == "store" and not settings.companies_catalog:
+            raise ConfigError("MOF_COMPANIES_SOURCE=store requires MOF_COMPANIES_CATALOG "
+                              "(and MOF_COMPANIES_DATA_ROOT)")
+        if settings.companies_source == "sec" and not settings.sec_contact:
+            raise ConfigError("MOF_COMPANIES_SOURCE=sec requires MOF_SEC_CONTACT: SEC asks every client "
+                              "to identify itself")
+        if settings.cache not in CACHE_MODES:
+            raise ConfigError(f"MOF_CACHE must be one of {', '.join(CACHE_MODES)}, got {settings.cache!r}")
+        if not os.path.isabs(settings.cache_dir):
+            raise ConfigError("MOF_CACHE_DIR must be an absolute path: a relative one would depend on the "
+                              "directory the server is started from")
+        if settings.rag_onnx_provider not in ONNX_PROVIDERS:
+            raise ConfigError(f"MOF_RAG_ONNX_PROVIDER must be one of {', '.join(ONNX_PROVIDERS)}, "
+                              f"got {settings.rag_onnx_provider!r}")
+        forms = [f.strip() for f in settings.filings_default_forms.split(",")]
+        if not all(_FORM.fullmatch(f) for f in forms):
+            raise ConfigError("MOF_FILINGS_DEFAULT_FORMS must be comma-separated form types such as "
+                              f"10-K,10-Q, got {settings.filings_default_forms!r}")
+        if settings.chunk_overlap_tokens >= settings.chunk_max_tokens:
+            raise ConfigError(
+                f"MOF_CHUNK_OVERLAP_TOKENS ({settings.chunk_overlap_tokens}) must be below "
+                f"MOF_CHUNK_MAX_TOKENS ({settings.chunk_max_tokens})"
+            )
         if settings.companies_q4_rule not in Q4_RULES:
             raise ConfigError(f"MOF_COMPANIES_Q4_RULE must be one of {', '.join(Q4_RULES)}, "
                               f"got {settings.companies_q4_rule!r}")

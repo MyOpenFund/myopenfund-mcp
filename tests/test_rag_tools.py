@@ -2180,7 +2180,9 @@ def test_the_readme_documents_the_codes_every_reason_and_every_argument():
 
 def test_the_readme_pins_rag_engine_to_the_commit_the_server_is_built_on():
     root = Path(__file__).resolve().parent.parent
-    pins = re.findall(r"MyOpenFund/rag-engine@([0-9a-f]{40})", (root / "pyproject.toml").read_text())
+    # the [rag] extra only: [filings] tracks another rag-engine commit (the local index), see pyproject.toml
+    rag_line = next(line for line in (root / "pyproject.toml").read_text().splitlines() if line.startswith("rag = "))
+    pins = re.findall(r"MyOpenFund/rag-engine@([0-9a-f]{40})", rag_line)
     assert len(pins) == 1
     readme = (root / "README.md").read_text()
     assert re.findall(r"MyOpenFund/rag-engine(?:@([0-9a-f]+))?[\"`'\s]", readme) == pins  # one install line, pinned

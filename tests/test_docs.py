@@ -44,7 +44,18 @@ FIELDS = {
     "MOF_RAG_CHECK_RETRY_S": "rag_check_retry_s", "MOF_RAG_DESCRIPTION_NOTES": "rag_description_notes",
     "MOF_RAG_DATE_FILTER_MODE": "rag_date_filter_mode", "MOF_RAG_DATE_FILTER_REFRESH_S": "rag_date_filter_refresh_s",
     "MOF_RAG_DATE_FILTER_RETRY_S": "rag_date_filter_retry_s",
+    "MOF_SEC_CONTACT": "sec_contact", "MOF_SEC_MAX_RPS": "sec_max_rps", "MOF_SEC_TIMEOUT_S": "sec_timeout_s",
+    "MOF_SEC_RETRIES": "sec_retries", "MOF_SEC_CALL_BUDGET_S": "sec_call_budget_s",
+    "MOF_COMPANIES_SOURCE": "companies_source", "MOF_CACHE": "cache", "MOF_CACHE_DIR": "cache_dir",
+    "MOF_CACHE_MAX_GB": "cache_max_gb", "MOF_CACHE_TTL_SUBMISSIONS_H": "cache_ttl_submissions_h",
+    "MOF_CACHE_TTL_COMPANYFACTS_H": "cache_ttl_companyfacts_h", "MOF_FILINGS_MAX_DOCS": "filings_max_docs",
+    "MOF_INDEX_WORKERS": "index_workers", "MOF_RAG_ONNX_PROVIDER": "rag_onnx_provider",
+    "MOF_SEARCH_RRF_K": "search_rrf_k", "MOF_SEARCH_CANDIDATES": "search_candidates",
+    "MOF_SEARCH_EIGENMIND": "search_eigenmind", "MOF_FILINGS_DEFAULT_FORMS": "filings_default_forms",
+    "MOF_CHUNK_MAX_TOKENS": "chunk_max_tokens", "MOF_CHUNK_OVERLAP_TOKENS": "chunk_overlap_tokens",
 }
+# Defaults that depend on the machine: the example shows a <placeholder> for them.
+MACHINE_DEFAULTS = {"MOF_CACHE_DIR"}
 COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
 
 
@@ -67,7 +78,9 @@ def test_env_example_defaults_match_settings(name, value):
     from myopenfund_mcp.config import Settings
 
     default = getattr(Settings(), FIELDS[name])
-    if default is None or default == "":  # no default: the example shows a placeholder value
+    if name in MACHINE_DEFAULTS:
+        assert "<" in value, f"{name} default depends on the platform; its example must be a <placeholder>"
+    elif default is None or default == "":  # no default: the example shows a placeholder value
         assert "<" in value, f"{name} has no default; its example must be a <placeholder>"
     elif isinstance(default, bool):  # written as the server reads it: true / false
         assert value == str(default).lower()

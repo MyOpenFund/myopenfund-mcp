@@ -803,6 +803,26 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_DATE_FILTER_MODE` | `auto` | How a date bound of `rag_search` is applied (rag-engine's `date_filter_mode`): `auto` (the intervals on a collection where `date_start` and `date_end` both have a datetime index, the `date` field elsewhere), `interval` (always the intervals; a collection in strict mode without the two indexes refuses it: `search_refused`) or `legacy` (always the `date` field). Lower case, exactly. See [Dates](#dates-in-rag_search). |
 | `MOF_RAG_DATE_FILTER_REFRESH_S` | `300` | `auto` mode: seconds the collection's answer (are the two indexes there?) is kept before a date-bounded call reads it again (0-86400; `0` reads it before every date-bounded search). The longest the server takes to use the intervals once the indexes exist, without a restart. |
 | `MOF_RAG_DATE_FILTER_RETRY_S` | `30` | `auto` mode: seconds before a collection whose answer could not be read is read again (1-3600). Meanwhile date-bounded calls use the last answer read, or `legacy` when none was. Such a failure refuses no call and is not remembered as an outage. |
+| `MOF_COMPANIES_SOURCE` | `auto` | No-vault mode: `auto` (the store when `MOF_COMPANIES_CATALOG` is set, else SEC when `MOF_SEC_CONTACT` is set, else no companies toolset), `store` (needs `MOF_COMPANIES_CATALOG`) or `sec` (needs `MOF_SEC_CONTACT`). Needs the `[companies]` extra. |
+| `MOF_SEC_CONTACT` | unset | E-mail or name sent in the User-Agent of every request to SEC, as their fair-access rules ask. Never logged, shown or put in an error. |
+| `MOF_SEC_MAX_RPS` | `5.0` | Requests per second to SEC (above 0, at most 10, SEC's own limit). |
+| `MOF_SEC_TIMEOUT_S` | `30` | Seconds one request to SEC may take (1-600). |
+| `MOF_SEC_RETRIES` | `4` | Retries of a failed request to SEC (0-20). |
+| `MOF_SEC_CALL_BUDGET_S` | `50` | Time budget of one tool call that fetches from SEC, in seconds (1-3600). |
+| `MOF_CACHE` | `on` | Keep fetched data between calls: `on` or `off`. |
+| `MOF_CACHE_DIR` | platform cache folder + `/myopenfund-mcp` | Absolute path. Default: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. |
+| `MOF_CACHE_MAX_GB` | `20` | Size above which the oldest cached files are removed (1-100000). |
+| `MOF_CACHE_TTL_SUBMISSIONS_H` | `24` | Hours a cached filing list is reused (1-8760). |
+| `MOF_CACHE_TTL_COMPANYFACTS_H` | `24` | Hours a cached company-facts file is reused (1-8760). |
+| `MOF_FILINGS_MAX_DOCS` | `40` | Filings downloaded and indexed by one call (1-1000). |
+| `MOF_INDEX_WORKERS` | `1` | Filings indexed in parallel (1-32). |
+| `MOF_RAG_ONNX_PROVIDER` | `cpu` | ONNX execution provider of the local embedding: `cpu` or `coreml`. |
+| `MOF_SEARCH_RRF_K` | `60` | Constant k of the reciprocal-rank fusion of a filings search (1-1000). |
+| `MOF_SEARCH_CANDIDATES` | `50` | Passages each retriever hands to the fusion (1-1000). |
+| `MOF_SEARCH_EIGENMIND` | `false` | Add the graph (eigenmind) retriever to a filings search. Off until an evaluation decides. Needs the `[filings]` extra. |
+| `MOF_FILINGS_DEFAULT_FORMS` | `10-K` | Comma-separated form types fetched when the caller names none. |
+| `MOF_CHUNK_MAX_TOKENS` | `480` | Largest passage of the local filings index, in tokens (16-8192). |
+| `MOF_CHUNK_OVERLAP_TOKENS` | `32` | Tokens shared by neighbouring passages (0-2048, below `MOF_CHUNK_MAX_TOKENS`). |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

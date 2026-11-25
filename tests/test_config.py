@@ -276,3 +276,82 @@ def test_rag_https_reads_the_usual_booleans(raw, expected):
 def test_rag_tuning_variables_alone_do_not_configure_the_toolset():
     s = Settings.from_env({"MOF_RAG_MAX_LIMIT": "30", "MOF_RAG_MODEL_CACHE": "/models"})
     assert s.rag_qdrant_host is None and s.rag_max_limit == 30
+
+
+# --- no-vault mode (live SEC, local filings index) ------------------------------------------------------
+def test_no_vault_defaults():
+    s = Settings.from_env({})
+    assert s.sec_contact is None and s.companies_source == "auto"
+    assert (s.sec_max_rps, s.sec_timeout_s, s.sec_retries, s.sec_call_budget_s) == (5.0, 30, 4, 50)
+    assert (s.cache, s.cache_max_gb) == ("on", 20)
+    assert s.cache_dir.endswith("myopenfund-mcp")
+    assert (s.cache_ttl_submissions_h, s.cache_ttl_companyfacts_h) == (24, 24)
+    assert (s.filings_max_docs, s.index_workers, s.rag_onnx_provider) == (40, 1, "cpu")
+    assert (s.search_rrf_k, s.search_candidates, s.search_eigenmind) == (60, 50, False)
+    assert s.filings_default_forms == "10-K"
+    assert (s.chunk_max_tokens, s.chunk_overlap_tokens) == (480, 32)
+
+
+def test_cache_dir_default_follows_the_platform(monkeypatch, tmp_path):
+    from myopenfund_mcp import config
+
+    monkeypatch.setattr(config.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert config.default_cache_dir() == str(tmp_path / "myopenfund-mcp")
+    monkeypatch.setattr(config.sys, "platform", "darwin")
+    assert config.default_cache_dir().endswith("Library/Caches/myopenfund-mcp")
+    monkeypatch.setattr(config.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert config.default_cache_dir() == str(tmp_path / "myopenfund-mcp")
+
+
+def test_cache_dir_override_and_cache_off():
+    s = Settings.from_env({"MOF_CACHE_DIR": "/data/c", "MOF_CACHE": "off"})
+    assert (s.cache_dir, s.cache) == ("/data/c", "off")
+
+
+def test_sources_and_their_requirements():
+    assert Settings.from_env({"MOF_COMPANIES_SOURCE": "auto"}).companies_source == "auto"
+    with pytest.raises(ConfigError, match="MOF_COMPANIES_CATALOG"):
+        Settings.from_env({"MOF_COMPANIES_SOURCE": "store"})
+    with pytest.raises(ConfigError, match="MOF_SEC_CONTACT"):
+        Settings.from_env({"MOF_COMPANIES_SOURCE": "sec"})
+    assert Settings.from_env({"MOF_COMPANIES_SOURCE": "sec", "MOF_SEC_CONTACT": "a@b.c"}).sec_contact == "a@b.c"
+    s = Settings.from_env({"MOF_COMPANIES_SOURCE": "store", "MOF_COMPANIES_CATALOG": "postgres:x",
+                           "MOF_COMPANIES_DATA_ROOT": "/d"})
+    assert s.companies_source == "store"
+
+
+def test_contact_is_never_shown_or_echoed():
+    secret = "someone.private@example.org"
+    s = Settings.from_env({"MOF_SEC_CONTACT": secret})
+    assert secret not in repr(s)
+    with pytest.raises(ConfigError) as err:
+        Settings.from_env({"MOF_SEC_CONTACT": secret, "MOF_SEC_MAX_RPS": "11"})
+    assert secret not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"MOF_SEC_MAX_RPS": "11"}, {"MOF_SEC_MAX_RPS": "0"}, {"MOF_SEC_MAX_RPS": "-1"},
+        {"MOF_SEC_MAX_RPS": "fast"}, {"MOF_SEC_MAX_RPS": "nan"}, {"MOF_SEC_MAX_RPS": "inf"},
+        {"MOF_COMPANIES_SOURCE": "web"}, {"MOF_CACHE": "maybe"}, {"MOF_RAG_ONNX_PROVIDER": "tpu"},
+        {"MOF_SEC_TIMEOUT_S": "0"}, {"MOF_SEC_RETRIES": "-1"}, {"MOF_SEC_CALL_BUDGET_S": "0"},
+        {"MOF_CACHE_MAX_GB": "0"}, {"MOF_CACHE_TTL_SUBMISSIONS_H": "0"}, {"MOF_FILINGS_MAX_DOCS": "0"},
+        {"MOF_INDEX_WORKERS": "0"}, {"MOF_SEARCH_RRF_K": "0"}, {"MOF_SEARCH_CANDIDATES": "0"},
+        {"MOF_SEARCH_EIGENMIND": "perhaps"}, {"MOF_FILINGS_DEFAULT_FORMS": ","},
+        {"MOF_CHUNK_MAX_TOKENS": "0"}, {"MOF_CHUNK_OVERLAP_TOKENS": "480"},
+        {"MOF_CACHE_DIR": "relative/dir"},
+    ],
+)
+def test_bad_no_vault_values_are_refused(env):
+    with pytest.raises(ConfigError, match=next(iter(env))):
+        Settings.from_env(env)
+
+
+def test_rps_is_a_float_up_to_ten_and_retries_may_be_zero():
+    assert Settings.from_env({"MOF_SEC_MAX_RPS": "2.5"}).sec_max_rps == 2.5
+    assert Settings.from_env({"MOF_SEC_MAX_RPS": "10"}).sec_max_rps == 10.0
+    assert Settings.from_env({"MOF_SEC_RETRIES": "0"}).sec_retries == 0
+    assert Settings.from_env({"MOF_SEARCH_EIGENMIND": "true"}).search_eigenmind is True
