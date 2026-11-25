@@ -48,6 +48,7 @@ FIELDS = {
     "MOF_SEC_RETRIES": "sec_retries", "MOF_SEC_CALL_BUDGET_S": "sec_call_budget_s",
     "MOF_SEC_POSITIONS_LOOKBACK_Y": "sec_positions_lookback_y", "MOF_SEC_MEMO_COMPANIES": "sec_memo_companies",
     "MOF_SEC_FAILURE_TTL_S": "sec_failure_ttl_s", "MOF_SEC_POSITIONS_DONOR_DEPTH": "sec_positions_donor_depth",
+    "MOF_SEC_TTM_LOOKBACK_M": "sec_ttm_lookback_m",
     "MOF_COMPANIES_SOURCE": "companies_source", "MOF_CACHE": "cache", "MOF_CACHE_DIR": "cache_dir",
     "MOF_CACHE_MAX_GB": "cache_max_gb", "MOF_CACHE_EVICT_TO": "cache_evict_to",
     "MOF_CACHE_TMP_GRACE_S": "cache_tmp_grace_s", "MOF_CACHE_TTL_SUBMISSIONS_H": "cache_ttl_submissions_h",

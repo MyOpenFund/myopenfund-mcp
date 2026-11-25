@@ -248,6 +248,12 @@ class Settings:
     # MOF_SEC_POSITIONS_DONOR_DEPTH: earlier report filings looked through for the positions a filing
     # without its own borrows, as the store's selection does (0 = none)
     sec_positions_donor_depth: int = 4
+    # MOF_SEC_TTM_LOOKBACK_M: months before period_from whose facts' filings also get positions, so the
+    # period's TTM and ratios read the store's values. 20 covers both Q4 rules: a quarterly TTM spans
+    # four quarter ends up to 300 days back; its earliest quarter, when derived, reads a 9-month YTD up
+    # to 100 days earlier (ytd9: < 400 days, 14 months) or three quarters up to 300 days earlier
+    # (sum_of_quarters: < 600 days, 20 months); the prior-year averages read up to 385 days back
+    sec_ttm_lookback_m: int = 20
     # MOF_SEC_FAILURE_TTL_S: seconds a failed fetch of a company is remembered: calls meanwhile get its
     # error at once instead of starting the fetch again
     sec_failure_ttl_s: int = 60
@@ -338,6 +344,7 @@ class Settings:
             sec_positions_lookback_y=_int(env, "MOF_SEC_POSITIONS_LOOKBACK_Y", 5, maximum=50),
             sec_memo_companies=_int(env, "MOF_SEC_MEMO_COMPANIES", 50, maximum=10000),
             sec_positions_donor_depth=_int(env, "MOF_SEC_POSITIONS_DONOR_DEPTH", 4, minimum=0, maximum=40),
+            sec_ttm_lookback_m=_int(env, "MOF_SEC_TTM_LOOKBACK_M", 20, minimum=0, maximum=120),
             sec_failure_ttl_s=_int(env, "MOF_SEC_FAILURE_TTL_S", 60, maximum=3600),
             companies_source=_get(env, "MOF_COMPANIES_SOURCE") or "auto",
             cache=(_get(env, "MOF_CACHE") or "on").lower(),

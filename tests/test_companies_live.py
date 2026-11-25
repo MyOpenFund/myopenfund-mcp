@@ -21,6 +21,7 @@ from live_fixture import (
     MSFT,
     MSFT_K23,
     MSFT_K24,
+    MSFT_Q3_REVENUE,
     MSFT_Q25,
     MSFT_REVENUE_FY2024,
     NOFACTS,
@@ -222,7 +223,7 @@ def test_tables_are_memoised_for_the_companyfacts_ttl(make, clock):
 
 def test_positions_of_the_period_filings_and_their_donor_only(make):
     sec = FakeSec()
-    src = make(sec)
+    src = make(sec, sec_ttm_lookback_m=0)  # the period's own filings only, no TTM inputs
     rows, _ = src.concept_rows(MSFT, LATER, period_from=date(2024, 9, 1), period_to=date(2024, 12, 31))
     urls = sec.urls()
     assert any(u.startswith(_folder(MSFT, MSFT_Q25)) for u in urls)  # files the period's facts: 404
@@ -237,12 +238,14 @@ def test_positions_of_the_period_filings_and_their_donor_only(make):
 
 def test_apple_period_walks_to_the_donor_depth(make):
     sec = FakeSec()
-    make(sec).concept_rows(AAPL, LATER, period_from=date(2024, 1, 1), period_to=date(2024, 12, 31))
+    make(sec, sec_ttm_lookback_m=0).concept_rows(
+        AAPL, LATER, period_from=date(2024, 1, 1), period_to=date(2024, 12, 31)
+    )
     urls = sec.urls()
     for accn in (AAPL_K24, AAPL_Q24, AAPL_K23):  # 2024 facts; no positions anywhere: walk back
         assert any(u.startswith(_folder(AAPL, accn)) for u in urls)
     assert not any(u.startswith(_folder(AAPL, AAPL_E24)) for u in urls)  # not a report form
-    none = make(FakeSec(), sec_positions_donor_depth=0)
+    none = make(FakeSec(), sec_positions_donor_depth=0, sec_ttm_lookback_m=0)
     none.concept_rows(AAPL, LATER, period_from=date(2024, 1, 1), period_to=date(2024, 12, 31))
     assert not any(u.startswith(_folder(AAPL, AAPL_K23)) for u in none._sec.urls())
 
@@ -328,7 +331,17 @@ def _all_positions(cik, as_of):
             pc.less_equal(table["known_at"], pa.scalar(as_of, table.schema.field("known_at").type))
         )
 
-    return run_selection(known(t.fundamentals), known(t.filing_statements))
+    facts = known(t.fundamentals)
+    return run_selection(facts, known(t.filing_statements)), facts.to_pylist()
+
+
+def _period(src, period_from, period_to):
+    """The caller's period (the fact window of positions is wider)."""
+    return (period_from, period_to) if period_from else (src._window(None, period_to).start, period_to)
+
+
+def _in(period, day):
+    return day >= period[0] and (period[1] is None or day <= period[1])
 
 
 @pytest.mark.parametrize("cik", [AAPL, MSFT])
@@ -347,13 +360,13 @@ def _all_positions(cik, as_of):
 def test_parity_with_a_selection_on_all_positions(make, cik, period_from, period_to, as_of):
     src = make()
     rows, _ = src.concept_rows(cik, as_of, period_from=period_from, period_to=period_to)
-    w = src._window(period_from, period_to)
+    period = _period(src, period_from, period_to)
 
     def in_period(r):
-        return r["valid_date"] >= w.start and (w.end is None or r["valid_date"] <= w.end)
+        return _in(period, r["valid_date"])
 
     live = sorted(map(repr, filter(in_period, rows)))
-    store = sorted(map(repr, filter(in_period, _all_positions(cik, as_of))))
+    store = sorted(map(repr, filter(in_period, _all_positions(cik, as_of)[0])))
     assert live == store and (live or as_of != LATER)
 
 
@@ -588,3 +601,53 @@ def test_malformed_tickers_file_is_a_data_fault(make):
     sec.routes[TICKERS_URL] = json.dumps([1, 2]).encode()
     with pytest.raises(LiveDataError):
         make(sec).entities()
+
+
+def _summary_view(summaries, period):
+    return sorted(
+        repr((s.period_end, s.frequency, s.publication_date, s.values, s.derived, s.ttm))
+        for s in summaries
+        if s.period_end is not None and _in(period, s.period_end)
+    )
+
+
+@pytest.mark.parametrize(
+    ("cik", "period_from", "period_to"),
+    [
+        (MSFT, date(2024, 7, 1), date(2024, 9, 30)),  # fiscal Q1 FY2025: its TTM reads FY2024
+        (MSFT, date(2024, 9, 1), None),
+        (MSFT, date(2024, 4, 1), date(2024, 6, 30)),
+        (MSFT, None, None),
+        (AAPL, date(2024, 9, 1), date(2024, 12, 31)),
+        (AAPL, None, None),
+    ],
+)
+@pytest.mark.parametrize("q4_rule", ["ytd9", "sum_of_quarters"])
+def test_summaries_parity_with_all_positions(make, cik, period_from, period_to, q4_rule):
+    src = make(companies_q4_rule=q4_rule)
+    rows, vintages = src.concept_rows(cik, LATER, period_from=period_from, period_to=period_to)
+    store_rows, store_vintages = _all_positions(cik, LATER)
+    period = _period(src, period_from, period_to)
+    live = _summary_view(src.summaries(cik, "X", rows, vintages), period)
+    store = _summary_view(src.summaries(cik, "X", store_rows, store_vintages), period)
+    assert live and live == store
+
+
+def test_ttm_reads_the_prior_quarters_positions(make):
+    """Q1 FY2025's TTM needs Q3 FY2024's revenue as the store selects it (with Q3's positions)."""
+    q1 = {"period_from": date(2024, 7, 1), "period_to": date(2024, 9, 30)}
+
+    def net_margin_ttm(src):
+        rows, vintages = src.concept_rows(MSFT, LATER, **q1)
+        (s,) = [
+            s
+            for s in src.summaries(MSFT, "X", rows, vintages)
+            if s.period_end == date(2024, 9, 30) and s.frequency == "quarterly"
+        ]
+        return s.ttm["net_margin_ttm"]["value"]
+
+    revenue = 65585000000 + (MSFT_REVENUE_FY2024 - 180395000000) + MSFT_Q3_REVENUE + 62020000000
+    income = 24667000000 + (88136000000 - 66100000000) + 21939000000 + 21870000000
+    assert net_margin_ttm(make()) == pytest.approx(100 * income / revenue)
+    blind = net_margin_ttm(make(sec_ttm_lookback_m=0))  # Q3's positions not read: Revenues picked
+    assert blind != pytest.approx(100 * income / revenue)

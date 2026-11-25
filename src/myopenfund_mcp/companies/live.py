@@ -18,8 +18,10 @@ gets the finished tables.
 
 Statement positions (ruling R23: the store's numbers, not an approximation): ``concept_rows`` needs
 the positions of every filing that filed a fact (any vintage known at ``as_of``) dated
-(``valid_date``) in the period asked for -- the caller's, or ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years
-before its end (before now when it has none) -- and, for each of those filings without positions,
+(``valid_date``) in the period asked for -- from ``MOF_SEC_TTM_LOOKBACK_M`` months before the caller's
+``period_from`` (so the TTM, derived-Q4 and prior-year inputs of the period's summaries are
+selected as the store selects them), or, without one, ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years before
+its end (before now) -- and, for each of those filings without positions,
 the filing the selection borrows from: the latest report filing (10-K/10-Q/20-F/40-F) known no
 later, that has positions, looked for among the ``MOF_SEC_POSITIONS_DONOR_DEPTH`` latest. Only
 those filings' positions are fetched (once per issuer, added to its tables) and only they are read
@@ -187,6 +189,18 @@ def _data_faults():
         raise LiveDataError(f"an SEC response could not be read ({type(exc).__name__})") from exc
 
 
+def _months_before(day: date, months: int) -> date:
+    index = day.year * 12 + day.month - 1 - months
+    year, month = divmod(index, 12)
+    month += 1
+    for d in (day.day, 30, 29, 28):  # the same day, or the month's last when it has fewer
+        try:
+            return date(year, month, d)
+        except ValueError:
+            continue
+    raise AssertionError("unreachable")
+
+
 def _years_before(day: date, years: int) -> date:
     try:
         return day.replace(year=day.year - years)
@@ -310,11 +324,14 @@ class LiveSource:
             self._keep(self._archives, cik, (self._clock(), archive))
 
     def _window(self, period_from: date | None, period_to: date | None) -> _Window:
+        """The fact dates whose filings' positions a call reads. With ``period_from``: from
+        ``MOF_SEC_TTM_LOOKBACK_M`` months before it (the TTM, Q4 and prior-year inputs of the
+        period's summaries); without: ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years before ``period_to``
+        (or now)."""
         end = period_to
-        start = period_from or _years_before(
-            end or self._now().date(), self._settings.sec_positions_lookback_y
-        )
-        return _Window(start, end)
+        if period_from is not None:
+            return _Window(_months_before(period_from, self._settings.sec_ttm_lookback_m), end)
+        return _Window(_years_before(end or self._now().date(), self._settings.sec_positions_lookback_y), end)
 
     def _store(self, cik: str, entry: _Entry) -> None:
         with self._lock:
