@@ -1,4 +1,6 @@
-"""The only module that imports open-data-store and company-corpus (layer rule: public interfaces only).
+"""The store adapter. With ``companies/live.py`` (the live SEC source) and ``live/sec.py`` (the SEC
+client), the only modules that import open-data-store and company-corpus (layer rule: public
+interfaces only).
 
 Blocking (DuckDB): the tools call it in a worker thread under a time budget. One open-data-store
 ``Store`` per process, opened lazily and reopened after a backend failure (``Store.read_asof``

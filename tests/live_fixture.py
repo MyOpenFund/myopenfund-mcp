@@ -166,6 +166,13 @@ def _msft_facts() -> dict:
                         accn=MSFT_K24,
                         filed="2024-07-30",
                     ),
+                    point(  # FY2023 re-reported by the FY2024 10-K (whose positions are recorded)
+                        211915000000,
+                        "2023-06-30",
+                        start="2022-07-01",
+                        accn=MSFT_K24,
+                        filed="2024-07-30",
+                    ),
                     point(
                         211915000000,
                         "2023-06-30",

@@ -811,6 +811,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_SEC_CALL_BUDGET_S` | `50` | Time budget of one tool call that fetches from SEC, in seconds (1-3600). Past it the call answers that the company is still being fetched; the fetch goes on and a later call gets the result. |
 | `MOF_SEC_POSITIONS_LOOKBACK_Y` | `5` | Years before now whose 10-K, 10-Q, 20-F and 40-F filings get their statement positions (three requests per filing) when a call names no period start (1-50). A call with `period_from` uses it instead. |
 | `MOF_SEC_MEMO_COMPANIES` | `50` | Companies whose live tables (computed from SEC) are kept in memory for `MOF_CACHE_TTL_COMPANYFACTS_H`; past it the oldest built is dropped (1-10000). |
+| `MOF_SEC_FAILURE_TTL_S` | `60` | Seconds a failed fetch of a company from SEC (SEC unreachable, refused, unreadable answer) is remembered: calls meanwhile get its error at once, even when it came after their time budget, instead of fetching again (1-3600). |
 | `MOF_CACHE` | `on` | Keep fetched data between calls: `on` or `off` (`off`: entries live for the process only). |
 | `MOF_CACHE_DIR` | platform cache folder + `/myopenfund-mcp` | Absolute path (`~` is not expanded). Default: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. |
 | `MOF_CACHE_MAX_GB` | `20` | Size of the cached HTTP bodies above which the oldest-written ones are removed (1-100000). The model files and the local index sit under the same folder, on top of this figure, and are never removed. |

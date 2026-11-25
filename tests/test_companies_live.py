@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import UTC, date, datetime
 
 import pytest
@@ -27,7 +28,7 @@ from live_fixture import (
 )
 
 from myopenfund_mcp.companies import resolve
-from myopenfund_mcp.companies.live import LiveDataError, LiveSource, NoFacts, Warming
+from myopenfund_mcp.companies.live import LiveClosed, LiveDataError, LiveSource, NoFacts, Warming
 from myopenfund_mcp.companies.store import StoreBadArgument, StoreUnknownDataset
 from myopenfund_mcp.config import Settings
 
@@ -276,6 +277,58 @@ def test_concurrent_callers_share_one_build(make):
     assert sec.urls().count(COMPANYFACTS_URL.format(cik=AAPL)) == 1
 
 
+def test_result_does_not_depend_on_what_was_built_before(make):
+    period = {"period_from": date(2023, 1, 1), "period_to": date(2023, 12, 31)}
+    fresh = make().concept_rows(MSFT, LATER, **period)
+    src = make()
+    src.concept_rows(MSFT, LATER)  # an unrelated call builds the wide window (FY2024 positions)
+    after = src.concept_rows(MSFT, LATER, **period)
+    assert [sorted(map(repr, part)) for part in after] == [sorted(map(repr, part)) for part in fresh]
+    fy23 = _annual_revenue(after[0], date(2023, 6, 30))[0]
+    assert (fy23["location"], fy23["on_statement"]) == ("unknown", False)
+    wide = _annual_revenue(src.concept_rows(MSFT, LATER)[0], date(2023, 6, 30))[0]
+    assert wide["location"] == "statement"  # the FY2024 10-K's positions, in its own window
+
+
+def test_ttl_expiry_while_a_build_runs_waits_on_it(make, clock):
+    sec = FakeSec()
+    src = make(sec, cache_ttl_companyfacts_h=1)
+    src.concept_rows(AAPL, LATER)
+    clock.t += 3601
+    sec.hold = "companyfacts"
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(src.concept_rows(AAPL, LATER))) for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    _until(lambda: AAPL in src._jobs)
+    sec.gate.set()
+    for t in threads:
+        t.join(10)
+    assert len(results) == 3
+    assert sec.urls().count(COMPANYFACTS_URL.format(cik=AAPL)) == 2  # one rebuild for all
+
+
+def test_budget_elapsing_in_a_multi_company_read(make):
+    sec = FakeSec(hold="companyfacts/CIK0000789019")
+    src = make(sec, sec_call_budget_s=1)
+    flt = {"entity_value": [AAPL, MSFT]}
+    with pytest.raises(Warming) as info:
+        _read(src, filters=flt)
+    # Apple finished; Microsoft: submissions done, companyfacts held, 2 10-Ks in the window
+    assert (info.value.done, info.value.total) == (1, 2 + 3 * 2)
+    sec.gate.set()
+    rows = _read(src, filters=flt)
+    assert {r["entity_value"] for r in rows} == {AAPL, MSFT}
+
+
+def test_as_of_none_reads_now(make):
+    src = make()
+    assert _read(src, as_of=None) == _read(src, as_of=NOW)
+    assert src.concept_rows(AAPL, None)[0]
+
+
 def test_memo_keeps_at_most_the_configured_companies(make):
     sec = FakeSec()
     src = make(sec, sec_memo_companies=1)
@@ -287,6 +340,28 @@ def test_memo_keeps_at_most_the_configured_companies(make):
 
 
 # --- errors ------------------------------------------------------------------------------------------
+def test_close_stops_a_running_build(make):
+    sec = FakeSec(hold="companyfacts")
+    src = make(sec, sec_call_budget_s=1)
+    with pytest.raises(Warming):
+        src.concept_rows(AAPL, LATER)
+    job = src._jobs[AAPL]
+    src.close()
+    assert src._jobs == {}
+    sec.gate.set()  # the request in flight ends; the build stops before the next one
+    _until(job.future.done)
+    assert isinstance(job.future.exception(), LiveClosed)
+    assert not any("/Archives/" in u for u in sec.urls())
+    for call in (
+        lambda: src.concept_rows(AAPL, LATER),
+        src.entities,
+        lambda: src.latest_filing(AAPL),
+        lambda: _read(src),
+    ):
+        with pytest.raises(LiveClosed):
+            call()
+
+
 def test_companyfacts_404_is_no_facts_and_remembered(make):
     sec = FakeSec()
     src = make(sec)
@@ -304,7 +379,7 @@ def test_unknown_cik_is_no_facts(make):
         make().concept_rows("0000000007", LATER)
 
 
-def test_malformed_companyfacts_is_a_data_fault_not_a_bad_argument(make):
+def test_malformed_companyfacts_is_a_data_fault_not_a_bad_argument(make, clock):
     sec = FakeSec()
     sec.routes[COMPANYFACTS_URL.format(cik=AAPL)] = b"{not json"
     src = make(sec)
@@ -312,7 +387,73 @@ def test_malformed_companyfacts_is_a_data_fault_not_a_bad_argument(make):
         src.concept_rows(AAPL, LATER)
     assert not isinstance(info.value, ValueError)
     sec.routes[COMPANYFACTS_URL.format(cik=AAPL)] = FakeSec().routes[COMPANYFACTS_URL.format(cik=AAPL)]
-    assert src.concept_rows(AAPL, LATER)[0]  # a failed build is not remembered
+    with pytest.raises(LiveDataError):  # remembered for MOF_SEC_FAILURE_TTL_S
+        src.concept_rows(AAPL, LATER)
+    clock.t += 61
+    assert src.concept_rows(AAPL, LATER)[0]  # then fetched again
+
+
+@pytest.mark.parametrize("body", [b"[]", b"null", b'{"facts": 3}'])
+def test_wrong_shape_companyfacts_is_a_data_fault(make, body):
+    sec = FakeSec()
+    sec.routes[COMPANYFACTS_URL.format(cik=AAPL)] = body
+    with pytest.raises(LiveDataError):
+        make(sec).concept_rows(AAPL, LATER)
+
+
+def test_a_missing_submissions_page_is_not_no_facts(make):
+    sec = FakeSec()
+    sub = "https://data.sec.gov/submissions/CIK0000320193.json"
+    main = json.loads(sec.routes[sub])
+    main["filings"]["files"] = [{"name": "CIK0000320193-submissions-001.json"}]
+    sec.routes[sub] = json.dumps(main).encode()
+    src = make(sec)
+    with pytest.raises(LiveDataError):
+        src.concept_rows(AAPL, LATER)
+    with pytest.raises(LiveDataError):
+        src.filings(AAPL, forms=None, period_from=None, period_to=None)
+
+
+def test_no_facts_is_a_new_instance_per_caller(make):
+    src = make()
+    with pytest.raises(NoFacts) as first:
+        src.concept_rows(NOFACTS, LATER)
+    with pytest.raises(NoFacts) as second:
+        src.concept_rows(NOFACTS, LATER)
+    assert first.value is not second.value and second.value.cik == NOFACTS
+
+
+def test_a_failure_after_the_budget_reaches_the_next_caller(make, clock):
+    class SlowThenDown(FakeSec):
+        def get_bytes(self, url, *, max_age_s=None):
+            if "companyfacts" in url:
+                with self._lock:
+                    self.calls.append((url, max_age_s))
+                time.sleep(1.5)
+                raise SecUnavailable("down")
+            return super().get_bytes(url, max_age_s=max_age_s)
+
+    sec = SlowThenDown()
+    src = make(sec, sec_call_budget_s=1)
+    with pytest.raises(Warming):
+        src.concept_rows(AAPL, LATER)
+    _until(lambda: not src._jobs)
+    for _ in range(3):
+        with pytest.raises(SecUnavailable):
+            src.concept_rows(AAPL, LATER)
+    facts = COMPANYFACTS_URL.format(cik=AAPL)
+    assert sec.urls().count(facts) == 1  # no new build while the failure is remembered
+    clock.t += 61
+    with pytest.raises(Warming):
+        src.concept_rows(AAPL, LATER)
+    assert sec.urls().count(facts) == 2
+
+
+def _until(cond, timeout=10.0):
+    end = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < end, "condition not reached"
+        time.sleep(0.01)
 
 
 @pytest.mark.parametrize("exc", [SecRefused("undeclared"), SecUnavailable("throttled")])

@@ -17,14 +17,21 @@ gets :class:`Warming` with the requests done and expected while the build goes o
 gets the finished tables. Statement positions are fetched for the 10-K/10-Q/20-F/40-F filings
 whose report date lies in a window: the caller's period, or ``MOF_SEC_POSITIONS_LOOKBACK_Y``
 years before its end (before now when it has none). Tables built for a window serve any window
-inside it; a wider one rebuilds over both.
+inside it (a wider one rebuilds over both), but a result never depends on what was built before:
+the selection reads only the positions of the filings in the window asked for.
 
-Errors: a companyfacts (or submissions) 404 -> :class:`NoFacts` (remembered like tables);
-``SecRefused``, ``SecContactMissing`` and ``SecUnavailable`` propagate as they are; an SEC
-response that cannot be read (company-corpus raises a bare ``ValueError``) or a selection that
-fails on it -> :class:`LiveDataError`, a backend fault, never the caller's. Argument errors use the
-store adapter's types (:class:`StoreBadArgument`, :class:`StoreUnknownDataset`), checked before
-any request. The SEC contact is never logged here: no message names it.
+Errors: a 404 on the companyfacts file, or on the main submissions file (a CIK unknown to SEC) ->
+:class:`NoFacts` (remembered like tables; each caller gets its own instance); a 404 on any other
+non-positions file is a :class:`LiveDataError`. ``SecRefused``, ``SecContactMissing`` and
+``SecUnavailable`` propagate as they are; an SEC response that cannot be read (company-corpus raises
+a bare ``ValueError``, or a wrong-shape JSON a ``TypeError``/``KeyError``/``AttributeError``) or a
+selection that fails on it -> :class:`LiveDataError`, a backend fault, never the caller's. A build
+that fails is remembered for ``MOF_SEC_FAILURE_TTL_S``: callers meanwhile get its error (even one
+that came after their budget, while they were answered :class:`Warming`), not a new build. After
+:meth:`LiveSource.close` every call raises :class:`LiveClosed`, and a running build stops at its next
+request. Argument errors use the store adapter's types (:class:`StoreBadArgument`,
+:class:`StoreUnknownDataset`), checked before any request. The SEC contact is never logged here:
+no message names it.
 """
 
 from __future__ import annotations
@@ -74,6 +81,13 @@ class LiveDataError(RuntimeError):
     """An SEC response that cannot be read, or a selection that failed on it: a backend fault."""
 
 
+class LiveClosed(RuntimeError):
+    """The live source was closed (server shutting down)."""
+
+    def __init__(self):
+        super().__init__("the live SEC source is closed")
+
+
 @dataclass(frozen=True)
 class _Window:
     """Report dates whose filings get statement positions: ``[start, end]``, ``end`` None = open."""
@@ -98,24 +112,39 @@ class _Counting:
     """A SecGet counting the requests of one build. Bodies read while ``recording`` are kept for
     the build (the submissions, read once to size the work and again by ``issuer_tables``)."""
 
-    def __init__(self, sec):
+    def __init__(self, sec, closed: threading.Event):
         self._sec = sec
+        self._closed = closed
         self._kept: dict[str, bytes] = {}
         self._lock = threading.Lock()
         self.recording = True
         self.done = 0
         self.total = FIRST_REQUESTS
+        self.requested: list[str] = []  # URLs actually requested, in order
+        self.missing: str | None = None  # the URL of the last 404
 
     def get_bytes(self, url: str, *, max_age_s: float | None = None) -> bytes:
+        from company_corpus.live.sec import SecNotFound
+
+        if self._closed.is_set():  # close() stops the build at its next request
+            raise LiveClosed
         with self._lock:
             kept = self._kept.get(url)
         if kept is not None:
             return kept
+        with self._lock:
+            self.requested.append(url)
         try:
             body = self._sec.get_bytes(url, max_age_s=max_age_s)
+        except SecNotFound:
+            with self._lock:
+                self.missing = url
+            raise
         finally:  # a request that failed was made all the same
             with self._lock:
                 self.done += 1
+        if self._closed.is_set():
+            raise LiveClosed
         if self.recording:
             with self._lock:
                 self._kept[url] = body
@@ -134,19 +163,21 @@ class _Entry:
     window: _Window
     at: float
     tables: object | None = None  # company_corpus.live.IssuerTables
-    error: NoFacts | None = None
+    archive: object | None = None  # the submissions the tables were built from
+    no_facts: bool = False
 
 
 @contextmanager
 def _data_faults():
-    """company-corpus's bare ValueError (malformed JSON...) -> LiveDataError; SEC errors as is."""
+    """company-corpus's parsing errors (malformed or wrong-shape JSON: ValueError, TypeError,
+    KeyError, AttributeError) -> LiveDataError; SEC errors as they are."""
     from company_corpus.live.sec import SecContactMissing
 
     try:
         yield
     except SecContactMissing:  # a ValueError, but a configuration fault with its own code
         raise
-    except ValueError as exc:
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise LiveDataError(f"an SEC response could not be read ({type(exc).__name__})") from exc
 
 
@@ -161,7 +192,10 @@ def _is_cik(value) -> bool:
     return isinstance(value, str) and len(value) == 10 and value.isdigit()
 
 
-def _aware(as_of) -> datetime:
+def _aware(as_of, now: Callable[[], datetime]) -> datetime:
+    """as_of checked; None = now, as open-data-store reads it."""
+    if as_of is None:
+        return now()
     if not isinstance(as_of, datetime) or as_of.tzinfo is None:
         raise StoreBadArgument("as_of must be a timezone-aware datetime")
     return as_of
@@ -199,6 +233,7 @@ class LiveSource:
         self._contracts = {FUNDAMENTALS.name: FUNDAMENTALS, FILINGS.name: FILINGS}
         self._contracts.update({c.table_name: c for c in (FUNDAMENTALS, FILINGS)})
         self._statements = FILING_STATEMENTS
+        self._failure_ttl_s = settings.sec_failure_ttl_s
         self._facts_ttl_s = settings.cache_ttl_companyfacts_h * 3600
         self._submissions_ttl_s = settings.cache_ttl_submissions_h * 3600
         self._pool = ThreadPoolExecutor(
@@ -207,15 +242,29 @@ class LiveSource:
         self._lock = threading.Lock()
         self._entries: OrderedDict[str, _Entry] = OrderedDict()  # oldest built first
         self._jobs: dict[str, _Job] = {}
+        self._failures: dict[str, tuple[float, BaseException]] = {}  # last failed build per CIK
+        # Submissions read per CIK (former names for entities(), filings, latest_filing): their own
+        # memo, bounded like the tables (MOF_SEC_MEMO_COMPANIES, oldest read dropped) and kept
+        # MOF_CACHE_TTL_SUBMISSIONS_H. A CIK dropped from it loses its former names in entities()
+        # until its submissions are read again (resolution by ticker or current name still works).
         self._archives: OrderedDict[str, tuple[float, object]] = OrderedDict()
         self._tickers: tuple[float, list[dict]] | None = None
+        self._closed = threading.Event()
 
     def __repr__(self) -> str:
         return "LiveSource()"
 
     def close(self) -> None:
-        """Stop queued builds; a running one finishes in its thread (its result is dropped)."""
+        """Cancel queued builds, stop a running one at its next request; later calls raise
+        :class:`LiveClosed`. Returns at once."""
+        self._closed.set()
+        with self._lock:
+            self._jobs.clear()
         self._pool.shutdown(wait=False, cancel_futures=True)
+
+    def _check_open(self) -> None:
+        if self._closed.is_set():
+            raise LiveClosed
 
     # --- memo ------------------------------------------------------------------------------------
     def _fresh(self, at: float, ttl_s: float) -> bool:
@@ -240,12 +289,14 @@ class LiveSource:
         return _Window(start, end)
 
     def _build(self, cik: str, job: _Job):
-        """Worker thread: fetch and build one issuer's tables, record the entry, end the job."""
+        """Worker thread: fetch and build one issuer's tables, record the entry (or the failure),
+        end the job."""
         from company_corpus.live.filings import fetch_submissions, list_filings
         from company_corpus.live.issuer import POSITIONS_FORMS, issuer_tables
         from company_corpus.live.sec import SecNotFound
 
         counting, w = job.counting, job.window
+        first = None
         try:
             now = self._now()
             try:
@@ -257,6 +308,7 @@ class LiveSource:
                     )
                     counting.total = 1 + counting.done + REQUESTS_PER_FILING * len(window_filings)
                     counting.recording = False
+                    first = len(counting.requested)  # issuer_tables requests companyfacts first
                     tables = issuer_tables(
                         cik,
                         counting,
@@ -269,13 +321,28 @@ class LiveSource:
                         positions_forms=POSITIONS_FORMS,
                     )
             except SecNotFound:
-                entry = _Entry(_EVERY_WINDOW, self._clock(), error=NoFacts(cik))
+                # Only the main submissions file (the build's first request: the CIK is unknown to
+                # SEC) or the companyfacts file means "no facts"; positions 404s never get here.
+                companyfacts = (
+                    first is not None and len(counting.requested) > first and counting.requested[first]
+                )
+                if counting.missing not in (counting.requested[0], companyfacts):
+                    raise LiveDataError("an SEC submissions page is missing (404)") from None
                 with self._lock:
-                    self._keep(self._entries, cik, entry)
-                raise entry.error from None
+                    self._keep(self._entries, cik, _Entry(_EVERY_WINDOW, self._clock(), no_facts=True))
+                    self._failures.pop(cik, None)
+                raise NoFacts(cik) from None
             with self._lock:
-                self._keep(self._entries, cik, _Entry(w, self._clock(), tables=tables))
+                self._keep(self._entries, cik, _Entry(w, self._clock(), tables=tables, archive=archive))
+                self._failures.pop(cik, None)
             return tables
+        except NoFacts:
+            raise
+        except BaseException as exc:
+            if not isinstance(exc, LiveClosed):
+                with self._lock:
+                    self._failures[cik] = (self._clock(), exc)
+            raise
         finally:
             with self._lock:
                 if self._jobs.get(cik) is job:
@@ -283,19 +350,20 @@ class LiveSource:
 
     def _start(self, cik: str, window: _Window) -> _Job:
         """Under the lock: a build of ``cik`` over ``window``."""
-        job = _Job(window, _Counting(self._sec))
+        job = _Job(window, _Counting(self._sec, self._closed))
         self._jobs[cik] = job
         # set before the lock is released: the build's own clean-up takes the lock first
         job.future = self._pool.submit(self._build, cik, job)
         return job
 
-    def _tables(self, ciks: Collection[str], window: _Window) -> dict[str, object]:
-        """Each CIK's IssuerTables over (at least) ``window``, within the call budget."""
+    def _tables(self, ciks: Collection[str], window: _Window) -> dict[str, _Entry]:
+        """Each CIK's entry (tables over at least ``window``), within the call budget."""
         deadline = self._clock() + self._settings.sec_call_budget_s
-        out: dict[str, object] = {}
+        out: dict[str, _Entry] = {}
         while True:
             waiting: list[_Job] = []
             with self._lock:
+                self._check_open()
                 for cik in ciks:
                     if cik in out:
                         continue
@@ -303,12 +371,15 @@ class LiveSource:
                     if entry is not None and not self._fresh(entry.at, self._facts_ttl_s):
                         entry = None
                     if entry is not None and entry.window.covers(window):
-                        if entry.error is not None:
-                            raise entry.error
-                        out[cik] = entry.tables
+                        if entry.no_facts:
+                            raise NoFacts(cik)
+                        out[cik] = entry
                         continue
                     job = self._jobs.get(cik)
                     if job is None:
+                        failed = self._failures.get(cik)
+                        if failed is not None and self._fresh(failed[0], self._failure_ttl_s):
+                            raise failed[1]  # nobody may have seen it: it came after their budget
                         wanted = window if entry is None else entry.window.union(window)
                         job = self._start(cik, wanted)
                     waiting.append(job)
@@ -324,7 +395,11 @@ class LiveSource:
                 late = [j for j in waiting if j.future in pending]
                 raise Warming(sum(j.counting.done for j in late), sum(j.counting.total for j in late))
             for j in waiting:
+                if j.future.cancelled():
+                    raise LiveClosed
                 exc = j.future.exception()
+                if isinstance(exc, NoFacts):
+                    raise NoFacts(exc.cik)  # each caller its own instance
                 if exc is not None:
                     raise exc
             # finished: the loop reads the entries (or rebuilds over a wider window)
@@ -359,6 +434,7 @@ class LiveSource:
         list an undated first name. Copies."""
         from company_corpus.live.resolver import former_name_rows, resolver_rows
 
+        self._check_open()
         with self._lock:
             tickers = self._tickers
         if tickers is None or not self._fresh(tickers[0], self._submissions_ttl_s):
@@ -399,7 +475,7 @@ class LiveSource:
         contract = self._contract(dataset)
         description = {"columns": [{"name": f.name, "type": str(f.type)} for f in contract.schema]}
         checked = _checked(description, dataset, filters, columns) or {}
-        as_of = _aware(as_of)
+        as_of = _aware(as_of, self._now)
         if "entity_value" not in checked:
             raise StoreBadArgument(
                 "a live read needs an entity_value filter (10-digit CIKs): data is fetched per company"
@@ -417,7 +493,8 @@ class LiveSource:
 
         built = self._tables(ciks, self._window(None, None))
         parts = [
-            self._asof(getattr(built[c], contract.name), contract, as_of, checked, vintages) for c in ciks
+            self._asof(getattr(built[c].tables, contract.name), contract, as_of, checked, vintages)
+            for c in ciks
         ]
         t = pa.concat_tables(parts)
         t = t.sort_by([(k, "ascending") for k in [*contract.natural_key, "known_at"]])
@@ -436,18 +513,32 @@ class LiveSource:
         period_to: date | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """``(selection_rows, vintages)`` as ``CompaniesStore.concept_rows`` gives them, from the
-        live tables; the period bounds the filings whose statement positions are fetched."""
+        live tables; the period bounds the filings whose statement positions are fetched and read
+        (only those: tables built earlier over a wider window give the same result)."""
         from company_corpus.concepts.selection import run_selection
+        from company_corpus.live.filings import list_filings
+        from company_corpus.live.issuer import POSITIONS_FORMS
 
         if not _is_cik(cik):
             raise StoreBadArgument("cik must be a 10-digit string")
-        as_of = _aware(as_of)
-        t = self._tables([cik], self._window(period_from, period_to))[cik]
+        as_of = _aware(as_of, self._now)
+        window = self._window(period_from, period_to)
+        entry = self._tables([cik], window)[cik]
+        t = entry.tables
         fundamentals = self._contracts["fundamentals"]
         facts = self._asof(t.fundamentals, fundamentals, as_of, {}, vintages=True)
         if facts.num_rows == 0:
             return [], []
-        positions = self._asof(t.filing_statements, self._statements, as_of, {}, vintages=False)
+        with _data_faults():
+            in_window = [
+                f.accession
+                for f in list_filings(
+                    entry.archive, forms=POSITIONS_FORMS, period_from=window.start, period_to=window.end
+                )
+            ]
+        positions = self._asof(
+            t.filing_statements, self._statements, as_of, {"filing_ref": in_window}, vintages=False
+        )
         try:
             selected = run_selection(facts, positions)
         except Exception as exc:  # the SEC data, never the caller's arguments
@@ -478,23 +569,26 @@ class LiveSource:
 
     # --- filings (submissions only, no tables) ---------------------------------------------------
     def _archive(self, cik: str):
-        """The issuer's submissions (kept ``MOF_CACHE_TTL_SUBMISSIONS_H``); None on a 404."""
+        """The issuer's submissions (kept ``MOF_CACHE_TTL_SUBMISSIONS_H``); None when SEC does not
+        know the CIK (404 on the main file)."""
         from company_corpus.live.filings import fetch_submissions
         from company_corpus.live.sec import SecNotFound
 
         if not _is_cik(cik):
             raise StoreBadArgument("cik must be a 10-digit string")
+        self._check_open()
         with self._lock:
             kept = self._archives.get(cik)
         if kept is not None and self._fresh(kept[0], self._submissions_ttl_s):
             return kept[1]
+        counting = _Counting(self._sec, self._closed)
         try:
             with _data_faults():
-                archive = fetch_submissions(
-                    cik, self._sec, max_age_s=self._submissions_ttl_s, now=self._now()
-                )
+                archive = fetch_submissions(cik, counting, max_age_s=self._submissions_ttl_s, now=self._now())
         except SecNotFound:
-            return None
+            if counting.missing == counting.requested[0]:  # the main file: a CIK unknown to SEC
+                return None
+            raise LiveDataError("an SEC submissions page is missing (404)") from None
         self._remember_archive(cik, archive)
         return archive
 
