@@ -1,10 +1,12 @@
-"""The deployment is reproducible: one pinned base image, exact PyPI versions, git deps by commit."""
+"""The deployment is reproducible: one pinned base image and exact PyPI versions (siblings included)."""
 import importlib.util
 import re
 from importlib import metadata
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = (ROOT / "Dockerfile").read_text()
@@ -48,13 +50,71 @@ def test_constraints_are_exact_pins_without_urls():
     assert bad == []
     names = [line.split("==")[0].lower() for line in lines]
     assert names == sorted(names) and len(names) == len(set(names))
-    assert not {"myopenfund-mcp", "vault-query", "open-data-store", "company-corpus", "rag-engine"} & set(names)
+    assert "myopenfund-mcp" not in names
+    # the old, unprefixed names are not the published distributions
+    assert not {"vault-query", "open-data-store", "company-corpus", "rag-engine"} & set(names)
 
 
-def test_git_dependencies_are_pinned_by_full_commit():
-    refs = re.findall(r"git\+https://github\.com/[^\s\"']+", PYPROJECT)
-    assert refs
-    assert [r for r in refs if not re.search(r"@[0-9a-f]{40}(#|$)", r)] == []
+GIT_URL = re.compile(r"git\+|@\s*https?://|\.git\b")
+
+
+def test_no_git_urls_anywhere():
+    """Every package of the deployment, ours included, is an ordinary PyPI pin."""
+    readme_install_lines = [line for line in (ROOT / "README.md").read_text().splitlines()
+                            if re.search(r"pip install|uvx|pip uninstall", line)]
+    # The one documented exception: the install line for the latest `main`, of this package only
+    # (its dependencies still come from PyPI).
+    latest_main = 'pip install "myopenfund-mcp @ git+https://github.com/MyOpenFund/myopenfund-mcp"'
+    readme_install_lines = [line for line in readme_install_lines if latest_main not in line]
+    texts = {
+        "pyproject.toml": PYPROJECT,
+        "constraints.txt": CONSTRAINTS,
+        "build-constraints.txt": (ROOT / "build-constraints.txt").read_text(),
+        "Dockerfile": DOCKERFILE,
+        "compose.example.yaml": COMPOSE,
+        "README install lines": "\n".join(readme_install_lines),
+    }
+    for name, text in texts.items():
+        assert not re.search(r"git\+", text), name
+    assert "allow-direct-references" not in PYPROJECT
+
+
+def _specifiers():
+    """The sibling requirements of pyproject.toml (every extra), by canonical name."""
+    import tomllib
+
+    extras = tomllib.loads(PYPROJECT)["project"]["optional-dependencies"]
+    reqs = [Requirement(d) for deps in extras.values() for d in deps]
+    return {canonicalize_name(r.name): r for r in reqs if r.name.startswith("myopenfund-")}
+
+
+def test_constraints_pin_siblings_inside_ranges():
+    siblings = _specifiers()
+    assert set(siblings) == {"myopenfund-vault-query", "myopenfund-open-data-store",
+                             "myopenfund-company-corpus", "myopenfund-rag-engine"}
+    pins = checker.read_constraints(ROOT / "constraints.txt")
+    for name, req in siblings.items():
+        assert name in pins, f"{name} is not pinned in constraints.txt"
+        assert req.specifier.contains(pins[name]), f"{name}=={pins[name]} is outside {req.specifier}"
+    for line in CONSTRAINTS.splitlines():
+        if line.startswith("myopenfund-"):
+            assert re.fullmatch(r"myopenfund-[a-z-]+==\d+(\.\d+)*", line), line
+
+
+def test_constraints_cover_every_runtime_dependency():
+    """Every direct dependency of the server (core and runtime extras, siblings included) is pinned.
+    The transitive closure is `scripts/check_constraints.py`'s job, run by the `locked` CI job on the
+    image's Python (it depends on the interpreter's markers)."""
+    import tomllib
+
+    project = tomllib.loads(PYPROJECT)["project"]
+    deps = list(project["dependencies"])
+    for extra, extra_deps in project["optional-dependencies"].items():
+        if extra != "dev":
+            deps += extra_deps
+    pins = checker.read_constraints(ROOT / "constraints.txt")
+    missing = sorted({canonicalize_name(Requirement(d).name) for d in deps} - set(pins))
+    assert missing == []
 
 
 BUILD_CONSTRAINTS = (ROOT / "build-constraints.txt").read_text()
@@ -64,7 +124,7 @@ def test_build_backends_are_pinned_and_used():
     lines = [line for line in BUILD_CONSTRAINTS.splitlines() if line and not line.startswith("#")]
     names = {line.split("==")[0].lower() for line in lines}
     assert all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*==\S+", line) for line in lines)
-    assert {"hatchling", "setuptools"} <= names  # this package and rag-engine/open-data-store; vault-query, company-corpus
+    assert "hatchling" in names  # this package's only build backend
     assert "--build-constraint build-constraints.txt" in DOCKERFILE and "build-constraints.txt ./" in DOCKERFILE
     assert ("--build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/"
             "build-constraints.txt") in COMPOSE
@@ -78,19 +138,16 @@ def _script(name):
 
 
 updater = _script("update_constraints")
+checker = _script("check_constraints")
 
 
-def test_build_constraints_were_generated_from_the_current_git_pins():
-    """A git dependency bumped without regenerating build-constraints.txt could bring another build
-    backend that would then float: the file records the pins it was built from. The recorded list is
-    compared here; whether the backends are pinned within what each pin asks is the `--build` check."""
-    recorded = sorted(re.findall(r"^#   (\S+)$", BUILD_CONSTRAINTS, re.MULTILINE))
-    assert recorded == updater.git_pins(), "git pins changed: run python3.13 scripts/update_constraints.py"
-
-
-def test_git_dep_pattern_strips_a_dot_git_suffix():
-    url = "git+https://github.com/MyOpenFund/vault.git@" + "a" * 40 + "#subdirectory=query"
-    assert updater.GIT_DEP.findall(url) == [("MyOpenFund/vault", "a" * 40, "query")]
+def test_build_constraints_cover_build_requires():
+    """The backends of this package's `[build-system] requires` (plus `editables`, which hatchling asks
+    for in an editable install) are pinned in build-constraints.txt, within their specifiers."""
+    requirements = updater.build_requires()
+    assert "hatchling>=1.25" in requirements and "editables" in requirements
+    pins = checker.read_constraints(ROOT / "build-constraints.txt")
+    assert checker.check_build(pins, requirements) == []
 
 
 def test_editable_build_requirement_is_pinned():
@@ -98,7 +155,6 @@ def test_editable_build_requirement_is_pinned():
 
 
 # --- the checker's own logic, on fake distributions ---------------------------------------------------
-checker = _script("check_constraints")
 
 
 class FakeMetadata:
@@ -110,12 +166,9 @@ class FakeMetadata:
 
 
 class FakeDist:
-    def __init__(self, name, version, requires=(), extras=(), direct=False):
-        self.name, self.version, self.requires, self._direct = name, version, list(requires), direct
+    def __init__(self, name, version, requires=(), extras=()):
+        self.name, self.version, self.requires = name, version, list(requires)
         self.metadata = FakeMetadata(extras)
-
-    def read_text(self, name):
-        return "{}" if (name == "direct_url.json" and self._direct) else None
 
 
 def _getter(dists):
@@ -129,30 +182,34 @@ def _getter(dists):
 
 DISTS = {
     "myopenfund-mcp": FakeDist("myopenfund-mcp", "0.1.0",
-                               ["fastmcp>=4", 'rag-engine; extra == "rag"', 'vault-query; extra == "vault"'],
+                               ["fastmcp>=4", 'myopenfund-rag-engine; extra == "rag"',
+                                'myopenfund-vault-query; extra == "vault"'],
                                extras=["rag", "vault"]),
     "fastmcp": FakeDist("fastmcp", "4.2.1", ["anyio>=4", 'pywin32; sys_platform == "win32"']),
     "anyio": FakeDist("anyio", "4.16.0"),
-    "rag-engine": FakeDist("rag-engine", "0.1", ["onnxruntime[extra-a]"], direct=True),
+    "myopenfund-rag-engine": FakeDist("myopenfund-rag-engine", "0.1.0", ["onnxruntime[extra-a]"]),
     "onnxruntime": FakeDist("onnxruntime", "1.32.0", ['coloredlogs; extra == "extra-a"'], extras=["extra-a"]),
     "coloredlogs": FakeDist("coloredlogs", "15.0"),
-    "vault-query": FakeDist("vault-query", "0.2", direct=True),
+    "myopenfund-vault-query": FakeDist("myopenfund-vault-query", "0.1.0"),
 }
 
 
 def test_walk_follows_extras_and_markers():
     tree = checker.walk("myopenfund-mcp", {"rag"}, get=_getter(DISTS))
     # reached only through the extra `rag` and, below it, through onnxruntime's own extra
-    assert set(tree) == {"myopenfund-mcp", "fastmcp", "anyio", "rag-engine", "onnxruntime", "coloredlogs"}
-    assert "vault-query" not in tree and "pywin32" not in tree
+    assert set(tree) == {"myopenfund-mcp", "fastmcp", "anyio", "myopenfund-rag-engine", "onnxruntime",
+                        "coloredlogs"}
+    assert "myopenfund-vault-query" not in tree and "pywin32" not in tree
 
 
-def test_check_reports_missing_and_mismatched_pins_and_skips_direct_urls():
+def test_check_reports_missing_and_mismatched_pins():
     tree = checker.walk("myopenfund-mcp", {"rag", "vault"}, get=_getter(DISTS))
-    pins = {"fastmcp": "4.2.1", "anyio": "4.15.0", "onnxruntime": "1.32.0"}
+    pins = {"fastmcp": "4.2.1", "anyio": "4.15.0", "onnxruntime": "1.32.0",
+            "myopenfund-rag-engine": "0.1.0"}
     assert checker.check(pins, tree) == [
         "anyio: installed 4.16.0, constraints.txt says 4.15.0",
         "coloredlogs 15.0: not in constraints.txt",
+        "myopenfund-vault-query 0.1.0: not in constraints.txt",
     ]
 
 
@@ -181,8 +238,8 @@ def test_build_check_wants_every_build_requirement_pinned_within_its_specifier()
 
 
 def test_build_check_runs_on_the_committed_files(monkeypatch):
-    """The `--build` mode as the locked job runs it, with the GitHub reads of build_requires replaced."""
-    requirements = ["editables", "hatchling>=1.25", "setuptools>=77"]
+    """The `--build` mode as the locked job runs it, with build_requires replaced."""
+    requirements = ["editables", "hatchling>=1.25"]
     monkeypatch.setattr(checker, "_build_requires", lambda: requirements)
     assert checker.main(["--build"]) == 0
     monkeypatch.setattr(checker, "_build_requires", lambda: ["hatchling>=99"])

@@ -500,13 +500,13 @@ async def test_search_description_states_the_total_order():
 
 
 def test_installed_vault_query_breaks_ties_by_doc_id_then_corpus():
-    """The pin is vault-query 0.6.0 (d3c4497): its search ORDER BY ends with doc_id, corpus."""
+    """The pin is myopenfund-vault-query 0.1.0 (the former vault-query 0.6.0): its search ORDER BY ends with doc_id, corpus."""
     import inspect
     from importlib.metadata import version
 
     from vault_query import documents
 
-    assert version("vault-query") == "0.6.0"
+    assert version("myopenfund-vault-query") == "0.1.0"
     assert "NULLS LAST, doc_id, corpus" in inspect.getsource(documents.search_documents)
 
 

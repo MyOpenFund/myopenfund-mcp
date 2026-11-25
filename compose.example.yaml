@@ -61,11 +61,11 @@ services:
 # --- Variant: no locally built image ---------------------------------------------------------------
 # Where an image cannot be built (a compose-only UI, no build context), replace the `mcp` service above
 # with the services below. `install` runs once as root at each start of the stack: it installs the
-# package, at a commit you pin, into a named volume. `mcp` then serves from that volume, mounted
+# package from PyPI, at a version you pin, into a named volume. `mcp` then serves from that volume, mounted
 # read-only, with the same hardening as above. A restart of `mcp` alone needs no network.
-# Pinned versions: the image below is the Dockerfile's PYTHON_IMAGE (tag and digest), and the same
-# <commit> appears three times in `install`: in the two constraints URLs and in the package URL. Then every
-# Démarrer / `up` installs exactly what the CI tested (README, "Pinned versions").
+# Pinned versions: the image below is the Dockerfile's PYTHON_IMAGE (tag and digest), the same <commit>
+# appears in the two constraints URLs of `install` (the commit of the release you install) and the package
+# is pinned with ==<version>. Then every `up` installs exactly what the CI tested (README, "Pinned versions").
 # `rag-model-fill` is for the FIRST start with the rag toolset only: it downloads the embedding model
 # into its volume (outbound HTTPS to huggingface.co and the hosts it redirects to, a writable HOME) and
 # verifies it. It succeeded when its log ends with `model cache ready` and it exited with code 0
@@ -84,13 +84,11 @@ services:
 #       - -c
 #       - >-
 #         chown 10001:10001 /models &&
-#         apt-get update -qq &&
-#         apt-get install -y -qq --no-install-recommends git &&
 #         python -m venv --clear /opt/venv &&
 #         /opt/venv/bin/pip install -q --no-cache-dir
 #         -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/constraints.txt
 #         --build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/build-constraints.txt
-#         'myopenfund-mcp[vault,rag] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'
+#         'myopenfund-mcp[vault,rag]==<version>'
 #   rag-model-fill:
 #     image: python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 #     restart: "no"
