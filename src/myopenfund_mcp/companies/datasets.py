@@ -2,7 +2,8 @@
 
 Rows of a restricted source (market-data spec §13) are served only to a client of
 MOF_MARKET_RESTRICTED_ALLOW that lists it (`auth.allowed_restricted_for`; none over stdio): the store
-adapter drops the others before paging, so they reach no page, count, cursor or CSV."""
+adapter drops the others before paging, so they reach no page, count, cursor or CSV. The sources of
+MOF_MARKET_TOOL_ONLY_SOURCES (default private_history) are never served here, whatever the allow-list."""
 from __future__ import annotations
 
 import datetime as dt
@@ -56,7 +57,8 @@ def build_datasets_toolset(store, settings: Settings, *, auth_enabled: bool) -> 
         allowed = allowed_restricted_for(caller_client_id(auth_enabled=auth_enabled), settings)
         rows = await store_call(store.read, settings=settings, dataset=dataset, as_of=when,
                                 filters=filters or None, columns=columns or None,
-                                limit=offset + page + 1, vintages=vintages, allowed_restricted=allowed)
+                                limit=offset + page + 1, vintages=vintages, allowed_restricted=allowed,
+                                denied_sources=frozenset(settings.market_tool_only_sources))
         chunk, more = rows[offset:offset + page], len(rows) > offset + page
         end = offset + len(chunk)
         return when, rows_to_utc(chunk), (encode_cursor(end) if more and end <= MAX_OFFSET else None)

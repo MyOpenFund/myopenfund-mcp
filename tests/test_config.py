@@ -595,3 +595,41 @@ def test_real_registry_declares_the_restricted_sources():
     assert {"massive", "tiingo", "private_history"} <= auth.registered_restricted_sources()
     s = Settings.from_env(_market("notebook:massive|tiingo|private_history"))
     assert s.market_restricted_allow == {"notebook": frozenset({"massive", "tiingo", "private_history"})}
+
+
+@pytest.mark.parametrize("value", [",", " , ", ",,"])
+def test_no_restricted_clients_set_without_an_id_is_refused(value):
+    # A set value holding no id would silently disable the guard: refused, never read as "none".
+    with pytest.raises(ConfigError, match=r"^MOF_MARKET_NO_RESTRICTED_CLIENTS is set but holds no client id"):
+        Settings.from_env({"MOF_MARKET_NO_RESTRICTED_CLIENTS": value})
+
+
+def test_no_restricted_clients_are_guarded_case_insensitively(monkeypatch):
+    from myopenfund_mcp import auth
+
+    monkeypatch.setattr(auth, "registered_restricted_sources", lambda: REGISTRY)
+    tokens = f"Agents:{_D1}:read,notebook:{_D2}:read"
+    with pytest.raises(ConfigError, match=r"entry 1: .*MOF_MARKET_NO_RESTRICTED_CLIENTS"):
+        Settings.from_env({"MOF_MCP_TOKENS": tokens, "MOF_MARKET_RESTRICTED_ALLOW": "Agents:tiingo"})
+    with pytest.raises(ConfigError, match=r"entry 1: .*MOF_MARKET_NO_RESTRICTED_CLIENTS"):
+        Settings.from_env({"MOF_MCP_TOKENS": tokens, "MOF_MARKET_RESTRICTED_ALLOW": "notebook:tiingo",
+                           "MOF_MARKET_NO_RESTRICTED_CLIENTS": "NOTEBOOK"})
+
+
+def test_tool_only_sources():
+    assert Settings.from_env({}).market_tool_only_sources == ("private_history",)
+    assert Settings().market_tool_only_sources == ("private_history",)
+    s = Settings.from_env({"MOF_MARKET_TOOL_ONLY_SOURCES": " private_history , tiingo,tiingo"})
+    assert s.market_tool_only_sources == ("private_history", "tiingo")
+    for bad, where in (("private_history,Tiingo", "entry 2"), ("x y", "entry 1"), (",", "holds no source")):
+        with pytest.raises(ConfigError, match=rf"^MOF_MARKET_TOOL_ONLY_SOURCES.*{where}") as err:
+            Settings.from_env({"MOF_MARKET_TOOL_ONLY_SOURCES": bad})
+        assert "Tiingo" not in str(err.value)
+
+
+def test_live_concurrency():
+    assert Settings.from_env({}).market_live_concurrency == 1
+    assert Settings.from_env({"MOF_MARKET_LIVE_CONCURRENCY": "3"}).market_live_concurrency == 3
+    for bad in ("0", "17"):
+        with pytest.raises(ConfigError, match="MOF_MARKET_LIVE_CONCURRENCY"):
+            Settings.from_env({"MOF_MARKET_LIVE_CONCURRENCY": bad})

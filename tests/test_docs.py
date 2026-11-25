@@ -78,7 +78,8 @@ FIELDS = {
     "MOF_MARKET_SOURCE": "market_source", "MOF_MARKET_RESTRICTED_ALLOW": "market_restricted_allow",
     "MOF_MARKET_NO_RESTRICTED_CLIENTS": "market_no_restricted_clients",
     "MOF_MARKET_MAX_INSTRUMENTS": "market_max_instruments", "MOF_MARKET_MAX_ROWS": "market_max_rows",
-    "MOF_MARKET_LIVE_TIMEOUT_S": "market_live_timeout_s",
+    "MOF_MARKET_LIVE_TIMEOUT_S": "market_live_timeout_s", "MOF_MARKET_LIVE_CONCURRENCY": "market_live_concurrency",
+    "MOF_MARKET_TOOL_ONLY_SOURCES": "market_tool_only_sources",
 }
 
 COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)

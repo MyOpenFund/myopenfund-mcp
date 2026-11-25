@@ -25,7 +25,9 @@ message. The catalogue never goes in a message or a log.
 Restricted sources (market-data spec §13): ``read(..., allowed_restricted=...)`` drops the rows of a
 restricted source the caller may not read (open-data-store's ``filter_sources``, on ``source_code``)
 before the sort, the slice and the projection, so a denied row never reaches a page, a count, a cursor
-or a CSV. The market datasets (open-data-store's ``MARKET_CONTRACTS``) are read in strict mode, as
+or a CSV. ``denied_sources`` (MOF_MARKET_TOOL_ONLY_SOURCES, default private_history) are dropped whatever
+the allow-list: their rows (private tokens, labels) reach a client only through market_prices, keyed by
+instrument_id. The market datasets (open-data-store's ``MARKET_CONTRACTS``) are read in strict mode, as
 market-data's own binding reads them: a source the registry does not declare is denied too, so without
 the registry (no [market] extra) no market row is served. Other datasets keep their unregistered sources
 (SEC data declares none). A dataset without ``source_code`` is unchanged.
@@ -243,15 +245,17 @@ def _market_datasets() -> frozenset[str]:
     return frozenset(c.name for c in MARKET_CONTRACTS)
 
 
-def _gate(table, dataset: str, allowed: frozenset[str]):
-    """``table`` without the rows of a source the caller may not read (see the module docstring)."""
+def _gate(table, dataset: str, allowed: frozenset[str], denied: frozenset[str] = frozenset()):
+    """``table`` without the rows of a source the caller may not read (see the module docstring); ``denied``
+    sources are dropped whatever ``allowed`` says (and whether or not the registry knows them)."""
     from open_data_store.sources import filter_sources
 
     try:
         restricted, registered = _source_registry()
     except Exception as exc:  # noqa: BLE001 -- fail closed; a plugin's text is never forwarded
         raise StoreBackendError(f"source registry unreadable ({type(exc).__name__})") from None
-    return filter_sources(table, allowed_restricted=frozenset(allowed), restricted=restricted,
+    denied = frozenset(denied)
+    return filter_sources(table, allowed_restricted=frozenset(allowed) - denied, restricted=restricted | denied,
                           strict=dataset in _market_datasets(), registered=registered)
 
 
@@ -407,13 +411,15 @@ class CompaniesStore:
 
     def read(self, dataset: str, *, as_of: datetime, filters: dict | None,
              columns: list[str] | None, limit: int | None, vintages: bool = False,
-             allowed_restricted: frozenset[str] | None = None) -> list[dict]:
+             allowed_restricted: frozenset[str] | None = None,
+             denied_sources: frozenset[str] = frozenset()) -> list[dict]:
         """Rows knowable at ``as_of``, sorted by the dataset's natural key then ``known_at`` so
         pages are stable across calls; ``limit`` and ``columns`` apply after the sort. A dataset
         approved but not yet published reads as empty (it has no columns to check against).
         ``allowed_restricted`` (a caller's restricted sources, ``auth.allowed_restricted_for``): the rows
         of the other restricted sources are dropped first (module docstring); None = no source filter
-        (the server's own reads of SEC datasets)."""
+        (the server's own reads of SEC datasets). ``denied_sources``: sources never served, whatever
+        ``allowed_restricted`` (MOF_MARKET_TOOL_ONLY_SOURCES); applied with it."""
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
                                   or limit < 0):
             raise StoreBadArgument("limit must be a non-negative int")
@@ -430,7 +436,7 @@ class CompaniesStore:
             # and puts nulls last by default (pinned by a test).
             t = s.read_asof(dataset, as_of, filters=checked, vintages=vintages)
             if allowed_restricted is not None:
-                t = _gate(t, description["name"], allowed_restricted)
+                t = _gate(t, description["name"], allowed_restricted, denied_sources)
             t = t.sort_by([(k, "ascending") for k in key])
             if limit is not None:
                 t = t.slice(0, limit)

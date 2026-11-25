@@ -170,6 +170,7 @@ def parse_restricted_allow(spec: str, client_ids: frozenset[str], restricted: fr
     (`restricted`): opening an open source means nothing, and a typo must not pass silently. Errors name the
     entry by position, never by content (a token or a private symbol may sit in it)."""
     allow: dict[str, frozenset[str]] = {}
+    never_folded = {n.casefold() for n in never}  # `Agents` is the agents' client too
     items = [item.strip() for item in spec.split(",") if item.strip()]
     for position, item in enumerate(items, start=1):
         parts = [p.strip() for p in item.split(":")]
@@ -178,7 +179,7 @@ def parse_restricted_allow(spec: str, client_ids: frozenset[str], restricted: fr
         client, sources = parts[0], [s.strip() for s in parts[1].split("|")]
         if client not in client_ids:
             raise ConfigError(f"{_ALLOW} entry {position}: the client is not a client of MOF_MCP_TOKENS")
-        if client in never:
+        if client.casefold() in never_folded:
             raise ConfigError(f"{_ALLOW} entry {position}: the client is one of MOF_MARKET_NO_RESTRICTED_CLIENTS, "
                               "which never get restricted sources (spec §13)")
         if client in allow:

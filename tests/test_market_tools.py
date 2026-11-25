@@ -260,3 +260,74 @@ async def test_as_of_output_has_no_labels(http_url):
         assert PRIV_TOKEN not in json.dumps(out)
         for label in (PRIV_LABEL, FIGI1, CIK1, "AAA", "tiingo:", "private_history:"):
             assert label not in rows
+
+
+class _Slow:
+    """A live adapter whose fetch takes `seconds`, then answers as the fake Tiingo does."""
+
+    source_code = "tiingo"
+
+    def __init__(self, seconds: float, done: list):
+        self._seconds, self._done = seconds, done
+        self._inner = fake_tiingo()
+
+    def __getattr__(self, name):  # everything else as the fake Tiingo
+        return getattr(self._inner, name)
+
+    def fetch(self, *args, **kwargs):
+        time.sleep(self._seconds)
+        out = list(self._inner.fetch(*args, **kwargs))
+        self._done.append(True)
+        return iter(out)
+
+    def close(self):
+        self._inner.close()
+
+
+async def test_live_fetches_are_bounded_and_busy_is_answered_not_queued():
+    import anyio
+
+    done: list = []
+    server = build_server(Settings(market_live_concurrency=1),
+                          market_adapter=lambda code: _Slow(1.5, done))
+    async with Client(server) as c:
+        results: list = []
+
+        async def first():
+            results.append(await _call(c, instruments=["AAA"], mode="live"))
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(first)
+            await anyio.sleep(0.3)
+            t0 = time.monotonic()
+            with pytest.raises(ToolError, match=r"^\[market_busy\].*MOF_MARKET_LIVE_CONCURRENCY"):
+                await _call(c, instruments=["BBB"], mode="live")
+            assert time.monotonic() - t0 < 1.0  # answered at once, not queued
+        assert results[0]["returned"] == 5
+        assert (await _call(c, instruments=["BBB"], mode="live"))["returned"] == 5  # the slot is free again
+
+
+async def test_an_abandoned_live_fetch_keeps_its_slot_until_it_ends():
+    done: list = []
+    made: list = []
+
+    def factory(code):  # the first fetch outlasts the budget, later ones are quick
+        made.append(code)
+        return _Slow(2.5 if len(made) == 1 else 0, done)
+
+    server = build_server(Settings(market_live_concurrency=1, market_live_timeout_s=1), market_adapter=factory)
+    async with Client(server) as c:
+        with pytest.raises(ToolError, match=r"^\[timeout\]"):
+            await _call(c, instruments=["AAA"], mode="live")
+        # the abandoned thread still fetches with the key: no second fetch beside it
+        with pytest.raises(ToolError, match=r"^\[market_busy\]"):
+            await _call(c, instruments=["AAA"], mode="live")
+        import anyio
+
+        deadline = time.monotonic() + 5
+        while not done and time.monotonic() < deadline:
+            await anyio.sleep(0.05)
+        await anyio.sleep(0.1)  # its slot is released just after the fetch returns
+        assert done == [True]  # it finished its fetch: the quota is spent
+        out = await _call(c, instruments=["AAA"], mode="live")
+    assert out["returned"] == 5 and len(made) == 2  # the busy call built no adapter

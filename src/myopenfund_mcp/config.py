@@ -185,11 +185,38 @@ def _no_restricted_clients(env: Mapping[str, str]) -> tuple[str, ...]:
     if raw is None:
         return NO_RESTRICTED_CLIENTS
     ids = [item.strip() for item in raw.split(",") if item.strip()]
+    if not ids:  # "," would otherwise disable the guard silently
+        raise ConfigError("MOF_MARKET_NO_RESTRICTED_CLIENTS is set but holds no client id: give at least one "
+                          "(an empty value keeps the default, agents)")
     for position, client in enumerate(ids, start=1):
         if not auth.is_valid_client_id(client):
             raise ConfigError(f"MOF_MARKET_NO_RESTRICTED_CLIENTS entry {position}: a client id is 1-32 "
                               "characters of A-Z a-z 0-9 _ . -")
     return tuple(dict.fromkeys(ids))
+
+
+#: Default MOF_MARKET_TOOL_ONLY_SOURCES: sources whose rows only market_prices serves (instrument_id only):
+#: the private export's rows hold private tokens and labels (market-data spec §9.3, §13).
+TOOL_ONLY_SOURCES = ("private_history",)
+_SOURCE_CODE = re.compile(r"[a-z][a-z0-9_]{0,62}")  # open-data-store's source-code rule, written out
+
+
+def _tool_only_sources(env: Mapping[str, str]) -> tuple[str, ...]:
+    """MOF_MARKET_TOOL_ONLY_SOURCES: source codes, comma-separated, without duplicates, in order; each in the
+    registry's code format. Errors name the entry by position."""
+    name = "MOF_MARKET_TOOL_ONLY_SOURCES"
+    raw = _get(env, name)
+    if raw is None:
+        return TOOL_ONLY_SOURCES
+    codes = [item.strip() for item in raw.split(",") if item.strip()]
+    if not codes:
+        raise ConfigError(f"{name} is set but holds no source code (an empty value keeps the default, "
+                          "private_history)")
+    for position, code in enumerate(codes, start=1):
+        if not _SOURCE_CODE.fullmatch(code):
+            raise ConfigError(f"{name} entry {position}: a source code is 1-63 characters of a-z 0-9 _, "
+                              "starting with a letter")
+    return tuple(dict.fromkeys(codes))
 
 
 def _restricted_allow(env: Mapping[str, str], never: tuple[str, ...]) -> Mapping[str, frozenset[str]]:
@@ -361,6 +388,11 @@ class Settings:
     market_max_instruments: int = 10  # MOF_MARKET_MAX_INSTRUMENTS: instruments per market_prices call
     market_max_rows: int = 5000  # MOF_MARKET_MAX_ROWS: rows per market_prices result (refused above, never cut)
     market_live_timeout_s: int = 60  # MOF_MARKET_LIVE_TIMEOUT_S: time budget of a live market-data fetch
+    # MOF_MARKET_LIVE_CONCURRENCY: live fetches running at once (an abandoned one keeps its slot until it ends);
+    # one more is answered [market_busy], never queued
+    market_live_concurrency: int = 1
+    # MOF_MARKET_TOOL_ONLY_SOURCES: sources whose rows the dataset tools never serve, whatever the allow-list
+    market_tool_only_sources: tuple[str, ...] = field(default=TOOL_ONLY_SOURCES, repr=False)
 
     def __post_init__(self) -> None:
         allow = self.market_restricted_allow
@@ -461,6 +493,8 @@ class Settings:
             market_max_instruments=_int(env, "MOF_MARKET_MAX_INSTRUMENTS", 10, maximum=100),
             market_max_rows=_int(env, "MOF_MARKET_MAX_ROWS", 5000, maximum=1_000_000),
             market_live_timeout_s=_int(env, "MOF_MARKET_LIVE_TIMEOUT_S", 60, maximum=3600),
+            market_live_concurrency=_int(env, "MOF_MARKET_LIVE_CONCURRENCY", 1, maximum=16),
+            market_tool_only_sources=_tool_only_sources(env),
         )
         if settings.market_source not in MARKET_SOURCES:
             raise ConfigError(f"MOF_MARKET_SOURCE must be one of {', '.join(MARKET_SOURCES)}, "

@@ -32,6 +32,7 @@ MARKET_SOURCE_RESTRICTED = "market_source_restricted"
 MARKET_UNKNOWN_INSTRUMENT = "market_unknown_instrument"
 MARKET_AMBIGUOUS_INSTRUMENT = "market_ambiguous_instrument"
 MARKET_NO_DATA = "market_no_data"
+MARKET_BUSY = "market_busy"
 TOO_MANY_INSTRUMENTS = "too_many_instruments"
 
 

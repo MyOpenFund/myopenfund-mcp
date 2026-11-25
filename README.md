@@ -828,7 +828,9 @@ them `0700` for its own uid). Configuration:
   page, `returned`, a cursor or the CSV. The market datasets (`prices`, `corporate_actions`,
   `instrument_identifiers`, ...) are read strictly, like market-data reads them: a source the registry does
   not declare is dropped too (so without the `[market]` extra, which declares the sources, no market row is
-  served). Other datasets, and datasets without a `source_code` column, are unchanged. `datasets_list`'s
+  served). Other datasets, and datasets without a `source_code` column, are unchanged. The sources of
+  `MOF_MARKET_TOOL_ONLY_SOURCES` (default `private_history`: its rows hold private tokens and labels) are never
+  served by these tools, whatever the allow-list: only `market_prices` serves them, by `instrument_id`. `datasets_list`'s
   `rows_estimate` still counts every row of a table.
 - **Time budget, and a store read over SMB.** One call, all its store reads together, gets
   `MOF_COMPANIES_QUERY_TIMEOUT_S` seconds (default 20) and then answers `[timeout]`. The default is sized
@@ -870,6 +872,17 @@ Python API (`market_data.api.prices`), the same code path as a notebook: nothing
 - **Bounds.** More than `MOF_MARKET_MAX_INSTRUMENTS` instruments is `[too_many_instruments]`; more than
   `MOF_MARKET_MAX_ROWS` rows, or a result above `MOF_MCP_MAX_RESULT_CHARS`, is `[result_too_large]`: refused,
   never cut. Store reads get `MOF_COMPANIES_QUERY_TIMEOUT_S`, live fetches `MOF_MARKET_LIVE_TIMEOUT_S`.
+- **Live fetches spend the key's quota.** At most `MOF_MARKET_LIVE_CONCURRENCY` (default 1) run at once; one
+  more is answered `[market_busy]` at once, never queued. A fetch past `MOF_MARKET_LIVE_TIMEOUT_S` answers
+  `[timeout]`, but its worker thread cannot be stopped: it may go on and finish its fetch (the quota is spent,
+  the rows are dropped), and it keeps its slot until it ends, so calls meanwhile are `[market_busy]`.
+- **Massive's free plan** allows 5 requests a minute: a raw fetch is about one request per instrument, and a
+  total return through Massive pages through every dividend and split of the range. With the defaults
+  (`MOF_MARKET_MAX_INSTRUMENTS=10`, `MOF_MARKET_LIVE_TIMEOUT_S=60`), ten Massive instruments cannot be fetched
+  within the budget: ask for at most about 5 per call, or raise `MOF_MARKET_LIVE_TIMEOUT_S` (and the client's
+  own tool-call timeout). Tiingo's free plan is not limited per minute this way.
+- **Private-history rows** (`MOF_MARKET_TOOL_ONLY_SOURCES`, default `private_history`) are served by
+  `market_prices` only, keyed by `instrument_id`: the dataset tools never serve them, whatever the allow-list.
 
 ## Errors
 
@@ -898,6 +911,7 @@ branch on the code and show the message.
 | `market_source_restricted` | A restricted source this client may not read: from the store (`source=`), or live over HTTP (the deployment's key). | Omit `source`, or ask the operator (`MOF_MARKET_RESTRICTED_ALLOW`). |
 | `market_unknown_instrument` | Nothing this client may read names the input (store), the live source knows no such symbol, or a CIK was sent to a live source. Inputs are listed as you wrote them. | Pass a ticker or a FIGI; check the symbol. |
 | `market_ambiguous_instrument` | An input names several instruments in the store. | Pass a FIGI or an instrument id. |
+| `market_busy` | `MOF_MARKET_LIVE_CONCURRENCY` live fetches are already running (an abandoned, timed-out one included until it ends). Answered at once, never queued. | Retry in a moment. |
 | `market_no_data` | No price in the range: from the `source=` asked for, or from the live source. | Widen the range or try another source. |
 
 Arguments that do not match a tool's input schema (wrong type, string too long, e.g. an over-long company
@@ -1028,7 +1042,9 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_CHUNK_OVERLAP_TOKENS` | `32` | Tokens shared by neighbouring passages (0-2048, below `MOF_CHUNK_MAX_TOKENS`). |
 | `MOF_MARKET_SOURCE` | `auto` | Where `market_prices` reads when a call gives no `mode`: `auto` (the store when it holds the rows, else a live fetch), `store` (needs `MOF_COMPANIES_CATALOG`) or `live`. `store` or `live` without the `[market]` extra refuses to start. |
 | `MOF_MARKET_RESTRICTED_ALLOW` | unset | `client:source\|source,...`: the restricted sources (licences that forbid sharing, e.g. `massive`, `tiingo`, `private_history`) whose stored rows each client of `MOF_MCP_TOKENS` may read. Unset = none, for every client and over stdio. Each source must be a restricted code of the installed source registry (needs the `[market]` extra). The list applies to HTTP tokens only: over stdio there is no client, so stored restricted rows are never served, and a live fetch uses your own key and is your own data: not gated. A client of `MOF_MARKET_NO_RESTRICTED_CLIENTS` is refused. Errors name the entry by position only. |
-| `MOF_MARKET_NO_RESTRICTED_CLIENTS` | `agents` | Client ids (comma-separated) that `MOF_MARKET_RESTRICTED_ALLOW` may never name: the agents' token never gets restricted sources (it may post publicly). An empty value keeps the default; an operator whose agents client has another id sets it here. |
+| `MOF_MARKET_NO_RESTRICTED_CLIENTS` | `agents` | Client ids (comma-separated) that `MOF_MARKET_RESTRICTED_ALLOW` may never name: the agents' token never gets restricted sources (it may post publicly). Compared without regard to case (`Agents` is refused too). An empty value keeps the default; a value holding no id (`,`) is refused; an operator whose agents client has another id sets it here. |
+| `MOF_MARKET_TOOL_ONLY_SOURCES` | `private_history` | Source codes (comma-separated, the registry's format) whose rows `datasets_read_asof` / `datasets_export_csv` never serve, whatever `MOF_MARKET_RESTRICTED_ALLOW`: they reach an allowed client only through `market_prices`, keyed by `instrument_id`. A value holding no code (`,`) is refused. |
+| `MOF_MARKET_LIVE_CONCURRENCY` | `1` | Live market-data fetches running at once (1-16); one more is `[market_busy]`, never queued. A timed-out fetch keeps its slot until its thread ends. |
 | `MOF_MARKET_MAX_INSTRUMENTS` | `10` | Instruments per `market_prices` call (1-100); more is refused. |
 | `MOF_MARKET_MAX_ROWS` | `5000` | Rows per `market_prices` result (1-1000000); more is refused, never cut (`MOF_MCP_MAX_RESULT_CHARS` applies too). |
 | `MOF_MARKET_LIVE_TIMEOUT_S` | `60` | Time budget of one live market-data fetch, in seconds (1-3600); then `[timeout]`. |

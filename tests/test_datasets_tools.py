@@ -324,8 +324,12 @@ async def test_datasets_export_csv_filters_restricted(market_store):
 
 
 async def test_datasets_serve_restricted_rows_to_an_allowed_client_only(market_store):
+    """An allowed client gets its restricted rows, except those of a tool-only source
+    (MOF_MARKET_TOOL_ONLY_SOURCES, default private_history): never served by the generic dataset tools,
+    whatever the allow-list (their rows hold private tokens and labels; market_prices serves them keyed by
+    instrument_id only)."""
     from http_server import free_port, serve
-    from market_fixture import N_PRIVATE, N_TIINGO, UNREGISTERED
+    from market_fixture import N_TIINGO, PRIV_LABEL, PRIV_TOKEN, UNREGISTERED
 
     from myopenfund_mcp.auth import hash_token
 
@@ -336,9 +340,31 @@ async def test_datasets_serve_restricted_rows_to_an_allowed_client_only(market_s
     with serve(build_server(settings, companies_store=market_store), port) as url:
         async with Client(url, auth=allowed) as c:
             rows = (await c.call_tool("datasets_read_asof", {"dataset": "prices"})).data["rows"]
+            ids = (await c.call_tool("datasets_export_csv", {"dataset": "instrument_identifiers"})).data
         async with Client(url, auth=other) as c:
             none = (await c.call_tool("datasets_export_csv", {"dataset": "prices"})).data
     by_source = {s: sum(r["source_code"] == s for r in rows) for s in {r["source_code"] for r in rows}}
-    assert by_source == {"tiingo": N_TIINGO, "private_history": N_PRIVATE}  # never the unregistered source
-    assert UNREGISTERED not in json.dumps(rows)
+    assert by_source == {"tiingo": N_TIINGO}  # never private_history (tool-only), never the unregistered source
+    # I1's tiingo series and three open labels; nothing of I2 (private_history label and series)
+    assert ids["returned"] == 4 and "tiingo:AAA" in ids["csv"]
+    for leaked in (UNREGISTERED, PRIV_LABEL, PRIV_TOKEN, "private_history"):
+        assert leaked not in json.dumps([rows, ids])
     assert none["returned"] == 0 and none["csv"] == ""
+
+
+async def test_tool_only_sources_are_configurable(market_store):
+    """With MOF_MARKET_TOOL_ONLY_SOURCES=tiingo, private_history rows reach an allowed client and tiingo's
+    do not (stdio would serve neither: it gets no restricted rows at all)."""
+    from http_server import free_port, serve
+    from market_fixture import N_PRIVATE
+
+    from myopenfund_mcp.auth import hash_token
+
+    port, token = free_port(), "t-notebook-" + "n" * 40
+    settings = Settings(transport="http", port=port, tokens=f"notebook:{hash_token(token)}:read",
+                        market_restricted_allow={"notebook": frozenset({"tiingo", "private_history"})},
+                        market_tool_only_sources=("tiingo",))
+    with serve(build_server(settings, companies_store=market_store), port) as url:
+        async with Client(url, auth=token) as c:
+            rows = (await c.call_tool("datasets_read_asof", {"dataset": "prices"})).data["rows"]
+    assert {r["source_code"] for r in rows} == {"private_history"} and len(rows) == N_PRIVATE

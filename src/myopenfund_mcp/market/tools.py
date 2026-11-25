@@ -28,13 +28,17 @@ echoed.
 
 Bounds: at most MOF_MARKET_MAX_INSTRUMENTS inputs and MOF_MARKET_MAX_ROWS rows per call, and the server's
 result cap; larger requests are refused, never cut. Store reads run in a worker thread within
-MOF_COMPANIES_QUERY_TIMEOUT_S, live fetches within MOF_MARKET_LIVE_TIMEOUT_S.
+MOF_COMPANIES_QUERY_TIMEOUT_S, live fetches within MOF_MARKET_LIVE_TIMEOUT_S. At most
+MOF_MARKET_LIVE_CONCURRENCY live fetches run at once (they spend the key's quota): one more is answered
+``[market_busy]`` at once, never queued. A fetch past its time budget is abandoned, not stopped (a worker
+thread cannot be): it may still finish and spend its quota, and it keeps its slot until it ends.
 """
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import re
+import threading
 from collections.abc import Callable
 from functools import partial
 from typing import Annotated, Literal
@@ -58,6 +62,7 @@ from ..errors import (
     INVALID_ARGUMENT,
     LIMIT_EXCEEDED,
     MARKET_AMBIGUOUS_INSTRUMENT,
+    MARKET_BUSY,
     MARKET_KEY_MISSING,
     MARKET_NO_DATA,
     MARKET_SOURCE_RESTRICTED,
@@ -200,6 +205,40 @@ def _fetch_live(labels, start, end, code, adjust, factory: AdapterFactory | None
             adapter.close()
 
 
+class _LiveSlots:
+    """MOF_MARKET_LIVE_CONCURRENCY slots for live fetches. A slot is taken before the worker thread is asked
+    and released when the fetch itself ends, so an abandoned (timed-out) fetch keeps it: no new fetch runs
+    beside one still spending the key. A fetch cancelled before its thread started never runs."""
+
+    def __init__(self, n: int):
+        self._slots = threading.BoundedSemaphore(n)
+
+    def take(self) -> bool:
+        return self._slots.acquire(blocking=False)
+
+    async def run(self, fn, seconds: float):
+        """``fn()`` off the event loop within ``seconds``, in a slot taken by :meth:`take`."""
+        lock, state = threading.Lock(), {"started": False, "skipped": False}
+
+        def guarded():
+            with lock:
+                if state["skipped"]:
+                    return None
+                state["started"] = True
+            try:
+                return fn()
+            finally:
+                self._slots.release()
+
+        try:
+            return await _off_loop(guarded, seconds)
+        finally:
+            with lock:
+                if not state["started"]:  # cancelled before its thread ran: it never will
+                    state["skipped"] = True
+                    self._slots.release()
+
+
 def _live_error(exc: BaseException, code: str):
     env = KEY_ENVS.get(code, "the source's key variable")
     if isinstance(exc, api.MissingKeyError):
@@ -229,6 +268,7 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
     """``store``: the CompaniesStore (its open-data-store holds the market datasets) or None.
     ``adapter_factory``: tests only. Reads the source registry once (a ConfigError if it is broken)."""
     restricted = registered_restricted_sources()
+    slots = _LiveSlots(settings.market_live_concurrency)
     mk = FastMCP("market", mask_error_details=True)
     read = tier_check("read", auth_enabled=auth_enabled)
 
@@ -304,8 +344,12 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
                                  f"a live fetch from {live_code} uses this server's key: serving it is "
                                  "redistribution, and this client is not allowed it (MOF_MARKET_RESTRICTED_ALLOW)")
             fetch = partial(_fetch_live, live_labels, first, last, live_code, adjust, adapter_factory)
+            if not slots.take():
+                raise tool_error(MARKET_BUSY, f"{settings.market_live_concurrency} live fetch(es) already running "
+                                              "(MOF_MARKET_LIVE_CONCURRENCY, an abandoned one included until it "
+                                              "ends); try again in a moment")
             try:
-                table = await _off_loop(fetch, settings.market_live_timeout_s)
+                table = await slots.run(fetch, settings.market_live_timeout_s)
             except Exception as exc:  # noqa: BLE001 -- mapped to a code; a fixed message for the unexpected
                 raise (exc if _is_timeout(exc) else _live_error(exc, live_code)) from None
             by_input: dict[str, list[dict]] = {}
