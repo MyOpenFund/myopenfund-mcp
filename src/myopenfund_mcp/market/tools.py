@@ -14,6 +14,15 @@ chantier 3 Q9):
   (``source`` is a restricted source this caller may not read from the store) or ``store_unavailable``
   (the store failed or ran out of time).
 
+The store is read in one market-data call for all the inputs (and one more, raw, for a total return: it
+gives each session's provider). When several sources the caller may read price one session, the first of
+MOF_MARKET_PRECEDENCE wins (codes the caller may not read are dropped from it; readable ones it leaves out
+come after it, alphabetically); ``source`` reads one source only.
+
+A live source is sent tickers only: a ``mof:`` instrument id, a ``source:symbol`` string, a CIK, or a label
+the store holds for a source of MOF_MARKET_TOOL_ONLY_SOURCES (a private label or token) is refused with
+``[market_unknown_instrument]`` before any provider request.
+
 Every row carries ``source`` (store or live), ``reason`` when ``auto`` went live, and ``source_code`` (the
 provider of that price). Stored rows carry ``instrument_id`` only, never a label, a private_history token
 or a source symbol (spec §9.3); live rows also carry ``input`` (the caller's own words). The ``inputs``
@@ -30,15 +39,20 @@ Bounds: at most MOF_MARKET_MAX_INSTRUMENTS inputs and MOF_MARKET_MAX_ROWS rows p
 result cap; larger requests are refused, never cut. Store reads run in a worker thread within
 MOF_COMPANIES_QUERY_TIMEOUT_S, live fetches within MOF_MARKET_LIVE_TIMEOUT_S. At most
 MOF_MARKET_LIVE_CONCURRENCY live fetches run at once (they spend the key's quota): one more is answered
-``[market_busy]`` at once, never queued. A fetch past its time budget is abandoned, not stopped (a worker
-thread cannot be): it may still finish and spend its quota, and it keeps its slot until it ends.
+``[market_busy]`` at once, never queued. A live fetch never sleeps beyond its time budget: a wait the
+adapter asks for (Tiingo's hourly budget, Massive's 5 requests a minute, a ``Retry-After``) that would end
+after it is ``[limit_exceeded]`` with the wait, at once. A fetch past its time budget all the same (a slow
+answer) is abandoned, not stopped (a worker thread cannot be): it may still finish and spend its quota, and
+it keeps its slot until it ends.
 """
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import re
 import threading
+import time
 from collections.abc import Callable
 from functools import partial
 from typing import Annotated, Literal
@@ -54,6 +68,7 @@ from ..auth import (
     caller_client_id,
     live_restricted_for,
     registered_restricted_sources,
+    registered_sources,
     tier_check,
 )
 from ..config import Settings
@@ -76,7 +91,6 @@ from ..paging import cap_result
 
 log = logging.getLogger("myopenfund_mcp.market")
 
-MODES = ("auto", "store", "live")
 STORE, LIVE = "store", "live"
 NO_STORE, NOT_IN_STORE, STORE_NO_DATA = "no_store", "not_in_store", "store_no_data"
 STORE_SOURCE_RESTRICTED, STORE_UNAVAILABLE = "store_source_restricted", "store_unavailable"
@@ -87,20 +101,26 @@ _QUOTA_ERRORS = (tiingo.TiingoQuotaError,)
 MAX_INSTRUMENT_CHARS = 64
 _SOURCE_CODE = re.compile(r"[a-z][a-z0-9_]{0,62}")  # open-data-store's source-code rule
 _CIK = re.compile(r"[0-9]+")
+#: the adapters' own text when a retry would wait longer than ``max_wait_s`` (numbers only)
+_ADAPTER_WAIT = re.compile(r"asked to wait ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?) s, beyond max_wait_s")
+_IDENTIFIERS = "instrument_identifiers"  # open-data-store's market contract of the identifier mapping
 _LISTED = 20  # inputs quoted in a message
+TOOLSET = "the market toolset (market_prices)"  # what a registry error names
 ANNOTATIONS = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
 SIZE_HINT = "narrow the date range or ask for fewer instruments"
 BACKEND_MESSAGE = "the market data store cannot be read right now; try again later"
 LIVE_MESSAGE = "the live market data source cannot be read right now; try again later"
-INSTRUMENTS_DESCRIPTION = (f"Tickers or FIGIs (CIKs and mof: instrument ids through the store only), at most the "
-                           f"server maximum per call, each at most {MAX_INSTRUMENT_CHARS} characters")
+INSTRUMENTS_DESCRIPTION = (f"Tickers (store and live); FIGIs, CIKs and mof: instrument ids resolve through the "
+                           f"store only. At most the server maximum per call, each at most {MAX_INSTRUMENT_CHARS} "
+                           "characters")
 MODE_DESCRIPTION = ("auto: the store when it holds the instrument over the range, else a live fetch; store: never "
                     "live; live: never the store. Omitted = the server's MOF_MARKET_SOURCE")
 SOURCE_DESCRIPTION = ("A provider code to read from (e.g. tiingo, massive, private_history); live fetches take "
                       "tiingo (default) or massive. Omitted = any source this client may read")
 
-#: `source_code -> Adapter`: an adapter instead of the one market-data builds from the environment (tests)
-AdapterFactory = Callable[[str], object]
+#: ``(source_code, budget) -> Adapter``: the live adapter of a fetch (tests inject one); ``budget`` is the
+#: fetch's `_Budget` (its ``sleep`` and ``max_wait_s`` keep every wait inside the call's time budget)
+AdapterFactory = Callable[[str, "_Budget"], object]
 
 
 def _labels(instruments: list[str], settings: Settings) -> list[str]:
@@ -134,38 +154,96 @@ async def _off_loop(fn, seconds: float):
 
 
 # --- the store (market-data's server profile) ---------------------------------------------------------
-def _store_answers(store, labels, start, end, source, adjust, allowed) -> dict[str, tuple]:
-    """Per input: ``("rows", table, raw_or_None)`` or ``(kind, ApiError)``; one store call, one input at a
-    time (the server profile returns instrument ids only: per input is how a route is known per input).
-    With a total return, the raw rows of the same read give each session's provider."""
+_KINDS = ((api.UnknownInstrumentError, "unknown"), (api.NoDataError, "no_data"),
+          (api.RestrictedSourceError, "restricted"))
+_REASONS = {"unknown": NOT_IN_STORE, "no_data": STORE_NO_DATA, "restricted": STORE_SOURCE_RESTRICTED,
+            "unavailable": STORE_UNAVAILABLE}
 
-    def kind(exc: api.ApiError) -> str:
-        for cls, name in ((api.UnknownInstrumentError, "unknown"), (api.NoDataError, "no_data"),
-                          (api.RestrictedSourceError, "restricted"),
-                          (api.AmbiguousInstrumentError, "ambiguous")):
-            if isinstance(exc, cls):
-                return name
-        return "conflict"
+
+def precedence_for(settings: Settings, allowed: frozenset[str], restricted: frozenset[str],
+                   registered: frozenset[str]) -> tuple[str, ...]:
+    """MOF_MARKET_PRECEDENCE for a caller who may read the restricted sources ``allowed``: its codes this
+    caller may read, in order, then the other sources it may read, alphabetically (market-data ignores the
+    sources a precedence leaves out). A restricted code outside ``allowed`` is never passed."""
+    readable = {c for c in registered if c not in restricted or c in allowed}
+    listed = [c for c in settings.market_precedence if c in readable]
+    return (*listed, *sorted(readable - set(listed)))
+
+
+def _named_privately(s, labels: list[str], codes: tuple[str, ...]) -> set[str]:
+    """The ``labels`` an identifier of the sources ``codes`` holds (case aside, a CIK zero-padded), or a
+    ``source_symbol`` token of theirs: names that only the store may resolve, never sent to a live source.
+    Read on the open ``Store`` ``s``, never served."""
+    if not labels or not codes:
+        return set()
+    from open_data_store.reader.api import UnknownDataset
+
+    try:
+        if not s.is_published(_IDENTIFIERS):
+            return set()
+    except UnknownDataset:
+        return set()
+    table = s.read_asof(_IDENTIFIERS, filters={"source_code": sorted(codes)}, columns=["id_scheme", "id_value"])
+    held: set[str] = set()
+    for scheme, value in zip(table["id_scheme"].to_pylist(), table["id_value"].to_pylist(), strict=True):
+        if value is None:
+            continue
+        held.add(value.upper())
+        if scheme == "source_symbol":
+            held.add(value.partition(":")[2].upper())
+    return {label for label in labels
+            if label.upper() in held or (_CIK.fullmatch(label) and label.zfill(10) in held)}
+
+
+def _store_answers(store, labels, start, end, source, adjust, allowed, precedence, how, private) -> dict:
+    """One store call: ``{"table", "raw", "failed": {input: kind}, "private": set, "refusal"}``.
+
+    All the inputs are read in one market-data call (one more, raw, for a total return: each session's
+    provider). An error naming some inputs (unknown, no data from ``source``) sets them aside and the others
+    are read again; an error about all of them (a restricted ``source``) sets them all aside; an ambiguous
+    input or a conflict refuses the call (the caller's to fix, whatever the mode). In ``auto``, when fewer
+    instruments come back than inputs remain (two inputs naming one instrument, or one without a row in the
+    range), each remaining input is read alone to know which has no row: the server profile keys its rows
+    by instrument_id only. ``private``: tool-only source codes whose labels never go live
+    (`_named_privately`, for the inputs set aside in ``auto``)."""
 
     def go(s):
-        out: dict[str, tuple] = {}
-        for label in labels:
-            read = partial(api.prices, [label], start, end, source=source, profile="server", store=s,
-                           allowed_restricted=allowed)
+        kw = {"source": source, "profile": "server", "store": s, "allowed_restricted": allowed,
+              "precedence": precedence}
+        pending, failed = list(labels), {}
+        table = raw = None
+        while pending:
             try:
-                table = read(adjust=adjust)
-                raw = read(adjust="raw") if adjust == "total_return" else None
-            except api.ApiError as exc:  # handed back: a ValueError would read as the store's bad argument
-                out[label] = (kind(exc), exc)
-            else:
-                out[label] = ("rows", table, raw)
-        return out
+                table = api.prices(pending, start, end, adjust=adjust, **kw)
+                raw = api.prices(pending, start, end, adjust="raw", **kw) if adjust == "total_return" else None
+                break
+            except api.AmbiguousInstrumentError as exc:  # handed back: a ValueError would read as a bad argument
+                return {"refusal": ("ambiguous", list(exc.inputs))}
+            except api.ApiError as exc:
+                kind = next((name for cls, name in _KINDS if isinstance(exc, cls)), None)
+                if kind is None:  # several sources, or series, disagree on one session
+                    return {"refusal": ("conflict", pending)}
+                named = set(getattr(exc, "inputs", ()) or ()) if kind != "restricted" else set(pending)
+                hit = [label for label in pending if label in named] or pending
+                failed.update(dict.fromkeys(hit, kind))
+                pending = [label for label in pending if label not in hit]
+        if table is not None and how != STORE:
+            ids = (raw if raw is not None else table)["instrument_id"].to_pylist()
+            if len(set(ids)) < len(pending):
+                for label in pending:
+                    one = api.prices([label], start, end, adjust="raw", **kw)
+                    if not one.num_rows:
+                        failed[label] = "no_data"
+        gone = [label for label in labels if label in failed]
+        return {"table": table, "raw": raw, "failed": failed, "refusal": None,
+                "private": _named_privately(s, gone, private) if how != STORE else set()}
 
     return store.call(go)
 
 
-def _store_rows(answer: tuple) -> list[dict]:
-    table, raw = answer[1], answer[2]
+def _store_rows(table, raw) -> list[dict]:
+    if table is None:
+        return []
     rows = table.to_pylist()
     if raw is not None:  # total return: the provider of each session's price
         provider = {(r["instrument_id"], r["session_date"]): r["source_code"] for r in raw.to_pylist()}
@@ -174,7 +252,7 @@ def _store_rows(answer: tuple) -> list[dict]:
     return [{**r, "source": STORE} for r in rows]
 
 
-def _store_refusal(kind: str, labels: list[str], exc: api.ApiError | None, source: str | None):
+def _store_refusal(kind: str, labels: list[str], source: str | None):
     """The error of a store-mode (or no-live-fallback) call for `labels` that the store cannot answer."""
     if kind in ("unknown", NOT_IN_STORE):
         return tool_error(MARKET_UNKNOWN_INSTRUMENT,
@@ -190,18 +268,82 @@ def _store_refusal(kind: str, labels: list[str], exc: api.ApiError | None, sourc
     if kind == "ambiguous":
         return tool_error(MARKET_AMBIGUOUS_INSTRUMENT, f"{_listed(labels)} name several instruments: pass a "
                                                        "FIGI or an instrument id")
-    if kind == "conflict":  # market-data's message names the caller's inputs only
-        return tool_error(INVALID_ARGUMENT, str(exc))
+    if kind == "conflict":  # the server's own words: the caller's inputs only, and the argument it has
+        return tool_error(INVALID_ARGUMENT, f"several sources (or two series of one source) give {_listed(labels)} "
+                                            "different prices on one session: pass source to read one source")
     return tool_error(BACKEND_UNAVAILABLE, BACKEND_MESSAGE)  # store_unavailable
 
 
+def _route(answers: dict, labels: list[str], how: str, source: str | None):
+    """``(routes, store_rows)``: each input the store cannot answer goes live in ``auto`` (with its reason)
+    or fails the call in ``store``."""
+    if answers.get("refusal"):
+        kind, hit = answers["refusal"]
+        raise _store_refusal(kind, hit, source)
+    routes = {label: _REASONS[answers["failed"][label]] for label in labels if label in answers["failed"]}
+    if how == STORE and routes:
+        reason = next(iter(routes.values()))
+        raise _store_refusal(reason, [k for k, v in routes.items() if v == reason], source)
+    return routes, _store_rows(answers["table"], answers["raw"])
+
+
 # --- live (market-data's none profile) ----------------------------------------------------------------
-def _fetch_live(labels, start, end, code, adjust, factory: AdapterFactory | None):
-    adapter = factory(code) if factory is not None else None
+class _OverBudget(Exception):
+    """A wait the adapter asked for would end after the call's time budget (`_Budget.sleep`)."""
+
+
+class _Budget:
+    """The time budget of one live fetch (MOF_MARKET_LIVE_TIMEOUT_S from the call's start). Its ``sleep`` is
+    the adapter's: a wait that fits is slept, a longer one is refused at once (recorded in ``over``, then
+    ``_OverBudget``, which the adapter wraps in its own error). ``max_wait_s``: the adapter's cap on a retry
+    wait, the time left (at most the adapter's own default)."""
+
+    def __init__(self, seconds: float, *, default_max_wait_s: float):
+        self.seconds = seconds
+        self._deadline = time.monotonic() + seconds
+        self._default = default_max_wait_s
+        self.over: float | None = None
+
+    def left(self) -> float:
+        return self._deadline - time.monotonic()
+
+    @property
+    def max_wait_s(self) -> float:
+        return max(min(self.left(), self._default), 0.001)
+
+    def sleep(self, seconds: float) -> None:
+        if seconds > self.left():
+            self.over = seconds
+            raise _OverBudget
+        time.sleep(seconds)
+
+
+def _live_adapter(code: str, budget: _Budget):
+    """The live adapter of ``code`` keyed from this process's environment (the caller's own key over stdio),
+    its waits bounded by ``budget``."""
+    if not os.environ.get(KEY_ENVS[code], "").strip():
+        raise api.MissingKeyError(f"no {code} key")  # the message is not forwarded (`_live_error`)
+    cls = tiingo.TiingoAdapter if code == tiingo.SOURCE_CODE else massive.MassiveAdapter
+    return cls.from_env(sleep=budget.sleep, max_wait_s=budget.max_wait_s)
+
+
+class _OutsidePlan(Exception):
+    def __init__(self, days: int, oldest: dt.date):
+        super().__init__(days, oldest)
+        self.days, self.oldest = days, oldest
+
+
+def _fetch_live(labels, start, end, code, adjust, factory: AdapterFactory, budget: _Budget):
+    adapter = factory(code, budget)
     try:
+        days = getattr(adapter, "max_history_days", None)  # Massive's plan window: refused before any request
+        if isinstance(days, int) and not isinstance(days, bool):
+            oldest = dt.datetime.now(dt.UTC).date() - dt.timedelta(days=days)
+            if start < oldest:
+                raise _OutsidePlan(days, oldest)
         return api.prices(labels, start, end, source=code, adjust=adjust, profile="none", adapter=adapter)
     finally:
-        if adapter is not None and hasattr(adapter, "close"):
+        if hasattr(adapter, "close"):
             adapter.close()
 
 
@@ -239,11 +381,28 @@ class _LiveSlots:
                     self._slots.release()
 
 
-def _live_error(exc: BaseException, code: str):
+def _wait_error(code: str, seconds: float, budget: _Budget):
+    return tool_error(LIMIT_EXCEEDED, f"{code} asks to wait about {round(seconds)} s before its next request "
+                                      f"(its request budget), beyond this call's {budget.seconds:g} s "
+                                      "(MOF_MARKET_LIVE_TIMEOUT_S): try again later, or ask for fewer "
+                                      "instruments")
+
+
+def _live_error(exc: BaseException, code: str, budget: _Budget):
     env = KEY_ENVS.get(code, "the source's key variable")
+    if budget.over is not None:  # a wait refused by `_Budget.sleep`, whatever the adapter wrapped it in
+        return _wait_error(code, budget.over, budget)
+    if isinstance(exc, _OutsidePlan):
+        return tool_error(INVALID_ARGUMENT, f"{code}'s plan serves the last {exc.days} days only (from "
+                                            f"{exc.oldest.isoformat()}): start on or after it, or use source "
+                                            "tiingo (the deep free history)")
     if isinstance(exc, api.MissingKeyError):
         return tool_error(MARKET_KEY_MISSING, f"no {code} API key in this server's environment: set {env} "
                                               "(your own key; it is never a tool argument)")
+    if isinstance(exc, massive.MassiveKeyError) and str(exc).startswith("Massive answered HTTP 403"):
+        return tool_error(LIMIT_EXCEEDED, f"{code} refused the request (HTTP 403): it is outside the plan of "
+                                          f"this server's key (its history window, or a session not published "
+                                          f"yet); a refused key is HTTP 401 (check {env})")
     if isinstance(exc, _KEY_ERRORS):
         return tool_error(MARKET_KEY_MISSING, f"{code} refused the API key in {env}: check it")
     if isinstance(exc, api.UnknownInstrumentError):
@@ -254,23 +413,45 @@ def _live_error(exc: BaseException, code: str):
         return tool_error(MARKET_AMBIGUOUS_INSTRUMENT, str(exc))
     if isinstance(exc, _QUOTA_ERRORS):
         return tool_error(LIMIT_EXCEEDED, f"the request cap of this server's {code} key is reached; try later")
+    wait = _ADAPTER_WAIT.search(str(exc)) if isinstance(exc, (tiingo.TiingoError, massive.MassiveError)) else None
+    if wait is not None:  # a Retry-After beyond the time left (the adapter's max_wait_s)
+        return _wait_error(code, float(wait.group(1)), budget)
     log.warning("market: live fetch failed (%s)", type(exc).__name__)  # the class only
     return tool_error(BACKEND_UNAVAILABLE, LIVE_MESSAGE)
 
 
-def _live_rows(table, code: str, reason: str | None) -> list[dict]:
-    extra = {"source": LIVE, **({"reason": reason} if reason else {})}
-    return [{**r, "source_code": r.get("source_code", code), **extra} for r in table.to_pylist()]
+def _live_rows(table, code: str) -> list[dict]:
+    return [{**r, "source_code": r.get("source_code", code), "source": LIVE} for r in table.to_pylist()]
+
+
+def _store_only(labels: list[str]) -> list[str]:
+    """Inputs only the store resolves, by their form: an instrument id (``mof:``) or a ``source:symbol``."""
+    return [label for label in labels if ":" in label]
 
 
 def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
                          adapter_factory: AdapterFactory | None = None) -> FastMCP:
     """``store``: the CompaniesStore (its open-data-store holds the market datasets) or None.
     ``adapter_factory``: tests only. Reads the source registry once (a ConfigError if it is broken)."""
-    restricted = registered_restricted_sources()
+    restricted = registered_restricted_sources(TOOLSET)
+    registered = registered_sources(TOOLSET)
+    private = tuple(settings.market_tool_only_sources)
+    factory = adapter_factory or _live_adapter
     slots = _LiveSlots(settings.market_live_concurrency)
     mk = FastMCP("market", mask_error_details=True)
     read = tier_check("read", auth_enabled=auth_enabled)
+
+    async def held_privately(labels: list[str]) -> set[str]:
+        """Live mode: which inputs the store holds for a tool-only source (they never go live). A store that
+        cannot answer refuses none: a live fetch never needs it (logged, the class only)."""
+        if store is None:
+            return set()
+        try:
+            return await _off_loop(partial(store.call, lambda s: _named_privately(s, labels, private)),
+                                   settings.companies_query_timeout_s)
+        except Exception as exc:  # noqa: BLE001 -- its text is never forwarded
+            log.warning("market: store check of live inputs failed (%s)", type(exc).__name__)
+            return set()
 
     @mk.tool(name="prices", auth=read, annotations=ANNOTATIONS)
     async def market_prices(
@@ -309,22 +490,25 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
 
         routes: dict[str, str | None] = {}  # input -> live reason (None: mode live); absent: the store
         rows: list[dict] = []
+        held: set[str] | None = None  # inputs the store holds for a tool-only source (None: not checked)
         if how == LIVE:
             routes = dict.fromkeys(labels)
         elif store is None:
-            routes = dict.fromkeys(labels, NO_STORE)
+            routes, held = dict.fromkeys(labels, NO_STORE), set()
         else:
             allowed = allowed_restricted_for(client, settings)
-            fn = partial(_store_answers, store, labels, first, last, source, adjust, allowed)
+            order = None if source else precedence_for(settings, allowed, restricted, registered)
+            fn = partial(_store_answers, store, labels, first, last, source, adjust, allowed, order, how, private)
             try:
                 answers = await _off_loop(fn, settings.companies_query_timeout_s)
             except Exception as exc:  # noqa: BLE001 -- the store failed: its text is never forwarded
                 log.warning("market: store read failed (%s)", type(exc).__name__)
                 if how == STORE:
-                    raise (exc if _is_timeout(exc) else _store_refusal(STORE_UNAVAILABLE, labels, None,
-                                                                       source)) from None
-                answers = dict.fromkeys(labels, ("unavailable", None))
+                    raise (exc if _is_timeout(exc) else _store_refusal(STORE_UNAVAILABLE, labels, source)) from None
+                answers = {"table": None, "raw": None, "failed": dict.fromkeys(labels, "unavailable"),
+                           "refusal": None, "private": set()}
             routes, rows = _route(answers, labels, how, source)
+            held = answers["private"]
 
         if routes:
             live_labels = list(routes)
@@ -333,17 +517,30 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
                 if reason == NO_STORE:
                     raise tool_error(INVALID_ARGUMENT, f"this server has no market store, and live fetches take "
                                                        f"source {' or '.join(api.LIVE_SOURCES)}")
-                raise _store_refusal(reason, [k for k, v in routes.items() if v == reason], None, source)
+                raise _store_refusal(reason, [k for k, v in routes.items() if v == reason], source)
             ciks = [label for label in live_labels if _CIK.fullmatch(label)]
             if ciks:
                 raise tool_error(MARKET_UNKNOWN_INSTRUMENT,
                                  f"{_listed(ciks)}: a CIK names an instrument through the store's identifiers "
                                  "only; live sources take tickers")
+            only_store = _store_only(live_labels)
+            if only_store:
+                raise tool_error(MARKET_UNKNOWN_INSTRUMENT,
+                                 f"{_listed(only_store)}: an instrument id or a source:symbol names an instrument "
+                                 "through the store only; live sources take tickers")
+            if held is None:
+                held = await held_privately(live_labels)
+            hidden = [label for label in live_labels if label in held]
+            if hidden:  # a private label or token: the store's answer, never a provider request
+                raise _store_refusal("unknown", hidden, source)
             if live_code in restricted and live_code not in live_restricted_for(client, settings, restricted):
                 raise tool_error(MARKET_SOURCE_RESTRICTED,
                                  f"a live fetch from {live_code} uses this server's key: serving it is "
                                  "redistribution, and this client is not allowed it (MOF_MARKET_RESTRICTED_ALLOW)")
-            fetch = partial(_fetch_live, live_labels, first, last, live_code, adjust, adapter_factory)
+            budget = _Budget(settings.market_live_timeout_s,
+                             default_max_wait_s=(tiingo if live_code == tiingo.SOURCE_CODE
+                                                 else massive).DEFAULT_MAX_WAIT_S)
+            fetch = partial(_fetch_live, live_labels, first, last, live_code, adjust, factory, budget)
             if not slots.take():
                 raise tool_error(MARKET_BUSY, f"{settings.market_live_concurrency} live fetch(es) already running "
                                               "(MOF_MARKET_LIVE_CONCURRENCY, an abandoned one included until it "
@@ -351,9 +548,9 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
             try:
                 table = await slots.run(fetch, settings.market_live_timeout_s)
             except Exception as exc:  # noqa: BLE001 -- mapped to a code; a fixed message for the unexpected
-                raise (exc if _is_timeout(exc) else _live_error(exc, live_code)) from None
+                raise (exc if _is_timeout(exc) else _live_error(exc, live_code, budget)) from None
             by_input: dict[str, list[dict]] = {}
-            for row in _live_rows(table, live_code, None):
+            for row in _live_rows(table, live_code):
                 by_input.setdefault(row["input"], []).append(row)
             for label in live_labels:
                 reason = routes[label]
@@ -371,32 +568,3 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
 
 def _is_timeout(exc: BaseException) -> bool:
     return str(exc).startswith(f"[{TIMEOUT}]")
-
-
-def _route(answers: dict[str, tuple], labels: list[str], how: str, source: str | None):
-    """``(routes, store_rows)``: each input the store cannot answer goes live in ``auto`` (with its reason)
-    or fails the call in ``store``; stored rows of one instrument named by two inputs are kept once."""
-    reasons = {"unknown": NOT_IN_STORE, "no_data": STORE_NO_DATA, "restricted": STORE_SOURCE_RESTRICTED,
-               "unavailable": STORE_UNAVAILABLE}
-    routes: dict[str, str] = {}
-    rows: list[dict] = []
-    seen: set = set()
-    for kind in ("ambiguous", "conflict"):  # the caller's to fix, whatever the mode
-        hit = [label for label in labels if answers[label][0] == kind]
-        if hit:
-            raise _store_refusal(kind, hit, answers[hit[0]][1], source)
-    for label in labels:
-        answer = answers[label]
-        if answer[0] == "rows" and (answer[1].num_rows or how == STORE):
-            for r in _store_rows(answer):
-                key = (r["instrument_id"], r["session_date"])
-                if key not in seen:
-                    seen.add(key)
-                    rows.append(r)
-            continue
-        routes[label] = STORE_NO_DATA if answer[0] == "rows" else reasons[answer[0]]
-    if how == STORE and routes:
-        reason = next(iter(routes.values()))
-        raise _store_refusal(reason, [k for k, v in routes.items() if v == reason],
-                             None, source)
-    return routes, rows

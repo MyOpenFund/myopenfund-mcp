@@ -8,7 +8,11 @@ Adversarial on purpose:
   private_history series (``PRIV_TOKEN``): neither string may reach a caller;
 - one price row comes from a source no registry declares (``UNREGISTERED``): never served, even to an
   allowed client (the market datasets are read in strict mode, as market-data's own binding reads them);
-- I1 has a ticker and a FIGI from openfigi and a CIK from sec (open sources), and one dividend.
+- I1 has a ticker and a FIGI from openfigi and a CIK from sec (open sources), and one dividend;
+- ``seed_market(overlap=True)`` adds a massive series of I1 overlapping tiingo's on the last three sessions,
+  at other closes: two sources a client may both read, on one instrument (MOF_MARKET_PRECEDENCE decides);
+- ``seed_market(conflict=True)`` adds a second tiingo series of I1 (``tiingo:AAZ``) with another close on
+  the first session: two series of one source disagree, which no precedence resolves.
 """
 from __future__ import annotations
 
@@ -54,13 +58,21 @@ def _ident(instrument: str, scheme: str, value: str, source: str) -> dict:
             "known_at_kind": "collected", "source_code": source, "source_doc_id": None}
 
 
-def seed_market(tmp_path) -> StoreConfig:
+#: closes of the massive series of I1 (``seed_market(overlap=True)``), on DAYS[2:]
+MASSIVE_CLOSES = (500.0, 501.0, 502.0)
+
+
+def seed_market(tmp_path, *, overlap: bool = False, conflict: bool = False) -> StoreConfig:
     cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
     for contract in MARKET_CONTRACTS:
         approve_contract(cfg, contract, "test")
     prices = [_price("tiingo", "AAA", d, 100.0 + i) for i, d in enumerate(DAYS)]
     prices += [_price("private_history", PRIV_TOKEN, d, 20.0 + i) for i, d in enumerate(DAYS)]
     prices += [_price(UNREGISTERED, "UNR", DAYS[0], 1.0)]  # a source no registry declares: denied (strict)
+    if overlap:
+        prices += [_price("massive", "AAA", d, c) for d, c in zip(DAYS[2:], MASSIVE_CLOSES, strict=True)]
+    if conflict:
+        prices.append(_price("tiingo", "AAZ", DAYS[0], 999.0))
     dividend = {"source_symbol": "AAA", "action_type": "cash_dividend_regular", "action_seq": 0,
                 "source_action_type": "divCash", "announce_date": None, "record_date": None, "pay_date": None,
                 "amount": 1.0, "currency": "USD", "amount_basis": None, "per_share_basis": None,
@@ -75,6 +87,10 @@ def seed_market(tmp_path) -> StoreConfig:
         _ident(I2, "source_symbol", f"private_history:{PRIV_TOKEN}", "private_history"),
         _ident(I2, "ticker", PRIV_LABEL, "private_history"),
     ]
+    if overlap:
+        ids.append(_ident(I1, "source_symbol", "massive:AAA", "massive"))
+    if conflict:
+        ids.append(_ident(I1, "source_symbol", "tiingo:AAZ", "tiingo"))
     for contract, rows in ((PRICES, prices), (CORPORATE_ACTIONS, [dividend]), (INSTRUMENT_IDENTIFIERS, ids)):
         write_batch(contract, pa.Table.from_pylist(rows, schema=contract.schema), landing_root=cfg.landing,
                     run_id="t", producer="test")
@@ -96,8 +112,9 @@ PAYLOADS = {
 }
 
 
-def fake_tiingo(requests: list | None = None):
-    """market-data's TiingoAdapter on a mock transport: no network, no quota file."""
+def fake_tiingo(requests: list | None = None, **adapter):
+    """market-data's TiingoAdapter on a mock transport: no network, no quota file (``adapter``: other
+    TiingoAdapter arguments, e.g. a state directory, ``per_hour``, ``sleep``)."""
     import httpx
     from market_data.adapters.tiingo import TiingoAdapter
 
@@ -109,5 +126,5 @@ def fake_tiingo(requests: list | None = None):
             return httpx.Response(404, json={"detail": "Error: Ticker not found"})
         return httpx.Response(200, content=json.dumps(PAYLOADS[ticker]).encode())
 
-    return TiingoAdapter(KEY, transport=httpx.MockTransport(answer), state_dir=None, min_spacing_s=0,
-                         sleep=lambda s: None, now=lambda: NOW)
+    kw = {"state_dir": None, "min_spacing_s": 0, "sleep": lambda s: None, "now": lambda: NOW, **adapter}
+    return TiingoAdapter(KEY, transport=httpx.MockTransport(answer), **kw)

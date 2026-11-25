@@ -80,7 +80,8 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
                  rag_backend=None, filings_indexer=None, market_adapter=None) -> FastMCP:
     """``companies_store`` / ``companies_live`` / ``filings_indexer``: injected sources (tests); the server
     closes only the ones it builds itself: at shutdown, or at once when a later step refuses to start.
-    ``market_adapter``: a ``source_code -> Adapter`` factory for market_prices' live fetches (tests)."""
+    ``market_adapter``: a ``(source_code, budget) -> Adapter`` factory for market_prices' live fetches
+    (tests)."""
     owned: list = []
     try:
         return _build_server(settings, owned, vault_reader=vault_reader, companies_store=companies_store,

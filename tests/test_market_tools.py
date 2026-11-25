@@ -6,8 +6,12 @@ deployment's key and is gated like stored rows. Synthetic store and fake live so
 """
 import json
 import sys
+import threading
 import time
 
+import anyio
+import anyio.lowlevel
+import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -17,11 +21,14 @@ pytest.importorskip("market_data", reason="the [market] extra is not installed")
 
 from market_fixture import (
     CIK1,
+    DAYS,
     END,
     FIGI1,
     I1,
     I2,
     KEY,
+    MASSIVE_CLOSES,
+    NOW,
     PRIV_LABEL,
     PRIV_TOKEN,
     START,
@@ -59,7 +66,7 @@ def market_store(tmp_path):
 
 
 def _factory(requests: list | None = None):
-    def make(code: str):
+    def make(code: str, budget=None):
         assert code == "tiingo", code
         return fake_tiingo(requests)
     return make
@@ -209,7 +216,7 @@ async def test_live_timeout(monkeypatch):
             time.sleep(3)
             return iter(())
 
-    async with Client(build_server(Settings(market_live_timeout_s=1), market_adapter=lambda code: Slow())) as c:
+    async with Client(build_server(Settings(market_live_timeout_s=1), market_adapter=lambda code, budget: Slow())) as c:
         with pytest.raises(ToolError, match=r"^\[timeout\]"):
             await _call(c, instruments=["AAA"], mode="live")
 
@@ -263,33 +270,55 @@ async def test_as_of_output_has_no_labels(http_url):
 
 
 class _Slow:
-    """A live adapter whose fetch takes `seconds`, then answers as the fake Tiingo does."""
+    """A live adapter whose fetch waits for `release` (set at once: no wait), then answers as the fake Tiingo
+    does. `started` is set when a fetch begins, `closed` when the adapter is closed (the fetch has ended)."""
 
     source_code = "tiingo"
 
-    def __init__(self, seconds: float, done: list):
-        self._seconds, self._done = seconds, done
+    def __init__(self, release: threading.Event | None = None):
+        self.started, self.closed = threading.Event(), threading.Event()
+        self._release = release
         self._inner = fake_tiingo()
 
     def __getattr__(self, name):  # everything else as the fake Tiingo
         return getattr(self._inner, name)
 
     def fetch(self, *args, **kwargs):
-        time.sleep(self._seconds)
-        out = list(self._inner.fetch(*args, **kwargs))
-        self._done.append(True)
-        return iter(out)
+        self.started.set()
+        if self._release is not None:
+            assert self._release.wait(10), "the test never released the fetch"
+        return iter(list(self._inner.fetch(*args, **kwargs)))
 
     def close(self):
         self._inner.close()
+        self.closed.set()
+
+
+async def _wait(event: threading.Event):
+    assert await anyio.to_thread.run_sync(event.wait, 10), "the event never came"
+
+
+async def _call_when_free(client, **args):
+    """A call retried while the slot is still held by a fetch that has just ended (released after close)."""
+    for _ in range(200):
+        try:
+            return await _call(client, **args)
+        except ToolError as exc:
+            if not str(exc).startswith("[market_busy]"):
+                raise
+        await anyio.lowlevel.checkpoint()
+    raise AssertionError("the slot was never released")
 
 
 async def test_live_fetches_are_bounded_and_busy_is_answered_not_queued():
-    import anyio
+    release = threading.Event()
+    made: list[_Slow] = []
 
-    done: list = []
-    server = build_server(Settings(market_live_concurrency=1),
-                          market_adapter=lambda code: _Slow(1.5, done))
+    def factory(code, budget):
+        made.append(_Slow(release if not made else None))
+        return made[-1]
+
+    server = build_server(Settings(market_live_concurrency=1), market_adapter=factory)
     async with Client(server) as c:
         results: list = []
 
@@ -298,22 +327,30 @@ async def test_live_fetches_are_bounded_and_busy_is_answered_not_queued():
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(first)
-            await anyio.sleep(0.3)
+            await _wait_for_adapter(made)
+            await _wait(made[0].started)
             t0 = time.monotonic()
             with pytest.raises(ToolError, match=r"^\[market_busy\].*MOF_MARKET_LIVE_CONCURRENCY"):
                 await _call(c, instruments=["BBB"], mode="live")
             assert time.monotonic() - t0 < 1.0  # answered at once, not queued
+            release.set()
         assert results[0]["returned"] == 5
-        assert (await _call(c, instruments=["BBB"], mode="live"))["returned"] == 5  # the slot is free again
+        assert (await _call_when_free(c, instruments=["BBB"], mode="live"))["returned"] == 5  # the slot is free
+
+
+async def _wait_for_adapter(made: list):
+    with anyio.fail_after(10):
+        while not made:
+            await anyio.lowlevel.checkpoint()
 
 
 async def test_an_abandoned_live_fetch_keeps_its_slot_until_it_ends():
-    done: list = []
-    made: list = []
+    release = threading.Event()
+    made: list[_Slow] = []
 
-    def factory(code):  # the first fetch outlasts the budget, later ones are quick
-        made.append(code)
-        return _Slow(2.5 if len(made) == 1 else 0, done)
+    def factory(code, budget):  # the first fetch outlasts the budget (until released), later ones are quick
+        made.append(_Slow(release if not made else None))
+        return made[-1]
 
     server = build_server(Settings(market_live_concurrency=1, market_live_timeout_s=1), market_adapter=factory)
     async with Client(server) as c:
@@ -322,12 +359,208 @@ async def test_an_abandoned_live_fetch_keeps_its_slot_until_it_ends():
         # the abandoned thread still fetches with the key: no second fetch beside it
         with pytest.raises(ToolError, match=r"^\[market_busy\]"):
             await _call(c, instruments=["AAA"], mode="live")
-        import anyio
+        assert len(made) == 1  # the busy call built no adapter
+        release.set()
+        await _wait(made[0].closed)  # it finished its fetch: the quota is spent
+        out = await _call_when_free(c, instruments=["AAA"], mode="live")
+    assert out["returned"] == 5 and len(made) == 2
 
-        deadline = time.monotonic() + 5
-        while not done and time.monotonic() < deadline:
-            await anyio.sleep(0.05)
-        await anyio.sleep(0.1)  # its slot is released just after the fetch returns
-        assert done == [True]  # it finished its fetch: the quota is spent
-        out = await _call(c, instruments=["AAA"], mode="live")
-    assert out["returned"] == 5 and len(made) == 2  # the busy call built no adapter
+
+# --- several sources on one instrument: MOF_MARKET_PRECEDENCE ---------------------------------------
+def _overlap_server(tmp_path, port, **settings):
+    cfg = seed_market(tmp_path, overlap=True, conflict=settings.pop("conflict", False))
+    store = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    tokens = f"notebook:{hash_token(NOTEBOOK_TOKEN)}:read,agents:{hash_token(AGENTS_TOKEN)}:read"
+    allow = {"notebook": frozenset({"tiingo", "massive"})}
+    s = Settings(transport="http", port=port, tokens=tokens, market_restricted_allow=allow, **settings)
+    return store, build_server(s, companies_store=store, market_adapter=_factory())
+
+
+async def test_two_allowed_sources_on_one_instrument_follow_the_precedence(tmp_path):
+    port = free_port()
+    store, server = _overlap_server(tmp_path, port)
+    try:
+        with serve(server, port) as url:
+            async with Client(url, auth=NOTEBOOK_TOKEN) as c:
+                out = await _call(c, instruments=["AAA"], mode="store")
+                tr = await _call(c, instruments=["AAA"], mode="store", adjust="total_return")
+                one = await _call(c, instruments=["AAA"], mode="store", source="tiingo")
+    finally:
+        store.close()
+    # default private_history,massive,tiingo: massive wins where it has a price, tiingo elsewhere
+    by_day = {r["session_date"]: (r["source_code"], r["close"]) for r in out["rows"]}
+    assert len(out["rows"]) == 5 and {r["instrument_id"] for r in out["rows"]} == {I1}
+    assert [by_day[d.isoformat()] for d in DAYS] == [
+        ("tiingo", 100.0), ("tiingo", 101.0), *[("massive", c) for c in MASSIVE_CLOSES]]
+    assert [r["source_code"] for r in tr["rows"]] == ["tiingo", "tiingo", "massive", "massive", "massive"]
+    assert {r["source_code"] for r in one["rows"]} == {"tiingo"} and len(one["rows"]) == 5
+
+
+async def test_precedence_is_configurable_and_never_names_an_unreadable_source(tmp_path, monkeypatch):
+    from myopenfund_mcp.market import tools
+
+    seen: list = []
+    real = tools.api.prices
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("precedence"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tools.api, "prices", spy)
+    port = free_port()
+    store, server = _overlap_server(tmp_path, port, market_precedence=("tiingo", "massive"))
+    try:
+        with serve(server, port) as url:
+            async with Client(url, auth=NOTEBOOK_TOKEN) as c:
+                out = await _call(c, instruments=["AAA"], mode="store")
+            async with Client(url, auth=AGENTS_TOKEN) as c:
+                none = await _call(c, instruments=["AAA"], mode="store")
+    finally:
+        store.close()
+    assert {r["source_code"] for r in out["rows"]} == {"tiingo"} and len(out["rows"]) == 5
+    assert none["rows"] == []
+    notebook, agents = seen[0], seen[-1]
+    assert list(notebook[:2]) == ["tiingo", "massive"]  # the setting's order first
+    assert "private_history" not in notebook and "manual" not in notebook  # not allowed: never passed
+    assert not {"tiingo", "massive", "private_history", "manual"} & set(agents)
+
+
+async def test_conflicting_series_get_the_servers_own_message(tmp_path):
+    port = free_port()
+    store, server = _overlap_server(tmp_path, port, conflict=True)
+    try:
+        with serve(server, port) as url:
+            async with Client(url, auth=NOTEBOOK_TOKEN) as c:
+                with pytest.raises(ToolError, match=r"^\[invalid_argument\].*AAA.*pass source") as err:
+                    await _call(c, instruments=["AAA"], mode="store")
+    finally:
+        store.close()
+    assert "precedence" not in str(err.value) and "AAZ" not in str(err.value)
+
+
+# --- one store read per call ------------------------------------------------------------------------
+async def test_store_inputs_are_read_in_one_call(http_url, monkeypatch):
+    from myopenfund_mcp.market import tools
+
+    calls: list = []
+    real = tools.api.prices
+
+    def spy(instruments, *args, **kwargs):
+        calls.append((list(instruments), kwargs.get("adjust")))
+        return real(instruments, *args, **kwargs)
+
+    monkeypatch.setattr(tools.api, "prices", spy)
+    async with Client(http_url, auth=NOTEBOOK_TOKEN) as c:
+        raw = await _call(c, instruments=[PRIV_LABEL, "AAA"], mode="store")
+        n_raw = len(calls)
+        tr = await _call(c, instruments=[PRIV_LABEL, "AAA"], mode="auto", adjust="total_return")
+    assert n_raw == 1 and calls[0][0] == [PRIV_LABEL, "AAA"]
+    assert [a for _, a in calls[1:]] == ["total_return", "raw"]  # the raw read gives each session's provider
+    assert {r["instrument_id"] for r in raw["rows"]} == {I1, I2} and raw["returned"] == 10
+    assert {(r["instrument_id"], r["source_code"]) for r in tr["rows"]} == {(I1, "tiingo"), (I2, "private_history")}
+    assert tr["inputs"] == [{"input": PRIV_LABEL, "source": "store"}, {"input": "AAA", "source": "store"}]
+
+
+async def test_one_store_call_still_routes_each_input(http_url):
+    async with Client(http_url, auth=NOTEBOOK_TOKEN) as c:
+        out = await _call(c, instruments=["AAA", "BBB", FIGI1])
+    # AAA and its FIGI name one instrument (its rows once); BBB is not in the store: live
+    assert out["inputs"] == [{"input": "AAA", "source": "store"},
+                             {"input": "BBB", "source": "live", "reason": "not_in_store"},
+                             {"input": FIGI1, "source": "store"}]
+    assert sum(r["source"] == "store" for r in out["rows"]) == 5
+    assert {r["input"] for r in out["rows"] if r["source"] == "live"} == {"BBB"}
+
+
+# --- store-only names never reach a live source -----------------------------------------------------
+@pytest.mark.parametrize("label", [I2, f"private_history:{PRIV_TOKEN}", "tiingo:AAA"])
+async def test_live_refuses_store_only_names_before_any_request(label):
+    requests: list = []
+    async with _client(requests=requests) as c:
+        with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\]"):
+            await _call(c, instruments=["AAA", label], mode="live")
+        with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\]"):
+            await _call(c, instruments=[label])  # auto without a store
+    assert requests == []
+
+
+@pytest.mark.parametrize("mode", ["auto", "live"])
+async def test_a_private_label_is_never_sent_to_a_live_source(market_store, mode):
+    requests: list = []
+    async with _client(store=market_store, requests=requests) as c:
+        with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\]") as err:
+            await _call(c, instruments=["AAA", PRIV_LABEL], mode=mode)
+        with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\]"):
+            await _call(c, instruments=[PRIV_TOKEN], mode=mode)  # the private token typed as is
+        ok = await _call(c, instruments=["AAA"], mode=mode)  # an open label still goes live
+    assert requests and all(PRIV_LABEL not in str(r.url) and PRIV_TOKEN not in str(r.url) for r in requests)
+    assert len(requests) == 1 and ok["returned"] == 5
+    assert PRIV_TOKEN not in str(err.value)
+
+
+# --- live waits never outlast the call's budget -----------------------------------------------------
+def _budgeted_tiingo(tmp_path, requests: list, **kw):
+    def make(code, budget):
+        return fake_tiingo(requests, state_dir=tmp_path / "quota", sleep=budget.sleep,
+                           max_wait_s=budget.max_wait_s, **kw)
+    return make
+
+
+async def test_tiingo_hourly_budget_wait_is_limit_exceeded_not_a_sleep(tmp_path):
+    requests: list = []
+    server = build_server(Settings(market_live_timeout_s=30),
+                          market_adapter=_budgeted_tiingo(tmp_path, requests, per_hour=1))
+    async with Client(server) as c:
+        assert (await _call(c, instruments=["AAA"], mode="live"))["returned"] == 5
+        t0 = time.monotonic()
+        with pytest.raises(ToolError, match=r"^\[limit_exceeded\].*tiingo.*wait about (3[45][0-9]{2}|3600) s") as err:
+            await _call(c, instruments=["BBB"], mode="live")
+        assert time.monotonic() - t0 < 5  # refused at once, never slept
+    assert len(requests) == 1 and "MOF_MARKET_LIVE_TIMEOUT_S" in str(err.value)
+
+
+async def test_a_retry_wait_beyond_the_budget_is_limit_exceeded(tmp_path):
+    def answer(request):
+        return httpx.Response(429, headers={"Retry-After": "600"})
+
+    def make(code, budget):
+        from market_data.adapters.tiingo import TiingoAdapter
+
+        return TiingoAdapter(KEY, transport=httpx.MockTransport(answer), state_dir=None, min_spacing_s=0,
+                             sleep=budget.sleep, max_wait_s=budget.max_wait_s, now=lambda: NOW)
+
+    async with Client(build_server(Settings(market_live_timeout_s=30), market_adapter=make)) as c:
+        with pytest.raises(ToolError, match=r"^\[limit_exceeded\].*wait about 600 s"):
+            await _call(c, instruments=["AAA"], mode="live")
+
+
+def _fake_massive(status: int, requests: list):
+    from market_data.adapters.massive import MassiveAdapter
+
+    def answer(request):
+        requests.append(request)
+        return httpx.Response(status, json={"status": "NOT_AUTHORIZED", "request_id": "r"})
+
+    def make(code, budget):
+        assert code == "massive"
+        return MassiveAdapter(KEY, transport=httpx.MockTransport(answer), sleep=budget.sleep,
+                              max_wait_s=budget.max_wait_s, now=lambda: NOW)
+    return make
+
+
+async def test_massive_plan_window_and_403_get_their_own_codes():
+    requests: list = []
+    async with Client(build_server(Settings(), market_adapter=_fake_massive(403, requests))) as c:
+        with pytest.raises(ToolError, match=r"^\[invalid_argument\].*massive.*730 days") as old:
+            await _call(c, instruments=["AAA"], mode="live", source="massive", start="2001-01-02",
+                        end="2001-01-31")
+        assert requests == []  # refused before any request
+        with pytest.raises(ToolError, match=r"^\[limit_exceeded\].*massive.*HTTP 403.*plan"):
+            await _call(c, instruments=["AAA"], mode="live", source="massive")
+    assert "tiingo" in str(old.value)  # the deep free history
+
+
+async def test_massive_401_is_a_refused_key():
+    async with Client(build_server(Settings(), market_adapter=_fake_massive(401, []))) as c:
+        with pytest.raises(ToolError, match=r"^\[market_key_missing\].*massive.*MASSIVE_API_KEY"):
+            await _call(c, instruments=["AAA"], mode="live", source="massive")
