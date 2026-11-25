@@ -839,3 +839,65 @@ def test_no_period_start_reads_the_ttm_inputs_before_the_lookback(make, q4_rule,
     assert live == store
     live, store, _ = views(sec_ttm_lookback_m=0)  # the lookback's start alone does not give it
     assert live != store
+
+
+# --- a positions fetch that hits a transport failure fails the build -------------------------------
+class _PositionsDown(FakeSec):
+    """SEC answers everything but the files of one filing's folder, while ``down`` is set."""
+
+    def __init__(self, folder: str):
+        super().__init__()
+        self.folder, self.down = folder, True
+
+    def get_bytes(self, url, *, max_age_s=None):
+        if self.down and url.startswith(self.folder):
+            with self._lock:
+                self.calls.append((url, max_age_s))
+            raise SecUnavailable("503 after the retries")
+        return super().get_bytes(url, max_age_s=max_age_s)
+
+
+_MSFT_PERIOD = {"period_from": date(2024, 9, 1), "period_to": date(2024, 12, 31)}
+
+
+def test_a_positions_transport_failure_fails_the_build_and_is_not_memoised(make):
+    sec = _PositionsDown(_folder(MSFT, MSFT_K24))  # the donor's positions are unreachable
+    src = make(sec, sec_ttm_lookback_m=0)
+    with pytest.raises(SecUnavailable):
+        src.concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    entry = src._entries[MSFT]  # the tables are kept, the failed filing is not marked fetched
+    assert MSFT_K24 not in entry.fetched and entry.statements is None
+
+
+def test_the_positions_failure_is_remembered_for_the_failure_ttl(make, clock):
+    sec = _PositionsDown(_folder(MSFT, MSFT_K24))
+    src = make(sec, sec_ttm_lookback_m=0)
+    with pytest.raises(SecUnavailable):
+        src.concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    n = len(sec.calls)
+    clock.t += 30
+    for _ in range(2):
+        with pytest.raises(SecUnavailable):  # at once, no new request
+            src.concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    assert len(sec.calls) == n
+
+
+def test_after_the_failure_ttl_the_build_is_redone_and_complete(make, clock):
+    sec = _PositionsDown(_folder(MSFT, MSFT_K24))
+    src = make(sec, sec_ttm_lookback_m=0)
+    with pytest.raises(SecUnavailable):
+        src.concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    sec.down = False
+    clock.t += 61
+    result = src.concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    healthy = make(FakeSec(), sec_ttm_lookback_m=0).concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    assert _canon(result) == _canon(healthy)  # the full result, the donor's positions read
+    assert src._entries[MSFT].statements is not None and MSFT_K24 in src._entries[MSFT].fetched
+
+
+def test_a_filing_without_positions_files_stays_blind(make):
+    sec = FakeSec()  # the period's own filing (MSFT_Q25) has no FilingSummary: 404
+    rows, _ = make(sec, sec_ttm_lookback_m=0).concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    assert any(u.startswith(_folder(MSFT, MSFT_Q25)) for u in sec.urls())
+    q = [r for r in rows if r["concept"] == "revenue" and r["valid_date"] == date(2024, 9, 30)]
+    assert q[0]["location"] == "inferred"

@@ -33,9 +33,11 @@ for the rows, values, ratios and TTM of the period (``start`` onwards). Known li
 without positions whose donor lies deeper than the depth does not read the store's donor: it reads
 ``unknown`` where the store reads ``inferred``, or, when an older filing with positions is among
 those the call reads anyway (it filed a fact of the window, or is another filing's donor), borrows
-that older filing's positions instead of the store's donor's. A filing whose positions files could
-not be fetched (``SecUnavailable`` after the retries) counts as without positions until the
-issuer's tables are built again, as in ``issuer_tables``.
+that older filing's positions instead of the store's donor's. A filing that has no positions files
+(404, missing FilingSummary, malformed XML: ``filing_positions`` yields none) stays blind. A positions
+fetch that fails on the SEC transport (``SecUnavailable`` after the client's retries, a 429/5xx
+included) fails the build with that error, remembered for ``MOF_SEC_FAILURE_TTL_S`` like any build
+failure; nothing of the failed round is kept, and the next build after the TTL fetches it again.
 
 Errors: a 404 on the companyfacts file, or on the main submissions file (a CIK unknown to SEC) ->
 :class:`NoFacts` (remembered like tables; each caller gets its own instance); a 404 on any other
@@ -479,7 +481,7 @@ class LiveSource:
         from company_corpus.live.filings import list_filings
         from company_corpus.live.issuer import POSITIONS_FORMS
         from company_corpus.live.positions import filing_positions
-        from company_corpus.live.sec import SecNotFound, SecUnavailable
+        from company_corpus.live.sec import SecNotFound
         from company_corpus.opendata.statements import statement_rows
         from company_corpus.opendata.submissions import acceptance_times
 
@@ -493,7 +495,7 @@ class LiveSource:
             try:
                 with _data_faults():
                     found.extend(filing_positions(ref, counting))
-            except (SecUnavailable, SecNotFound):  # as issuer_tables: no positions of its own
+            except SecNotFound:  # no positions files: a blind filing (SecUnavailable propagates)
                 continue
         if found:
             found.sort(key=lambda r: (r["accn"], r["statement"], r["tag"]))  # issuer_tables' order
