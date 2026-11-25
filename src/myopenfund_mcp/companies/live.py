@@ -67,6 +67,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
 from ..config import Q4_RULES, Settings
+from ..errors import SEC_CONTACT_MISSING, SEC_REFUSED, SEC_UNAVAILABLE
 from .store import (
     StoreBadArgument,
     StoreUnknownDataset,
@@ -107,6 +108,23 @@ class LiveClosed(RuntimeError):
 
     def __init__(self):
         super().__init__("the live SEC source is closed")
+
+
+def sec_error_code(exc: BaseException) -> str | None:
+    """The tool error code of company-corpus's SEC errors (``SecContactMissing``, ``SecRefused``,
+    ``SecUnavailable``); None for any other exception, or without company-corpus."""
+    try:
+        from company_corpus.live.sec import SecContactMissing, SecRefused, SecUnavailable
+    except ImportError:
+        return None
+    for cls, code in (
+        (SecContactMissing, SEC_CONTACT_MISSING),
+        (SecRefused, SEC_REFUSED),
+        (SecUnavailable, SEC_UNAVAILABLE),
+    ):
+        if isinstance(exc, cls):
+            return code
+    return None
 
 
 @dataclass(frozen=True)
@@ -282,6 +300,7 @@ class LiveSource:
         # ImportError here = company-corpus's live extra or open-data-store missing
         import company_corpus.concepts.store_summaries  # noqa: F401
         from company_corpus.config import Config
+        from company_corpus.live.issuer import POSITIONS_FORMS
         from open_data_store.contracts.standard import FILING_STATEMENTS, FILINGS, FUNDAMENTALS
 
         if settings.companies_q4_rule not in Q4_RULES:
@@ -295,6 +314,10 @@ class LiveSource:
         # contact="" explicitly: the corpus Config would otherwise read COMPANY_CORPUS_CONTACT;
         # the row functions read only its store_* rules, and the SEC client carries the contact.
         self._config = Config(contact="")
+        #: the forms the producer lists in ``filings`` (8-K included) and those that carry statement
+        #: positions (``filing_statements``): what the source router compares with the store
+        self.report_forms: tuple[str, ...] = tuple(self._config.store_report_forms)
+        self.positions_forms: tuple[str, ...] = tuple(POSITIONS_FORMS)
         self._contracts = {FUNDAMENTALS.name: FUNDAMENTALS, FILINGS.name: FILINGS}
         self._contracts.update({c.table_name: c for c in (FUNDAMENTALS, FILINGS)})
         self._statements = FILING_STATEMENTS
@@ -782,9 +805,10 @@ class LiveSource:
         with _data_faults():
             return list_filings(archive, forms=forms, period_from=period_from, period_to=period_to)
 
-    def latest_filing(self, cik: str):
-        """The newest filing of any form (``FilingRef``), or None."""
-        found = self.filings(cik, forms=None, period_from=None, period_to=None)
+    def latest_filing(self, cik: str, *, forms: Collection[str] | None = None):
+        """The newest filing (``FilingRef``) of ``forms`` (None = any form; a ``/A`` form matches its
+        base form), or None."""
+        found = self.filings(cik, forms=forms, period_from=None, period_to=None)
         return found[0] if found else None
 
 

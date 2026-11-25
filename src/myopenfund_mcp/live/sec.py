@@ -19,6 +19,11 @@ class CachedSec:
         self._client = client
         self._cache = cache
 
+    @property
+    def cache(self) -> DiskCache:
+        """The disk cache in use (its folder and size are reported by server_info)."""
+        return self._cache
+
     def get_bytes(self, url: str, *, max_age_s: float | None = None) -> bytes:
         key = cache_key(url)
         hit = self._cache.get(key, max_age_s)

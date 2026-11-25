@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from functools import partial
 
 import anyio
@@ -23,6 +24,8 @@ MISSING_VAULT_EXTRA = ("MOF_VAULT_DATABASE_URL is set but the [vault] extra is n
                        "pip install 'myopenfund-mcp[vault]'")
 MISSING_COMPANIES_EXTRA = ("MOF_COMPANIES_CATALOG is set but the [companies] extra is not installed: "
                            "pip install 'myopenfund-mcp[companies]'")
+MISSING_LIVE_EXTRA = ("MOF_SEC_CONTACT is set but the [companies] extra is not installed: "
+                      "pip install 'myopenfund-mcp[companies]'")
 
 MISSING_RAG_EXTRA = ("MOF_RAG_QDRANT_HOST is set but the [rag] extra is not installed: "
                      "pip install 'myopenfund-mcp[rag]'")
@@ -38,7 +41,22 @@ INSTRUCTIONS = (
 )
 
 
-def build_server(settings: Settings, *, vault_reader=None, companies_store=None, rag_backend=None) -> FastMCP:
+def _cache_dir(settings: Settings, sec) -> str | None:
+    """The SEC cache folder: the opened one, else the configured one (None when off or not found)."""
+    if sec is not None:
+        return str(sec.cache.root)
+    if settings.cache == "off":
+        return None
+    try:
+        return settings.cache_path()
+    except ConfigError:
+        return None
+
+
+def build_server(settings: Settings, *, vault_reader=None, companies_store=None, companies_live=None,
+                 rag_backend=None) -> FastMCP:
+    """``companies_store`` / ``companies_live``: injected sources (tests); the server closes only the
+    ones it builds itself, at shutdown."""
     auth_enabled = settings.transport == "http"
     if auth_enabled and not settings.tokens:
         raise ConfigError(
@@ -47,8 +65,21 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
     auth = HashedTokenVerifier(parse_tokens(settings.tokens)) if auth_enabled else None
     # mask_error_details: an unexpected exception (driver error, DSN in a message) reaches the
     # client as a generic error; our ToolError / ResourceError keep their `[code] message`.
+    owned: list = []  # sources this server built: closed at shutdown
+
+    @asynccontextmanager
+    async def lifespan(_server):
+        try:
+            yield {}
+        finally:
+            for source in owned:
+                try:
+                    source.close()
+                except Exception as exc:  # noqa: BLE001 -- shutdown goes on; the class only is logged
+                    log.warning("shutdown: closing %s failed (%s)", type(source).__name__, type(exc).__name__)
+
     root = FastMCP("myopenfund", instructions=INSTRUCTIONS, version=__version__, auth=auth,
-                   middleware=[AuditMiddleware()], mask_error_details=True)
+                   middleware=[AuditMiddleware()], mask_error_details=True, lifespan=lifespan)
 
     if vault_reader is None and settings.vault_database_url:
         from .vault.reader import PostgresVaultReader
@@ -81,14 +112,39 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
             companies_store = None
         if companies_store is None:
             raise ConfigError(MISSING_COMPANIES_EXTRA)
-    if companies_store is not None:
+        owned.append(companies_store)
+    sec = None
+    if companies_live is None and settings.sec_contact and settings.companies_source != "store":
+        # MOF_COMPANIES_SOURCE=store never reads SEC: no live source (nor cache folder) then.
+        try:
+            from .companies.live import LiveSource
+            from .live.sec import build_sec
+        except ImportError:
+            companies_live = None
+        else:
+            sec = build_sec(settings)
+            try:
+                companies_live = LiveSource(sec, settings)
+            except ImportError:
+                companies_live = None
+        if companies_live is None:
+            raise ConfigError(MISSING_LIVE_EXTRA)
+        owned.append(companies_live)
+    if companies_store is not None or companies_live is not None:
         from .companies.common import dict_to_utc
         from .companies.datasets import build_datasets_toolset
+        from .companies.router import SourceRouter
         from .companies.tools import build_companies_toolset
 
-        root.mount(build_datasets_toolset(companies_store, settings, auth_enabled=auth_enabled),
-                   namespace="datasets")
-        root.mount(build_companies_toolset(companies_store, settings, auth_enabled=auth_enabled),
+        try:
+            router = SourceRouter(companies_store, companies_live, settings.companies_source,
+                                  route_ttl_s=settings.cache_ttl_submissions_h * 3600)
+        except ValueError as exc:  # a source the mode needs is missing (from_env refuses it earlier)
+            raise ConfigError(str(exc)) from None
+        if companies_store is not None:  # without a store, datasets_* are not mounted
+            root.mount(build_datasets_toolset(companies_store, settings, auth_enabled=auth_enabled),
+                       namespace="datasets")
+        root.mount(build_companies_toolset(router, settings, auth_enabled=auth_enabled),
                    namespace="companies")
 
     if rag_backend is None and settings.rag_qdrant_host:
@@ -122,7 +178,9 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
 
         root.mount(build_rag_toolset(rag_backend, settings, auth_enabled=auth_enabled), namespace="rag")
 
-    companies_status = "enabled" if companies_store is not None else "not configured"
+    companies_status = ("enabled" if companies_store is not None or companies_live is not None
+                        else "not configured")
+    datasets_status = "enabled" if companies_store is not None else "not configured"
 
     # Open to any authenticated caller (no tier check): it is how a client learns its tier.
     @root.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
@@ -136,14 +194,21 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
         `languages`: the exact values rag_search accepts for these filters, null while not known).
         With the company store: `companies_freshness` (last publication, UTC; batch count), or
         `companies_freshness_error` if the store cannot be read.
+        `companies_source` (auto, store or sec: where company data comes from), `sec_contact_configured`
+        (whether SEC can be reached; never the contact itself), `cache` (`dir`: the SEC cache folder,
+        `bytes`: its size, null while no cache is open).
         """
         info = {
             "version": __version__,
             "tier": caller_tier(get_access_token(), auth_enabled=auth_enabled),
             "toolsets": {"vault": "enabled" if vault_reader is not None else "not configured",
                          "rag": "enabled" if rag_backend is not None else "not configured",
-                         "companies": companies_status, "datasets": companies_status},
+                         "companies": companies_status, "datasets": datasets_status},
             "freshness": None,
+            "companies_source": settings.companies_source,
+            "sec_contact_configured": bool(settings.sec_contact),
+            "cache": {"dir": _cache_dir(settings, sec),
+                      "bytes": sec.cache.size() if sec is not None else None},
         }
         if rag_backend is not None:
             # The state recorded at start and by the last calls: no request to Qdrant from here.

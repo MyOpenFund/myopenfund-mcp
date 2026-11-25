@@ -139,10 +139,12 @@ async def test_fundamentals_concepts_and_metrics(store):
     assert rev["value"] == 391036000000 and rev["label"] == "Revenue" and rev["unit"] == "USD"
     assert rev["known_at"] == "2025-10-31T20:00:00+00:00"
     assert set(rev) == {"cik", "name", "period_end", "frequency", "kind", "key", "label", "value", "unit",
-                        "original_tag", "filing_ref", "source_doc_id", "known_at", "location", "conflict"}
+                        "original_tag", "filing_ref", "source_doc_id", "known_at", "location", "conflict",
+                        "source"}
     nm = next(r for r in res["rows"] if r["key"] == "net_margin")
     assert set(nm) == {"cik", "name", "period_end", "frequency", "kind", "key", "label", "value", "unit",
-                       "ttm", "sector_relevant"}
+                       "ttm", "sector_relevant", "source"}
+    assert rev["source"] == nm["source"] == "store" and "reason" not in rev  # no contact: store, unchecked
     assert nm["ttm"] is False and nm["unit"] == "%" and abs(nm["value"] - 23.97) < 0.01
     assert next(r for r in res["rows"] if r["key"] == "net_margin_ttm")["ttm"] is True
     # the dictionary version company-corpus 06c619d ships
@@ -429,3 +431,248 @@ async def test_fundamentals_have_no_nine_month_periods(store):
     async with _client(store) as c:
         with pytest.raises(ToolError):
             await c.call_tool("companies_fundamentals", {"companies": [AAPL], "frequency": "ytd9"})
+
+
+# --- source routing (fake store + fake live SEC source) -----------------------------------------
+
+SENTINEL = "sentinel-contact-7f3a@example.invalid"
+
+
+def _routed(store, live, **kw):
+    kw.setdefault("sec_contact", SENTINEL if live is not None else None)
+    return Client(build_server(Settings(**kw), companies_store=store, companies_live=live))
+
+
+async def _routed_call(store, live, tool, args, **kw):
+    async with _routed(store, live, **kw) as c:
+        return (await c.call_tool(tool, args)).data
+
+
+async def _routed_error(store, live, tool, args, **kw) -> str:
+    async with _routed(store, live, **kw) as c:
+        with pytest.raises(ToolError) as err:
+            await c.call_tool(tool, args)
+    return str(err.value)
+
+
+async def test_mixed_call_tags_rows_per_company():
+    from source_fakes import APPLE, MSFT, FakeLive, FakeStore
+
+    store, live = FakeStore(), FakeLive()
+    facts = await _routed_call(store, live, "companies_facts", {"companies": [APPLE, MSFT]})
+    fund = await _routed_call(store, live, "companies_fundamentals", {"companies": ["AAPL", "MSFT"]})
+    for res in (facts, fund):
+        by_cik = {r["cik"]: r for r in res["rows"]}
+        assert (by_cik[APPLE]["source"], by_cik[APPLE]["value"]) == ("store", 100)
+        assert "reason" not in by_cik[APPLE]
+        assert (by_cik[MSFT]["source"], by_cik[MSFT]["reason"], by_cik[MSFT]["value"]) == (
+            "sec_live", "not_in_store", 200)
+    assert live.calls.count("concept_rows") == 1  # Microsoft only: Apple came from the store
+
+
+async def test_sec_mode_rows_carry_no_reason_and_the_store_is_not_read():
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    store = FakeStore()
+    res = await _routed_call(store, FakeLive(), "companies_fundamentals", {"companies": [APPLE]},
+                             companies_source="sec")
+    assert [(r["source"], "reason" in r) for r in res["rows"]] == [("sec_live", False)]
+    assert store.calls == []
+
+
+async def test_auto_without_a_store_rows_say_no_store():
+    from source_fakes import FakeLive
+
+    res = await _routed_call(None, FakeLive(), "companies_facts", {"companies": ["MSFT"]})
+    assert [(r["source"], r["reason"]) for r in res["rows"]] == [("sec_live", "no_store")]
+
+
+async def test_a_store_failure_answers_live_with_store_unavailable():
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    store = FakeStore(fail={"read:fundamentals": RuntimeError("down")})
+    res = await _routed_call(store, FakeLive(), "companies_facts", {"companies": [APPLE]})
+    assert [(r["source"], r["reason"], r["value"]) for r in res["rows"]] == [
+        ("sec_live", "store_unavailable", 200)]
+
+
+async def test_without_a_store_datasets_are_not_mounted():
+    from source_fakes import FakeLive
+
+    async with _routed(None, FakeLive()) as c:
+        names = {t.name for t in await c.list_tools()}
+        info = (await c.call_tool("server_info", {})).data
+    assert "companies_fundamentals" in names and not any(n.startswith("datasets_") for n in names)
+    assert info["toolsets"]["companies"] == "enabled" and info["toolsets"]["datasets"] == "not configured"
+    assert "companies_freshness" not in info
+
+
+async def test_without_contact_and_store_the_companies_toolset_is_absent():
+    async with Client(build_server(Settings())) as c:
+        names = {t.name for t in await c.list_tools()}
+        info = (await c.call_tool("server_info", {})).data
+    assert not any(n.startswith(("companies_", "datasets_")) for n in names)
+    assert info["toolsets"]["companies"] == "not configured" and info["sec_contact_configured"] is False
+
+
+async def test_contact_missing_with_a_store_names_the_setting_and_store_companies_still_answer():
+    from source_fakes import APPLE, MSFT, FakeStore
+
+    store = FakeStore()
+    # without a contact the resolver is the store's: a company outside it is not even found
+    msg = await _routed_error(store, None, "companies_fundamentals", {"companies": [APPLE, MSFT]})
+    assert msg.startswith("[unknown_company]") and "MOF_SEC_CONTACT" in msg and MSFT in msg
+    ok = await _routed_call(store, None, "companies_fundamentals", {"companies": [APPLE]})
+    assert [r["source"] for r in ok["rows"]] == ["store"]
+
+
+async def test_warming_lists_progress_per_company_and_says_call_again():
+    from source_fakes import APPLE, MSFT, FakeLive
+
+    from myopenfund_mcp.companies.live import Warming
+
+    live = FakeLive(fail={"concept_rows:" + APPLE: Warming(3, 12), "concept_rows:" + MSFT: Warming(1, 9)})
+    msg = await _routed_error(None, live, "companies_fundamentals", {"companies": [APPLE, MSFT]})
+    assert msg.startswith("[warming]") and "call again" in msg
+    assert f"CIK {APPLE}): 3/12" in msg and f"CIK {MSFT}): 1/9" in msg
+
+
+async def test_warming_for_one_company_only_is_still_an_error():
+    from source_fakes import APPLE, MSFT, FakeLive
+
+    from myopenfund_mcp.companies.live import Warming
+
+    live = FakeLive(fail={"read:fundamentals:" + MSFT: Warming(2, 5)})
+    msg = await _routed_error(None, live, "companies_facts", {"companies": [APPLE, MSFT]})
+    assert msg.startswith("[warming]") and f"CIK {MSFT}): 2/5" in msg and APPLE not in msg
+
+
+async def test_a_definitive_error_wins_over_warming():
+    from source_fakes import APPLE, MSFT, FakeLive
+
+    from myopenfund_mcp.companies.live import NoFacts, Warming
+
+    live = FakeLive(fail={"concept_rows:" + APPLE: Warming(1, 2), "concept_rows:" + MSFT: NoFacts(MSFT)})
+    msg = await _routed_error(None, live, "companies_fundamentals", {"companies": [APPLE, MSFT]})
+    assert msg.startswith("[no_facts]") and MSFT in msg
+
+
+def _live_errors():
+    from company_corpus.live.sec import SecContactMissing, SecRefused, SecUnavailable
+
+    from myopenfund_mcp.companies.live import LiveClosed, LiveDataError, NoFacts
+
+    leak = f"contact {SENTINEL}"
+    return [(NoFacts("0000320193"), "no_facts"), (SecRefused(leak), "sec_refused"),
+            (SecUnavailable(leak), "sec_unavailable"), (SecContactMissing(leak), "sec_contact_missing"),
+            (LiveDataError(leak), "backend_unavailable"), (LiveClosed(), "backend_unavailable")]
+
+
+@pytest.mark.parametrize("index", range(6))
+@pytest.mark.parametrize("tool", ["companies_facts", "companies_fundamentals"])
+async def test_live_errors_are_coded_and_never_hold_the_contact(index, tool, caplog):
+    from source_fakes import APPLE, FakeLive
+
+    exc, code = _live_errors()[index]
+    method = "read:fundamentals" if tool == "companies_facts" else "concept_rows"
+    msg = await _routed_error(None, FakeLive(fail={method: exc}), tool, {"companies": [APPLE]})
+    assert msg.startswith(f"[{code}]")
+    if code.startswith("sec_contact"):
+        assert "MOF_SEC_CONTACT" in msg
+    assert SENTINEL not in msg and SENTINEL not in caplog.text
+
+
+async def test_results_and_server_info_never_hold_the_contact(caplog):
+    from source_fakes import FakeLive, FakeStore
+
+    async with _routed(FakeStore(), FakeLive()) as c:
+        texts = [str((await c.call_tool(name, args)).data) for name, args in (
+            ("server_info", {}), ("companies_resolve", {"query": "microsoft"}),
+            ("companies_facts", {"companies": ["AAPL", "MSFT"]}),
+            ("companies_fundamentals", {"companies": ["AAPL", "MSFT"], "metrics": "all"}))]
+    assert texts and all(SENTINEL not in t for t in texts) and SENTINEL not in caplog.text
+
+
+async def test_resolve_unions_store_and_live_companies():
+    from source_fakes import APPLE, MSFT, FakeLive, FakeStore
+
+    res = await _routed_call(FakeStore(), FakeLive(), "companies_resolve", {"query": "c"})  # Inc., CORP, CO
+    assert {c["cik"] for c in res["candidates"]} >= {APPLE, MSFT}
+
+
+async def test_server_info_reports_the_source_contact_and_cache(tmp_path):
+    from source_fakes import FakeLive
+
+    async with _routed(None, FakeLive(), cache_dir=str(tmp_path / "c"), companies_source="sec") as c:
+        info = (await c.call_tool("server_info", {})).data
+    assert info["companies_source"] == "sec" and info["sec_contact_configured"] is True
+    assert info["cache"] == {"dir": str(tmp_path / "c"), "bytes": None}  # injected source: no cache opened
+
+
+async def test_the_server_builds_the_live_source_and_closes_it_at_shutdown(tmp_path):
+    settings = Settings(sec_contact=SENTINEL, cache_dir=str(tmp_path / "c"))
+    server = build_server(settings)
+    async with Client(server) as c:
+        info = (await c.call_tool("server_info", {})).data
+        names = {t.name for t in await c.list_tools()}
+    assert info["cache"] == {"dir": str(tmp_path / "c"), "bytes": 0}
+    assert "companies_facts" in names and "datasets_list" not in names
+
+    from unittest import mock
+
+    from myopenfund_mcp.companies import live as live_mod
+
+    made = []
+
+    class Recording(live_mod.LiveSource):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+
+    with mock.patch.object(live_mod, "LiveSource", Recording):
+        server = build_server(settings)
+    async with Client(server):
+        assert made and not made[0]._closed.is_set()
+    assert made[0]._closed.is_set()
+
+
+def test_store_mode_builds_no_live_source(tmp_path, monkeypatch):
+    import myopenfund_mcp.companies.live as live_mod
+
+    monkeypatch.setattr(live_mod, "LiveSource", lambda *a, **kw: pytest.fail("built"))
+    build_server(Settings(sec_contact=SENTINEL, companies_source="store", companies_catalog="x",
+                          companies_data_root=str(tmp_path), cache_dir=str(tmp_path / "c")))
+    assert not (tmp_path / "c").exists()
+
+
+async def test_live_calls_get_the_sec_budget_on_top_of_the_store_budget():
+    from source_fakes import APPLE, FakeLive
+
+    live = FakeLive()
+    real = live.concept_rows
+
+    def slow(cik, as_of, **kw):
+        time.sleep(1.3)
+        return real(cik, as_of, **kw)
+
+    live.concept_rows = slow
+    res = await _routed_call(None, live, "companies_fundamentals", {"companies": [APPLE]},
+                             companies_query_timeout_s=1, sec_call_budget_s=2)
+    assert res["rows"]
+
+
+async def test_a_company_needing_sec_without_contact_is_sec_contact_missing():
+    """A company the resolver knows but the router must read live, with no live source (defensive:
+    the store resolver lists only store companies, so the tools reach this through a store listing a
+    CIK whose data the router sends to SEC)."""
+    from source_fakes import APPLE, FakeStore
+
+    from myopenfund_mcp.companies.common import store_call
+    from myopenfund_mcp.companies.router import SourceRouter
+
+    router = SourceRouter(FakeStore(ciks=()), None, "auto")
+    with pytest.raises(ToolError) as err:
+        await store_call(router.call, settings=Settings(), company=APPLE, method="concept_rows", cik=APPLE,
+                         as_of=parse_as_of(None))
+    msg = str(err.value)
+    assert msg.startswith("[sec_contact_missing]") and "MOF_SEC_CONTACT" in msg and APPLE in msg

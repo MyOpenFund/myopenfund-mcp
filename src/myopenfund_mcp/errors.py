@@ -18,6 +18,14 @@ UNKNOWN_COLUMN = "unknown_column"
 TOO_MANY_COMPANIES = "too_many_companies"
 RAG_UNAVAILABLE = "rag_unavailable"
 LIMIT_EXCEEDED = "limit_exceeded"
+SEC_CONTACT_MISSING = "sec_contact_missing"
+SEC_REFUSED = "sec_refused"
+SEC_UNAVAILABLE = "sec_unavailable"
+WARMING = "warming"
+NOT_FETCHED = "not_fetched"
+INDEX_NOT_READY = "index_not_ready"
+INDEX_UNAVAILABLE = "index_unavailable"
+NO_FACTS = "no_facts"
 
 
 def tool_error(code: str, message: str) -> ToolError:

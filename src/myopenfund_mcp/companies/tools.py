@@ -1,8 +1,11 @@
 """The `companies` toolset: identify companies, read their filed facts, concepts and ratios as of a date.
 
-Concepts and ratios come from company-corpus through the store adapter; nothing is computed here.
-Every argument is checked before the store is touched, and each call has ONE time budget
-(`companies_query_timeout_s`) shared by all its store reads.
+Concepts and ratios come from company-corpus through the store adapter or the live SEC source, chosen
+per company by the source router (`MOF_COMPANIES_SOURCE`); nothing is computed here. Every row says
+where it comes from (`source`, and `reason` when `auto` answered live). Every argument is checked
+before any source is touched, and each call has ONE time budget (`companies_query_timeout_s`, plus
+`sec_call_budget_s` when SEC may be reached) shared by all its reads; the companies of a call are
+read concurrently.
 """
 from __future__ import annotations
 
@@ -10,7 +13,9 @@ import datetime as dt
 from functools import cache
 from typing import Annotated, Literal, get_args
 
+import anyio
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from ..auth import tier_check
@@ -22,11 +27,22 @@ from ..errors import (
     UNKNOWN_COMPANY,
     UNKNOWN_CONCEPT,
     UNKNOWN_METRIC,
+    WARMING,
     tool_error,
 )
 from ..paging import MAX_OFFSET, cap_result, clamp_limit, decode_cursor, encode_cursor
 from . import resolve as res
-from .common import AS_OF_DESCRIPTION, READ_ONLY, parse_as_of, rows_to_utc, store_call, time_budget
+from .common import (
+    AS_OF_DESCRIPTION,
+    READ_ONLY,
+    WarmingError,
+    call_budget_s,
+    parse_as_of,
+    rows_to_utc,
+    store_call,
+    time_budget,
+)
+from .router import Route, SourceRouter
 
 Frequency = Literal["annual", "semiannual", "quarterly", "instant"]
 #: as filed in the store; ytd9 = the 9-month year-to-date, which only derives an unreported Q4
@@ -59,15 +75,57 @@ def _newest_first(day: dt.date) -> int:
     return -day.toordinal()
 
 
-def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) -> FastMCP:
+def _origin(route: Route) -> dict:
+    """The row fields saying where a company's rows come from."""
+    return {"source": route.source, **({"reason": route.reason} if route.reason else {})}
+
+
+async def _per_company(hits: list[dict], fn) -> list:
+    """``fn(hit)`` for every company at once, results in the order of ``hits``. All or error: the first
+    company (in that order) that failed otherwise decides the error; else, when some are still being
+    fetched from SEC, one ``[warming]`` lists each of them with its progress."""
+    results: list = [None] * len(hits)
+    errors: list[ToolError | None] = [None] * len(hits)
+
+    async def run(i: int, hit: dict) -> None:
+        try:
+            results[i] = await fn(hit)
+        except ToolError as exc:
+            errors[i] = exc
+
+    async with anyio.create_task_group() as tg:
+        for i, hit in enumerate(hits):
+            tg.start_soon(run, i, hit)
+    failed = next((e for e in errors if e is not None and not isinstance(e, WarmingError)), None)
+    if failed is not None:
+        raise failed
+    warming = [(h, e) for h, e in zip(hits, errors, strict=True) if isinstance(e, WarmingError)]
+    if warming:
+        progress = "; ".join(f"{h['current_name'] or h['cik']} (CIK {h['cik']}): {e.done}/{e.total} requests "
+                             "done" for h, e in warming)
+        raise tool_error(WARMING, f"still fetching from SEC: {progress}; the fetch goes on in the "
+                                  "background: call again in a few seconds")
+    return results
+
+
+def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_enabled: bool) -> FastMCP:
     co = FastMCP("companies", mask_error_details=True)
     read = tier_check("read", auth_enabled=auth_enabled)
+    budget_s = call_budget_s(settings, live=router.live_enabled)
+
+    # auto with a store and no contact: a company outside the store needs SEC, which is not configured
+    unknown_hint = ("not in the company store, and companies outside it are read from SEC, which needs "
+                    "MOF_SEC_CONTACT (sec_contact_missing); or try companies_resolve"
+                    if router.mode == "auto" and router.live is None else "try companies_resolve")
+
+    async def call(fn, /, **kwargs):
+        return await store_call(fn, settings=settings, timeout_s=budget_s, **kwargs)
 
     @cache
     def catalogs() -> tuple[dict[str, str], frozenset[str]]:
         """Concept labels by key and metric keys: company-corpus's dictionary, read once."""
-        return ({c["key"]: c["label"] for c in store.concept_catalog()},
-                frozenset(m["key"] for m in store.metric_catalog()))
+        return ({c["key"]: c["label"] for c in router.concept_catalog()},
+                frozenset(m["key"] for m in router.metric_catalog()))
 
     def check(companies, period_from, period_to, limit, cursor) -> tuple[int, int]:
         """Arguments every multi-company tool shares, checked before any store work: (page, offset)."""
@@ -85,12 +143,12 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
 
     async def lookup(companies: list[str]) -> list[dict]:
         """One entity per distinct company (in the order given); unknown or ambiguous is an error."""
-        idx = res.index(await store_call(store.entities, settings=settings))
+        idx = res.index(await call(router.entities))
         out: dict[str, dict] = {}
         for q in companies:
             hits = res.resolve(idx, q)
             if not hits:
-                raise tool_error(UNKNOWN_COMPANY, f"no company matches {q!r}; try companies_resolve")
+                raise tool_error(UNKNOWN_COMPANY, f"no company matches {q!r}; {unknown_hint}")
             if len(hits) > 1:
                 names = ", ".join(f"{h['current_name']} (CIK {h['cik']})" for h in hits[:10])
                 more = f" and {len(hits) - 10} more" if len(hits) > 10 else ""
@@ -109,8 +167,8 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
         when you only have a name; several candidates = ambiguous: pick one by CIK. `names` lists
         former names oldest first with the date each was first seen (`since`)."""
         page = clamp_limit(limit, settings)
-        with time_budget(settings):
-            idx = res.index(await store_call(store.entities, settings=settings))
+        with time_budget(settings, budget_s):
+            idx = res.index(await call(router.entities))
         hits = res.resolve(idx, query)
         return cap_result({"candidates": hits[:page], "total": len(hits)}, settings,
                           hint="ask for a smaller limit or a more precise query")
@@ -133,22 +191,29 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
         For standard items (revenue, net income, debt...) and ratios prefer companies_fundamentals.
         With only a name, call companies_resolve first. Raw: `frequency` filters the filed column
         as is (no balance-sheet values added to a period). Rows: newest period first per company;
-        `valid_date` is the period end; datetimes are UTC."""
+        `valid_date` is the period end; datetimes are UTC; `source` says where a company's rows
+        come from (store or sec_live), `reason` why SEC answered when the store could have.
+        `[warming]` = still fetching from SEC: call again."""
         page, offset = check(companies, period_from, period_to, limit, cursor)
         when = parse_as_of(as_of)
-        with time_budget(settings):
+        flt: dict = {"entity_scheme": ["cik"]}
+        if tags:
+            flt["original_tag"] = tags
+        if frequency:
+            flt["frequency"] = [frequency]
+
+        async def one(h):
+            return await call(router.call, company=h["cik"], method="read", dataset="fundamentals",
+                              as_of=when, filters={**flt, "entity_value": [h["cik"]]}, columns=None,
+                              limit=None)
+
+        with time_budget(settings, budget_s):
             hits = await lookup(companies)
-            names = {h["cik"]: h["current_name"] for h in hits}
-            flt: dict = {"entity_scheme": ["cik"], "entity_value": list(names)}
-            if tags:
-                flt["original_tag"] = tags
-            if frequency:
-                flt["frequency"] = [frequency]
-            found = await store_call(store.read, settings=settings, dataset="fundamentals", as_of=when,
-                                     filters=flt, columns=None, limit=None)
-        rows = [{"cik": r["entity_value"], "name": names[r["entity_value"]],
-                 **{k: v for k, v in r.items() if k != "batch_id"}}
-                for r in found if _in_range(r["valid_date"], period_from, period_to)]
+            found = await _per_company(hits, one)
+        rows = [{"cik": h["cik"], "name": h["current_name"],
+                 **{k: v for k, v in r.items() if k != "batch_id"}, **_origin(route)}
+                for h, (route, part) in zip(hits, found, strict=True)
+                for r in part if _in_range(r["valid_date"], period_from, period_to)]
         rows.sort(key=lambda r: (r["cik"], _newest_first(r["valid_date"]), r["original_tag"], r["frequency"]))
         chunk, nxt = page_of(rows, page, offset)
         return cap_result({"as_of": when.isoformat(), "returned": len(chunk), "total": len(rows),
@@ -180,7 +245,9 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
         ends, the ones the ratios use. Call companies_resolve first
         if you only have a name. Banks and insurers: the sector is unknown to the store, so judge
         debt and margin ratios accordingly. Rows: newest period first per company, concepts before
-        metrics; datetimes are UTC."""
+        metrics; datetimes are UTC; `source` says where a company's rows come from (store or
+        sec_live), `reason` why SEC answered when the store could have. `[warming]` = still fetching
+        from SEC: call again."""
         concept_labels, metric_keys = catalogs()
         bad = sorted(set(concepts or []) - set(concept_labels))
         if bad:
@@ -205,11 +272,22 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
                 return r["valid_date"] in period_ends
             return keep(r["valid_date"], r["frequency"])
 
+        async def one(h):
+            route, (sel, vintages) = await call(router.call, company=h["cik"], method="concept_rows",
+                                                cik=h["cik"], as_of=when, period_from=period_from,
+                                                period_to=period_to)
+            summaries = []
+            if wanted and sel:
+                summaries = await call(router.source(route).summaries, cik=h["cik"], name=h["current_name"],
+                                       rows=sel, vintages=vintages)
+            return route, sel, summaries
+
         rows, version = [], None
-        with time_budget(settings):
-            for h in await lookup(companies):
-                cik, name = h["cik"], h["current_name"]
-                sel, vintages = await store_call(store.concept_rows, settings=settings, cik=cik, as_of=when)
+        with time_budget(settings, budget_s):
+            hits = await lookup(companies)
+            found = await _per_company(hits, one)
+            for h, (route, sel, summaries) in zip(hits, found, strict=True):
+                cik, name, origin = h["cik"], h["current_name"], _origin(route)
                 # ends of this company's included duration periods (any concept, before the concept filter)
                 period_ends = {r["valid_date"] for r in sel if keep(r["valid_date"], r["frequency"])}
                 for r in sel:
@@ -222,11 +300,7 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
                                  "unit": r["unit"], "original_tag": r["original_tag"],
                                  "filing_ref": r["filing_ref"], "source_doc_id": r["source_doc_id"],
                                  "known_at": r["known_at"], "location": r["location"],
-                                 "conflict": r["conflict"]})
-                if not (wanted and sel):
-                    continue
-                summaries = await store_call(store.summaries, settings=settings, cik=cik, name=name,
-                                             rows=sel, vintages=vintages)
+                                 "conflict": r["conflict"], **origin})
                 for s in summaries:
                     freq = _SUMMARY_FREQUENCY.get(s.frequency, s.frequency)
                     if s.period_end is None or not keep(s.period_end, freq):
@@ -238,7 +312,7 @@ def build_companies_toolset(store, settings: Settings, *, auth_enabled: bool) ->
                                              "frequency": freq, "kind": "metric", "key": key,
                                              "label": m.get("label"), "value": m["value"],
                                              "unit": m.get("unit"), "ttm": is_ttm,
-                                             "sector_relevant": m.get("sector_relevant")})
+                                             "sector_relevant": m.get("sector_relevant"), **origin})
         rows.sort(key=lambda r: (r["cik"], _newest_first(r["period_end"]), r["frequency"],
                                  r["kind"] != "concept", r["key"]))
         chunk, nxt = page_of(rows, page, offset)

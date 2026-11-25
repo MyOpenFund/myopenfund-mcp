@@ -665,7 +665,9 @@ def test_latest_filing_and_filings_read_the_submissions_only(make):
     sec = FakeSec()
     src = make(sec)
     assert src.latest_filing(AAPL).accession == AAPL_E24
-    tenk = src.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
+    assert src.latest_filing(AAPL, forms=src.report_forms).accession == AAPL_E24  # an 8-K is a report form
+    assert src.latest_filing(AAPL, forms=src.positions_forms).accession == AAPL_K24
+    tenk =src.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
     assert [f.accession for f in tenk] == [AAPL_K24, AAPL_K23]
     dated = src.filings(AAPL, forms=None, period_from=date(2024, 1, 1), period_to=date(2024, 7, 1))
     assert [f.accession for f in dated] == [AAPL_Q24]
