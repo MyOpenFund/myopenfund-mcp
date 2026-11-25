@@ -241,14 +241,16 @@ class Settings:
     sec_retries: int = 4  # MOF_SEC_RETRIES: retries of a failed request (0 = none)
     sec_call_budget_s: int = 50  # MOF_SEC_CALL_BUDGET_S: time budget of one tool call that fetches from SEC
     # MOF_SEC_POSITIONS_LOOKBACK_Y: years before now whose filings get statement positions when a call
-    # names no period start (positions cost three requests per filing)
+    # names no period start (positions cost three requests per filing); MOF_SEC_TTM_LOOKBACK_M moves
+    # that start further back, as it does a call's period_from
     sec_positions_lookback_y: int = 5
     # MOF_SEC_MEMO_COMPANIES: companies whose live tables are kept in memory (the oldest built is dropped)
     sec_memo_companies: int = 50
     # MOF_SEC_POSITIONS_DONOR_DEPTH: earlier report filings looked through for the positions a filing
     # without its own borrows, as the store's selection does (0 = none)
     sec_positions_donor_depth: int = 4
-    # MOF_SEC_TTM_LOOKBACK_M: months before period_from whose facts' filings also get positions, so the
+    # MOF_SEC_TTM_LOOKBACK_M: months before the period's start (period_from, or the start the lookback
+    # above gives a call without one) whose facts' filings also get positions, so the
     # period's TTM and ratios read the store's values. 20 covers both Q4 rules: a quarterly TTM spans
     # four quarter ends up to 300 days back; its earliest quarter, when derived, reads a 9-month YTD up
     # to 100 days earlier (ytd9: < 400 days, 14 months) or three quarters up to 300 days earlier

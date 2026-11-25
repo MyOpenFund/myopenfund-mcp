@@ -3,8 +3,8 @@
 Shapes follow company-corpus's ``tests/opendata/factories.py`` (small helpers copied, not
 imported). Microsoft's FY2024 10-K serves its recorded positions files (index.json,
 FilingSummary.xml, presentation linkbase, copied from company-corpus's A6 fixtures), so its
-selection reads real statement positions; every other filing folder answers 404 (positions
-borrowed). Adversarial on purpose: Apple's FY2023 revenue is re-reported by the FY2024 10-K (two
+selection reads real statement positions, and so do its three FY2024 10-Qs (the same files); every
+other filing folder answers 404 (positions borrowed). Adversarial on purpose: Apple's FY2023 revenue is re-reported by the FY2024 10-K (two
 vintages of one key), Apple has a former name, an 8-K is the newest filing, and an unknown CIK
 has no companyfacts.
 """
@@ -32,13 +32,24 @@ AAPL_K24, AAPL_Q24, AAPL_K23, AAPL_E24 = (
 MSFT_K24, MSFT_K23 = "0000950170-24-087843", "0000950170-23-035122"
 #: Microsoft's Q1 FY2025 10-Q: its folder answers 404, so it borrows the FY2024 10-K's positions
 MSFT_Q25 = "0000950170-24-118967"
-#: Microsoft's Q2 and Q3 FY2024 10-Qs. Q3 files revenue under two tags with different values (the
-#: dictionary's first, Revenues, is not on its statement); its folder serves the FY2024 10-K's
-#: recorded positions files, which put RevenueFromContract... on the income statement, so the
-#: selection picks that tag only with Q3's positions. Q3 feeds the TTM of Q1 FY2025 (2024-09-30):
-#: a call on that quarter must read Q3's positions to give the store's TTM. Q2's folder is 404.
-MSFT_Q24_2, MSFT_Q24_3 = "0000950170-24-008814", "0000950170-24-048288"
+#: Microsoft's Q1, Q2 and Q3 FY2024 10-Qs. Q1 and Q3 file revenue under two tags with different
+#: values (the dictionary's first, Revenues, is not on their statement; Q3 does so for its quarter
+#: and for its 9-month YTD); their folders serve the FY2024 10-K's recorded positions files, which
+#: put RevenueFromContract... on the income statement, so the selection picks that tag only with
+#: the filing's own positions. Q3 feeds the TTM of Q1 FY2025 (2024-09-30) and, by its YTD, the
+#: fourth quarter the ``ytd9`` rule derives; Q1 feeds the fourth quarter ``sum_of_quarters`` derives
+#: (FY - Q1 - Q2 - Q3), read by the TTM up to Q3 FY2025, 18 months after Q1's end. Q2 has its own
+#: positions too (one revenue tag), so Q1 is nobody's borrow donor: it is read only for its facts.
+MSFT_Q24_1, MSFT_Q24_2, MSFT_Q24_3 = (
+    "0000950170-23-054855",
+    "0000950170-24-008814",
+    "0000950170-24-048288",
+)
 MSFT_Q3_REVENUE, MSFT_Q3_OTHER_REVENUES = 61858000000, 61000000000
+MSFT_Q1_REVENUE, MSFT_Q1_OTHER_REVENUES = 56517000000, 56000000000
+MSFT_YTD9_REVENUE, MSFT_YTD9_OTHER_REVENUES = 180395000000, 179000000000
+#: Microsoft's Q2 and Q3 FY2025 10-Qs (folders 404: they borrow the FY2024 10-K's positions)
+MSFT_Q25_2, MSFT_Q25_3 = "0000950170-25-010491", "0000950170-25-061046"
 
 AAPL_FILINGS = [  # (accession, acceptance, form, filingDate, reportDate), newest first
     (AAPL_E24, "2024-11-05T21:00:00.000Z", "8-K", "2024-11-05", "2024-10-31"),
@@ -47,10 +58,13 @@ AAPL_FILINGS = [  # (accession, acceptance, form, filingDate, reportDate), newes
     (AAPL_K23, "2023-11-03T20:00:00.000Z", "10-K", "2023-11-03", "2023-09-30"),
 ]
 MSFT_FILINGS = [
+    (MSFT_Q25_3, "2025-04-30T20:05:00.000Z", "10-Q", "2025-04-30", "2025-03-31"),
+    (MSFT_Q25_2, "2025-01-29T21:05:00.000Z", "10-Q", "2025-01-29", "2024-12-31"),
     (MSFT_Q25, "2024-10-30T20:05:00.000Z", "10-Q", "2024-10-30", "2024-09-30"),
     (MSFT_K24, "2024-07-30T20:06:22.000Z", "10-K", "2024-07-30", "2024-06-30"),
     (MSFT_Q24_3, "2024-04-25T20:05:00.000Z", "10-Q", "2024-04-25", "2024-03-31"),
     (MSFT_Q24_2, "2024-01-30T21:05:00.000Z", "10-Q", "2024-01-30", "2023-12-31"),
+    (MSFT_Q24_1, "2023-10-24T20:05:00.000Z", "10-Q", "2023-10-24", "2023-09-30"),
     (MSFT_K23, "2023-07-27T20:00:00.000Z", "10-K", "2023-07-27", "2023-06-30"),
 ]
 AAPL_FORMER = [("APPLE COMPUTER INC", "1994-01-26", "2007-01-04")]
@@ -172,6 +186,36 @@ def _msft_facts() -> dict:
             "NetIncomeLoss": {
                 "USD": [
                     point(
+                        22291000000,
+                        "2023-09-30",
+                        start="2023-07-01",
+                        accn=MSFT_Q24_1,
+                        form="10-Q",
+                        filed="2023-10-24",
+                        fy=2024,
+                        fp="Q1",
+                    ),
+                    point(
+                        24108000000,
+                        "2024-12-31",
+                        start="2024-10-01",
+                        accn=MSFT_Q25_2,
+                        form="10-Q",
+                        filed="2025-01-29",
+                        fy=2025,
+                        fp="Q2",
+                    ),
+                    point(
+                        25824000000,
+                        "2025-03-31",
+                        start="2025-01-01",
+                        accn=MSFT_Q25_3,
+                        form="10-Q",
+                        filed="2025-04-30",
+                        fy=2025,
+                        fp="Q3",
+                    ),
+                    point(
                         21870000000,
                         "2023-12-31",
                         start="2023-10-01",
@@ -226,6 +270,26 @@ def _msft_facts() -> dict:
             "Revenues": {
                 "USD": [
                     point(
+                        MSFT_Q1_OTHER_REVENUES,
+                        "2023-09-30",
+                        start="2023-07-01",
+                        accn=MSFT_Q24_1,
+                        form="10-Q",
+                        filed="2023-10-24",
+                        fy=2024,
+                        fp="Q1",
+                    ),
+                    point(
+                        MSFT_YTD9_OTHER_REVENUES,
+                        "2024-03-31",
+                        start="2023-07-01",
+                        accn=MSFT_Q24_3,
+                        form="10-Q",
+                        filed="2024-04-25",
+                        fy=2024,
+                        fp="Q3",
+                    ),
+                    point(
                         MSFT_Q3_OTHER_REVENUES,
                         "2024-03-31",
                         start="2024-01-01",
@@ -239,6 +303,36 @@ def _msft_facts() -> dict:
             REV: {
                 "USD": [
                     point(
+                        MSFT_Q1_REVENUE,
+                        "2023-09-30",
+                        start="2023-07-01",
+                        accn=MSFT_Q24_1,
+                        form="10-Q",
+                        filed="2023-10-24",
+                        fy=2024,
+                        fp="Q1",
+                    ),
+                    point(
+                        69632000000,
+                        "2024-12-31",
+                        start="2024-10-01",
+                        accn=MSFT_Q25_2,
+                        form="10-Q",
+                        filed="2025-01-29",
+                        fy=2025,
+                        fp="Q2",
+                    ),
+                    point(
+                        70066000000,
+                        "2025-03-31",
+                        start="2025-01-01",
+                        accn=MSFT_Q25_3,
+                        form="10-Q",
+                        filed="2025-04-30",
+                        fy=2025,
+                        fp="Q3",
+                    ),
+                    point(
                         MSFT_Q3_REVENUE,
                         "2024-03-31",
                         start="2024-01-01",
@@ -248,7 +342,7 @@ def _msft_facts() -> dict:
                         fp="Q3",
                     ),
                     point(  # 9-month YTD: derives Q4 FY2024 (ytd9 rule)
-                        180395000000,
+                        MSFT_YTD9_REVENUE,
                         "2024-03-31",
                         start="2023-07-01",
                         accn=MSFT_Q24_3,
@@ -338,7 +432,8 @@ def routes() -> dict[str, bytes]:
             )
         ).encode(),
     }
-    for accn in (MSFT_K24, MSFT_Q24_3):  # Q3 serves the 10-K's recorded files (see above)
+    # the FY2024 10-Qs serve the 10-K's recorded files (see above)
+    for accn in (MSFT_K24, MSFT_Q24_1, MSFT_Q24_2, MSFT_Q24_3):
         folder = ARCHIVES.format(cik_int=int(MSFT), acc_nodash=accn.replace("-", ""))
         for f in (FIXTURES / MSFT / MSFT_K24).iterdir():
             out[f"{folder}/{f.name}"] = f.read_bytes()

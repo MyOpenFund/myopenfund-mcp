@@ -21,9 +21,14 @@ from live_fixture import (
     MSFT,
     MSFT_K23,
     MSFT_K24,
+    MSFT_Q1_OTHER_REVENUES,
     MSFT_Q3_REVENUE,
+    MSFT_Q24_1,
+    MSFT_Q24_3,
     MSFT_Q25,
     MSFT_REVENUE_FY2024,
+    MSFT_YTD9_OTHER_REVENUES,
+    MSFT_YTD9_REVENUE,
     NOFACTS,
     REV,
     TICKERS_URL,
@@ -31,7 +36,7 @@ from live_fixture import (
 )
 
 from myopenfund_mcp.companies import resolve
-from myopenfund_mcp.companies.live import LiveClosed, LiveDataError, LiveSource, NoFacts, Warming
+from myopenfund_mcp.companies.live import LiveClosed, LiveDataError, LiveSource, NoFacts, Warming, _own
 from myopenfund_mcp.companies.store import StoreBadArgument, StoreUnknownDataset
 from myopenfund_mcp.config import Settings
 
@@ -61,8 +66,8 @@ def clock():
 def make(clock):
     made = []
 
-    def _make(sec=None, **kw):
-        src = LiveSource(sec or FakeSec(), _settings(**kw), clock=clock, now=lambda: NOW)
+    def _make(sec=None, *, now=NOW, **kw):
+        src = LiveSource(sec or FakeSec(), _settings(**kw), clock=clock, now=lambda: now)
         made.append(src)
         return src
 
@@ -252,8 +257,30 @@ def test_apple_period_walks_to_the_donor_depth(make):
 
 def test_default_window_is_the_lookback(make):
     sec = FakeSec()
-    make(sec, sec_positions_lookback_y=2).concept_rows(AAPL, LATER)  # 2024-11-25 onwards
+    # facts from 2024-11-25 onwards: none
+    make(sec, sec_positions_lookback_y=2, sec_ttm_lookback_m=0).concept_rows(AAPL, LATER)
     assert not any("/Archives/" in u for u in sec.urls())
+    sec = FakeSec()  # R25: the TTM months also widen the lookback's start (2023-03-25 onwards)
+    make(sec, sec_positions_lookback_y=2).concept_rows(AAPL, LATER)
+    assert any(u.startswith(_folder(AAPL, AAPL_K24)) for u in sec.urls())
+
+
+def test_positions_rounds_fetch_the_wanted_filings_and_nothing_again(make):
+    """Each positions round asks SEC for the wanted filings' folders only: the facts and the
+    submissions are read once, whatever the number of rounds and of later, wider calls."""
+    sec = FakeSec()
+    src = make(sec, sec_ttm_lookback_m=0)
+    src.concept_rows(MSFT, LATER, period_from=date(2024, 9, 1), period_to=date(2024, 9, 30))
+    first = sec.urls()
+    assert {u.rsplit("/", 1)[0] for u in first if "/Archives/" in u} == {
+        _folder(MSFT, MSFT_Q25),  # round 1: the period's filing (404)
+        _folder(MSFT, MSFT_K24),  # round 2: its donor
+    }
+    src.concept_rows(MSFT, LATER)  # every other filing of the lookback
+    urls = sec.urls()
+    assert len(urls) == len(set(urls))  # nothing asked twice: no folder, no facts, no submissions
+    assert urls.count(COMPANYFACTS_URL.format(cik=MSFT)) == 1
+    assert sum("/submissions/" in u for u in urls) == 1
 
 
 def test_slow_sec_answers_warming_then_serves(make):
@@ -337,7 +364,7 @@ def _all_positions(cik, as_of):
 
 def _period(src, period_from, period_to):
     """The caller's period (the fact window of positions is wider)."""
-    return (period_from, period_to) if period_from else (src._window(None, period_to).start, period_to)
+    return (src._period_start(period_from, period_to), period_to)
 
 
 def _in(period, day):
@@ -440,6 +467,66 @@ def test_close_stops_a_running_build(make):
     ):
         with pytest.raises(LiveClosed):
             call()
+
+
+def test_close_answers_live_closed_to_a_caller_waiting_on_the_build(make):
+    sec = FakeSec(hold="companyfacts")
+    src = make(sec)  # budget 5 s: the caller is still waiting when the source closes
+    got = []
+
+    def call():
+        try:
+            got.append(src.concept_rows(AAPL, LATER))
+        except BaseException as exc:  # noqa: BLE001
+            got.append(exc)
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    _until(lambda: len(sec.urls()) == 1)  # submissions read, the build is held on companyfacts
+    src.close()
+    sec.gate.set()
+    thread.join(10)
+    assert len(got) == 1 and type(got[0]) is LiveClosed
+    assert str(got[0]) == "the live SEC source is closed"
+
+
+def test_a_failure_whose_class_cannot_be_copied_reaches_every_caller(make):
+    class Odd(SecUnavailable):
+        def __init__(self, host, status):
+            super().__init__(f"{host} answered {status}")
+
+    class Failing(FakeSec):
+        def get_bytes(self, url, *, max_age_s=None):
+            if "companyfacts" in url:
+                raise Odd("data.sec.gov", 503)
+            return super().get_bytes(url, max_age_s=max_age_s)
+
+    src = make(Failing())
+    for _ in range(2):  # the caller that waited on the build, then one served the remembered failure
+        with pytest.raises(Odd, match="answered 503"):
+            src.concept_rows(AAPL, LATER)
+
+
+def test_each_caller_gets_its_own_copy_of_a_failure_with_its_cause(make):
+    sec = FakeSec()
+    sec.routes[COMPANYFACTS_URL.format(cik=AAPL)] = b"{not json"
+    src = make(sec)
+    seen = []
+    for _ in range(2):
+        with pytest.raises(LiveDataError) as info:
+            src.concept_rows(AAPL, LATER)
+        seen.append(info.value)
+    assert seen[0] is not seen[1] and str(seen[0]) == str(seen[1])
+    assert all(isinstance(e.__cause__, ValueError) for e in seen)
+
+
+def test_own_instances_of_errors():
+    for exc in (LiveClosed(), NoFacts(NOFACTS), Warming(1, 2), LiveDataError("x"), SecRefused("r")):
+        own = _own(exc)
+        assert type(own) is type(exc) and str(own) == str(exc)
+    assert _own(NoFacts(NOFACTS)).cik == NOFACTS
+    warming = Warming(1, 2)
+    assert _own(warming) is warming  # not copiable (its constructor takes the counts): itself
 
 
 def test_companyfacts_404_is_no_facts_and_remembered(make):
@@ -617,7 +704,9 @@ def _summary_view(summaries, period):
         (MSFT, date(2024, 7, 1), date(2024, 9, 30)),  # fiscal Q1 FY2025: its TTM reads FY2024
         (MSFT, date(2024, 9, 1), None),
         (MSFT, date(2024, 4, 1), date(2024, 6, 30)),
+        (MSFT, date(2025, 1, 1), date(2025, 3, 31)),  # its TTM reads the derived Q4 FY2024
         (MSFT, None, None),
+        (MSFT, None, date(2025, 3, 31)),
         (AAPL, date(2024, 9, 1), date(2024, 12, 31)),
         (AAPL, None, None),
     ],
@@ -646,8 +735,90 @@ def test_ttm_reads_the_prior_quarters_positions(make):
         ]
         return s.ttm["net_margin_ttm"]["value"]
 
-    revenue = 65585000000 + (MSFT_REVENUE_FY2024 - 180395000000) + MSFT_Q3_REVENUE + 62020000000
+    revenue = 65585000000 + (MSFT_REVENUE_FY2024 - MSFT_YTD9_REVENUE) + MSFT_Q3_REVENUE + 62020000000
     income = 24667000000 + (88136000000 - 66100000000) + 21939000000 + 21870000000
     assert net_margin_ttm(make()) == pytest.approx(100 * income / revenue)
     blind = net_margin_ttm(make(sec_ttm_lookback_m=0))  # Q3's positions not read: Revenues picked
     assert blind != pytest.approx(100 * income / revenue)
+
+
+def _ttm(src, rows, vintages, day):
+    (s,) = [
+        s
+        for s in src.summaries(MSFT, "X", rows, vintages)
+        if s.period_end == day and s.frequency == "quarterly"
+    ]
+    return s.ttm
+
+
+@pytest.mark.parametrize(
+    ("q4_rule", "enough", "short", "blind_q4_revenue"),
+    [
+        # FY - Q1 - Q2 - Q3: Q1 FY2024 ends 2023-09-30, 18 months before Q3 FY2025's end and 15
+        # before the period's start. 14 months do not reach it, the default 20 do.
+        (
+            "sum_of_quarters",
+            20,
+            14,
+            MSFT_REVENUE_FY2024 - MSFT_Q1_OTHER_REVENUES - 62020000000 - MSFT_Q3_REVENUE,
+        ),
+        # FY - 9-month YTD: the YTD ends 2024-03-31, 9 months before the period's start: 6 months
+        # do not reach it, 14 do. Nothing under ytd9 reads further back than 400 days (see
+        # MOF_SEC_TTM_LOOKBACK_M), so no ytd9 case separates 20 from 14: only sum_of_quarters does.
+        ("ytd9", 14, 6, MSFT_REVENUE_FY2024 - MSFT_YTD9_OTHER_REVENUES),
+    ],
+)
+def test_ttm_lookback_reaches_the_derived_fourth_quarter_inputs(
+    make, q4_rule, enough, short, blind_q4_revenue
+):
+    """Q3 FY2025's TTM reads Q4 FY2024, derived from filings whose revenue tag depends on their own
+    positions: the store's value at the default lookback and at the shortest that reaches them,
+    another one below it."""
+    q3 = {"period_from": date(2025, 1, 1), "period_to": date(2025, 3, 31)}
+    day = date(2025, 3, 31)
+    income = 25824000000 + 24108000000 + 24667000000 + (88136000000 - 66100000000)
+    rest = 70066000000 + 69632000000 + 65585000000
+    expected = 100 * income / (rest + MSFT_REVENUE_FY2024 - MSFT_YTD9_REVENUE)  # both rules: 64.727 bn
+
+    store_src = make(companies_q4_rule=q4_rule)
+    store = _ttm(store_src, *_all_positions(MSFT, LATER), day)
+    assert store["net_margin_ttm"]["value"] == pytest.approx(expected)  # the rule does derive Q4
+    for kw in ({}, {"sec_ttm_lookback_m": enough}):
+        src = make(companies_q4_rule=q4_rule, **kw)
+        assert src._settings.sec_ttm_lookback_m == (kw.get("sec_ttm_lookback_m", 20))
+        assert _ttm(src, *src.concept_rows(MSFT, LATER, **q3), day) == store
+    sec = FakeSec()
+    src = make(sec, companies_q4_rule=q4_rule, sec_ttm_lookback_m=short)
+    blind = _ttm(src, *src.concept_rows(MSFT, LATER, **q3), day)
+    assert blind != store
+    assert blind["net_margin_ttm"]["value"] == pytest.approx(100 * income / (rest + blind_q4_revenue))
+    unread = MSFT_Q24_1 if q4_rule == "sum_of_quarters" else MSFT_Q24_3
+    assert not any(u.startswith(_folder(MSFT, unread)) for u in sec.urls())
+
+
+@pytest.mark.parametrize("q4_rule", ["ytd9", "sum_of_quarters"])
+@pytest.mark.parametrize("by_now", [False, True])
+def test_no_period_start_reads_the_ttm_inputs_before_the_lookback(make, q4_rule, by_now):
+    """R25: without period_from the period starts MOF_SEC_POSITIONS_LOOKBACK_Y years before
+    period_to (or now), here 2024-09-30. Its first summary, Q1 FY2025, reads in its TTM Q3 FY2024
+    (and the derived Q4's inputs), dated before that start: their positions are read too."""
+    end = date(2025, 9, 30)
+    now = datetime(2025, 9, 30, 12, tzinfo=UTC) if by_now else NOW
+    period_to = None if by_now else end
+    period = (date(2024, 9, 30), period_to)
+    store_rows, store_vintages = _all_positions(MSFT, LATER)
+
+    def views(**kw):
+        src = make(now=now, companies_q4_rule=q4_rule, sec_positions_lookback_y=1, **kw)
+        assert src._period_start(None, period_to) == period[0]
+        rows, vintages = src.concept_rows(MSFT, LATER, period_to=period_to)
+        live = _summary_view(src.summaries(MSFT, "X", rows, vintages), period)
+        store = _summary_view(src.summaries(MSFT, "X", store_rows, store_vintages), period)
+        q1 = _ttm(src, store_rows, store_vintages, date(2024, 9, 30))
+        return live, store, q1
+
+    live, store, q1 = views()
+    assert q1["net_margin_ttm"]["value"] and len(store) == 3  # Q1, Q2 and Q3 FY2025, with a TTM
+    assert live == store
+    live, store, _ = views(sec_ttm_lookback_m=0)  # the lookback's start alone does not give it
+    assert live != store

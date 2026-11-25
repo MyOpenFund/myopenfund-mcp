@@ -16,18 +16,26 @@ issuers, the oldest built dropped first). A caller waits up to ``MOF_SEC_CALL_BU
 gets :class:`Warming` with the requests done and expected while the build goes on; a later call
 gets the finished tables.
 
-Statement positions (ruling R23: the store's numbers, not an approximation): ``concept_rows`` needs
-the positions of every filing that filed a fact (any vintage known at ``as_of``) dated
-(``valid_date``) in the period asked for -- from ``MOF_SEC_TTM_LOOKBACK_M`` months before the caller's
-``period_from`` (so the TTM, derived-Q4 and prior-year inputs of the period's summaries are
-selected as the store selects them), or, without one, ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years before
-its end (before now) -- and, for each of those filings without positions,
-the filing the selection borrows from: the latest report filing (10-K/10-Q/20-F/40-F) known no
-later, that has positions, looked for among the ``MOF_SEC_POSITIONS_DONOR_DEPTH`` latest. Only
-those filings' positions are fetched (once per issuer, added to its tables) and only they are read
-by the selection, so a result is a function of the arguments and equals the selection on every
-position for the facts of the period. Known limit: a filing whose donor lies deeper than the depth
-reads ``unknown`` where the store reads ``inferred``.
+Statement positions (rulings R23-R25: the store's numbers, not an approximation): ``concept_rows``
+needs the positions of every filing that filed a fact (any vintage known at ``as_of``) dated
+(``valid_date``) in the fact window ``[start - MOF_SEC_TTM_LOOKBACK_M months, period_to]``, where
+``start`` is the caller's ``period_from`` or, without one, ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years
+before ``period_to`` (before now when there is none). The months before ``start`` are there in both
+cases (R25) so the TTM, derived-Q4 and prior-year inputs of the period's summaries are selected as
+the store selects them. For each of those filings without positions it also needs the filing the
+selection borrows from: the latest report filing (10-K/10-Q/20-F/40-F) known no later, that has
+positions, looked for among the ``MOF_SEC_POSITIONS_DONOR_DEPTH`` latest. Only those filings'
+positions are fetched (once per issuer: ``filing_positions`` per filing, turned into
+``filing_statements`` rows by the producer's ``statement_rows``; the issuer's other tables are built
+once, and no SEC response body is kept in memory after a build) and only they are read by the
+selection, so a result is a function of the arguments and equals the selection on every position
+for the rows, values, ratios and TTM of the period (``start`` onwards). Known limit: a filing
+without positions whose donor lies deeper than the depth does not read the store's donor: it reads
+``unknown`` where the store reads ``inferred``, or, when an older filing with positions is among
+those the call reads anyway (it filed a fact of the window, or is another filing's donor), borrows
+that older filing's positions instead of the store's donor's. A filing whose positions files could
+not be fetched (``SecUnavailable`` after the retries) counts as without positions until the
+issuer's tables are built again, as in ``issuer_tables``.
 
 Errors: a 404 on the companyfacts file, or on the main submissions file (a CIK unknown to SEC) ->
 :class:`NoFacts` (remembered like tables; each caller gets its own instance); a 404 on any other
@@ -36,10 +44,12 @@ non-positions file is a :class:`LiveDataError`. ``SecRefused``, ``SecContactMiss
 a bare ``ValueError``, or a wrong-shape JSON a ``TypeError``/``KeyError``/``AttributeError``) or a
 selection that fails on it -> :class:`LiveDataError`, a backend fault, never the caller's. A build
 that fails is remembered for ``MOF_SEC_FAILURE_TTL_S``: callers meanwhile get its error (even one
-that came after their budget, while they were answered :class:`Warming`), not a new build. After
+that came after their budget, while they were answered :class:`Warming`), not a new build; each
+caller gets its own copy, with the cause, or the error itself if its class cannot be copied. After
 :meth:`LiveSource.close`, ``entities``, ``read``, ``concept_rows``, ``filings`` and
 ``latest_filing`` raise :class:`LiveClosed` (``summaries`` and the catalogs fetch nothing and still
-answer), and a running build stops at its next request. Argument errors use the store adapter's types (:class:`StoreBadArgument`,
+answer), a running build stops at its next request, and a caller waiting on it gets
+:class:`LiveClosed`. Argument errors use the store adapter's types (:class:`StoreBadArgument`,
 :class:`StoreUnknownDataset`), checked before any request. The SEC contact is never logged here:
 no message names it.
 """
@@ -53,7 +63,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
 from ..config import Q4_RULES, Settings
@@ -108,18 +118,16 @@ class _Window:
 
 
 class _Counting:
-    """A SecGet counting the requests of one build. Bodies read while ``recording`` are kept
-    (companyfacts and submissions: the positions rounds rebuild the tables from them). Requests
-    under a ``blocked`` filing folder answer 404 without reaching SEC (positions of filings not
-    asked for)."""
+    """A SecGet counting the requests of one build. Bodies read while ``recording`` are kept for
+    the build (the submissions, read first to size the work: ``issuer_tables`` asks for them
+    again) and dropped with it."""
 
-    def __init__(self, sec, closed: threading.Event, kept: dict[str, bytes] | None = None):
+    def __init__(self, sec, closed: threading.Event):
         self._sec = sec
         self._closed = closed
         self._lock = threading.Lock()
-        self.kept: dict[str, bytes] = dict(kept or {})
+        self.kept: dict[str, bytes] = {}
         self.recording = True
-        self.blocked: tuple[str, ...] = ()
         self.done = 0
         self.total = FIRST_REQUESTS
         self.requested: list[str] = []  # URLs actually requested, in order
@@ -134,8 +142,6 @@ class _Counting:
             kept = self.kept.get(url)
         if kept is not None:
             return kept
-        if any(url.startswith(folder) for folder in self.blocked):
-            raise SecNotFound(url)
         with self._lock:
             self.requested.append(url)
         try:
@@ -169,7 +175,6 @@ class _Entry:
     at: float
     tables: object | None = None  # company_corpus.live.IssuerTables, positions of no filing
     archive: object | None = None  # the submissions the tables were built from
-    kept: dict = field(default_factory=dict)  # companyfacts and submissions bodies
     statements: object | None = None  # filing_statements rows fetched so far (pa.Table)
     fetched: frozenset = frozenset()  # accessions whose positions were asked for, found or not
     no_facts: bool = False
@@ -187,6 +192,24 @@ def _data_faults():
         raise
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise LiveDataError(f"an SEC response could not be read ({type(exc).__name__})") from exc
+
+
+def _own(exc: BaseException) -> BaseException:
+    """A caller's own instance of a build's error: a new :class:`NoFacts` or :class:`LiveClosed`,
+    else a copy without traceback that keeps the cause; the error itself when its class cannot be
+    copied (``copy.copy`` rebuilds it as ``cls(*args)``)."""
+    if isinstance(exc, NoFacts):
+        return NoFacts(exc.cik)
+    if isinstance(exc, LiveClosed):
+        return LiveClosed()
+    try:
+        own = copy.copy(exc)
+    except Exception:  # noqa: BLE001 - any constructor may refuse its own args
+        return exc
+    if type(own) is not type(exc):
+        return exc
+    own.__cause__, own.__suppress_context__ = exc.__cause__, exc.__suppress_context__
+    return own.with_traceback(None)
 
 
 def _months_before(day: date, months: int) -> date:
@@ -323,15 +346,19 @@ class LiveSource:
         with self._lock:
             self._keep(self._archives, cik, (self._clock(), archive))
 
-    def _window(self, period_from: date | None, period_to: date | None) -> _Window:
-        """The fact dates whose filings' positions a call reads. With ``period_from``: from
-        ``MOF_SEC_TTM_LOOKBACK_M`` months before it (the TTM, Q4 and prior-year inputs of the
-        period's summaries); without: ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years before ``period_to``
-        (or now)."""
-        end = period_to
+    def _period_start(self, period_from: date | None, period_to: date | None) -> date:
+        """The first date of the period a call answers for: ``period_from``, or
+        ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years before ``period_to`` (or now)."""
         if period_from is not None:
-            return _Window(_months_before(period_from, self._settings.sec_ttm_lookback_m), end)
-        return _Window(_years_before(end or self._now().date(), self._settings.sec_positions_lookback_y), end)
+            return period_from
+        return _years_before(period_to or self._now().date(), self._settings.sec_positions_lookback_y)
+
+    def _window(self, period_from: date | None, period_to: date | None) -> _Window:
+        """The fact dates whose filings' positions a call reads: from ``MOF_SEC_TTM_LOOKBACK_M``
+        months before the period's start (the TTM, Q4 and prior-year inputs of its summaries;
+        with or without ``period_from``, rulings R24 and R25) to ``period_to``."""
+        start = self._period_start(period_from, period_to)
+        return _Window(_months_before(start, self._settings.sec_ttm_lookback_m), period_to)
 
     def _store(self, cik: str, entry: _Entry) -> None:
         with self._lock:
@@ -415,31 +442,47 @@ class LiveSource:
             self._store(cik, _Entry(self._clock(), no_facts=True))
             raise NoFacts(cik) from None
         counting.recording = False
-        entry = _Entry(self._clock(), tables=tables, archive=archive, kept=dict(counting.kept))
+        entry = _Entry(self._clock(), tables=tables, archive=archive)
         self._store(cik, entry)
         return entry
 
     def _positions(self, cik: str, entry: _Entry, accessions: set, counting: _Counting) -> _Entry:
-        """Fetch the positions of ``accessions`` (others blocked) and add them to the entry."""
+        """Fetch the positions of ``accessions`` and add them to the entry: company-corpus's
+        ``filing_positions`` per filing, then the producer's ``statement_rows``, as
+        ``issuer_tables`` does for a window (a filing whose files are unreachable or gone has no
+        positions). Nothing else of the issuer is fetched or computed again."""
         import pyarrow as pa
-        import pyarrow.compute as pc
         from company_corpus.live.filings import list_filings
         from company_corpus.live.issuer import POSITIONS_FORMS
+        from company_corpus.live.positions import filing_positions
+        from company_corpus.live.sec import SecNotFound, SecUnavailable
+        from company_corpus.opendata.statements import statement_rows
+        from company_corpus.opendata.submissions import acceptance_times
 
         with _data_faults():
             reports = list_filings(entry.archive, forms=POSITIONS_FORMS, period_from=None, period_to=None)
-        wanted = [r for r in reports if r.accession in accessions and r.report_date is not None]
+        wanted = [r for r in reports if r.accession in accessions]
+        counting.total = counting.done + REQUESTS_PER_FILING * len(wanted)
         statements = entry.statements
-        if wanted:
-            lo, hi = min(r.report_date for r in wanted), max(r.report_date for r in wanted)
+        found: list[dict] = []
+        for ref in wanted:
+            try:
+                with _data_faults():
+                    found.extend(filing_positions(ref, counting))
+            except (SecUnavailable, SecNotFound):  # as issuer_tables: no positions of its own
+                continue
+        if found:
+            found.sort(key=lambda r: (r["accn"], r["statement"], r["tag"]))  # issuer_tables' order
             with _data_faults():
-                span = list_filings(entry.archive, forms=POSITIONS_FORMS, period_from=lo, period_to=hi)
-            counting.blocked = tuple(r.url.rstrip("/") + "/" for r in span if r.accession not in accessions)
-            counting.total = counting.done + REQUESTS_PER_FILING * len(wanted)
-            with _data_faults():
-                t = _issuer_tables(self, cik, counting, self._now(), lo, hi, forms=POSITIONS_FORMS)
-            new = t.filing_statements
-            new = new.filter(pc.is_in(new["filing_ref"], value_set=pa.array(sorted(accessions), pa.string())))
+                placed = statement_rows(
+                    cik,
+                    found,
+                    acceptance=acceptance_times(entry.archive),
+                    manifest_doc_ids=set(),
+                    config=self._config,
+                    now=self._now(),
+                )
+                new = pa.Table.from_pylist(placed.rows, schema=self._statements.schema)
             statements = new if statements is None else pa.concat_tables([statements, new])
         entry = replace(entry, statements=statements, fetched=entry.fetched | frozenset(accessions))
         self._store(cik, entry)
@@ -455,7 +498,6 @@ class LiveSource:
             if entry is None or entry.no_facts or not self._fresh(entry.at, self._facts_ttl_s):
                 entry = self._base(cik, counting)
             else:
-                counting.kept.update(entry.kept)
                 counting.recording = False
                 counting.total = counting.done
             if job.need is not None:
@@ -491,7 +533,7 @@ class LiveSource:
         for k in [k for k, (at, _) in self._failures.items() if not self._fresh(at, self._failure_ttl_s)]:
             del self._failures[k]
         failed = self._failures.get(cik)
-        return None if failed is None else copy.copy(failed[1]).with_traceback(None)
+        return None if failed is None else _own(failed[1])
 
     def _ready(self, entry: _Entry | None, need) -> bool:
         if entry is None or entry.no_facts or not self._fresh(entry.at, self._facts_ttl_s):
@@ -538,10 +580,8 @@ class LiveSource:
                 if j.future.cancelled():
                     raise LiveClosed
                 exc = j.future.exception()
-                if isinstance(exc, NoFacts):
-                    raise NoFacts(exc.cik)  # each caller its own instance
                 if exc is not None:
-                    raise copy.copy(exc).with_traceback(None)
+                    raise _own(exc)
             # finished: the loop reads the entries (or starts the build another need asks for)
 
     # --- as-of reading ---------------------------------------------------------------------------
