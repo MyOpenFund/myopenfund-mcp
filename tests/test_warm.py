@@ -10,6 +10,7 @@ from test_filings_tools import APPLE_K24, MSFT_K23, MSFT_K24, MSFT_Q, FakeIndexe
 from myopenfund_mcp import cli, warm
 from myopenfund_mcp.companies.live import Warming
 from myopenfund_mcp.companies.router import SourceRouter
+from myopenfund_mcp.config import Settings
 from myopenfund_mcp.filings.indexer import StatusResult
 
 SENTINEL = "sentinel-contact@example.invalid"
@@ -155,18 +156,16 @@ def test_second_run_makes_no_sec_call_for_ready_documents(rig):
     assert cli.main(ARGS) == 0
     first = list(rig.sec.urls)
     assert len(first) == 2
-    enqueues = len([1 for m, _ in rig.indexer.calls if m == "enqueue"])
     assert cli.main(ARGS) == 0
-    assert rig.sec.urls == first  # nothing downloaded again
-    assert len([1 for m, _ in rig.indexer.calls if m == "enqueue"]) == enqueues  # nor enqueued
+    assert rig.sec.urls == first  # nothing downloaded again (the indexer leaves a ready document alone)
 
 
-def test_a_partly_ready_run_only_enqueues_the_rest(rig, capsys):
+def test_a_partly_ready_run_hands_every_document_to_the_indexer_and_downloads_the_rest(rig, capsys):
     rig.indexer.docs[MSFT_K24.doc_id] = status(MSFT_K24, "ready")
     assert cli.main(ARGS) == 0
     [enqueue] = [kw for m, kw in rig.indexer.calls if m == "enqueue"]
-    assert [r.doc_id for r in enqueue["refs"]] == [MSFT_K23.doc_id]
-    assert "1/2 documents already ready, skipped" in capsys.readouterr().err
+    assert {r.doc_id for r in enqueue["refs"]} == {MSFT_K24.doc_id, MSFT_K23.doc_id}
+    assert "1/2 documents already ready" in capsys.readouterr().err
     assert rig.sec.urls == [MSFT_K23.url]
 
 
@@ -177,14 +176,58 @@ def test_no_filing_in_the_window_exits_0(rig, capsys):
     assert not [1 for m, _ in rig.indexer.calls if m == "enqueue"]
 
 
-def test_ctrl_c_closes_the_indexer_and_exits_130(rig, capsys):
-    def interrupt(seconds):
-        raise KeyboardInterrupt
-
+def test_ctrl_c_while_indexing_closes_the_indexer_and_exits_130(rig, capsys):
     rig.indexer.status = lambda doc_ids=None: (_ for _ in ()).throw(KeyboardInterrupt())
     assert cli.main(ARGS) == 130
     assert rig.indexer.closed
     assert "interrupted" in capsys.readouterr().err
+
+
+def test_ctrl_c_during_facts_exits_130_without_a_traceback(rig, capsys):
+    def interrupt(*a, **kw):
+        raise KeyboardInterrupt
+
+    rig.live.concept_rows = interrupt
+    assert cli.main(ARGS) == 130
+    assert rig.indexer.closed and "Traceback" not in capsys.readouterr().err
+
+
+def test_ctrl_c_while_building_exits_130(clean_env, monkeypatch, capsys):
+    def build(settings):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(warm, "build_stack", build)
+    assert cli.main(ARGS) == 130
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_ctrl_c_while_closing_exits_130(rig, capsys):
+    def close():
+        raise KeyboardInterrupt
+
+    rig.indexer.close = close
+    assert cli.main(ARGS) == 130
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_no_progress_for_the_stall_time_lists_the_stuck_documents_and_exits_1(rig, clean_env, capsys):
+    clean_env.setenv("MOF_WARM_STALL_S", "30")
+    rig.indexer.status = lambda doc_ids=None: StatusResult([status(MSFT_K24, "indexing", 3, 10)])
+    now = [0.0]
+    rig.live.refs = {MSFT: [MSFT_K24]}
+    code = warm.run_warm(
+        Settings.from_env(),
+        companies="MSFT",
+        forms="10-K",
+        since=dt.date(2022, 1, 1),
+        until=None,
+        poll_interval_s=10,
+        sleep=lambda s: now.__setitem__(0, now[0] + s),
+        clock=lambda: now[0],
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "no progress for 30s" in err and f"stuck {MSFT_K24.doc_id}" in err
 
 
 def test_an_unknown_company_exits_2(rig, capsys):
@@ -205,6 +248,9 @@ def test_an_unknown_company_exits_2(rig, capsys):
         ["warm", "--companies", "MSFT,,AAPL", "--since", "2022-01-01"],
         ["warm", "--companies", " ", "--since", "2022-01-01"],
         ["warm", "--companies", "MSFT", "--since", "2022-01-01", "--poll-interval", "0"],
+        ["warm", "--companies", "MSFT", "--since", "2022-01-01", "--poll-interval", "3601"],
+        ["warm", "--companies", "MSFT", "--since", "2022-01-01", "--poll-interval", "nan"],
+        ["warm", "--companies", "MSFT", "--since", "2022-01-01", "--poll-interval", "inf"],
     ],
 )
 def test_bad_arguments_exit_2_with_a_message_and_build_nothing(rig, capsys, monkeypatch, argv):
@@ -227,3 +273,42 @@ def test_a_configuration_error_exits_2(clean_env, capsys):
     clean_env.setenv("MOF_WARM_POLL_INTERVAL_S", "0")
     assert cli.main(ARGS) == 2
     assert "MOF_WARM_POLL_INTERVAL_S" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "named"),
+    [("MOF_CACHE", "off", "MOF_CACHE"), ("MOF_COMPANIES_SOURCE", "store", "MOF_COMPANIES_SOURCE")],
+)
+def test_a_configuration_warm_cannot_serve_exits_2(rig, clean_env, capsys, name, value, named):
+    clean_env.setenv(name, value)
+    if value == "store":
+        clean_env.setenv("MOF_COMPANIES_CATALOG", "/nonexistent")
+        clean_env.setenv("MOF_COMPANIES_DATA_ROOT", "/nonexistent")
+    assert cli.main(ARGS) == 2
+    assert named in capsys.readouterr().err
+
+
+def test_uncoded_errors_never_leak_the_contact_or_a_traceback(rig, capsys):
+    """Resolving, listing and indexing: every failure is a code or a class name, exit 1."""
+    for fail_on, target in [
+        ("entities", rig.live),
+        ("filings", rig.live),
+        ("enqueue", rig.indexer),
+        ("status", rig.indexer),
+    ]:
+        target.fail = {fail_on: RuntimeError(f"boom {SENTINEL}")}
+        code = cli.main(ARGS)
+        err = capsys.readouterr().err
+        assert code == 1, fail_on
+        assert SENTINEL not in err and "Traceback" not in err, fail_on
+        target.fail = {}
+        rig.indexer.docs.clear()
+
+
+def test_a_locked_index_says_to_stop_the_other_process(rig, capsys):
+    from myopenfund_mcp.filings.indexer import IndexUnavailable
+
+    rig.indexer.fail = {"enqueue": IndexUnavailable(f"locked {SENTINEL}")}
+    assert cli.main(ARGS) == 1
+    err = capsys.readouterr().err
+    assert "another process holds the filings index" in err and SENTINEL not in err

@@ -772,7 +772,13 @@ questions are answered from the cache. Needs `MOF_SEC_CONTACT` and the `[compani
 `MOF_WARM_POLL_INTERVAL_S`) is the wait between two looks at the progress. Progress lines go to stderr
 (`[warm] 12/20 documents ready (3 indexing)`). Exit codes: `0` all ready, `1` a step or document failed
 (listed), `2` bad arguments or no `MOF_SEC_CONTACT`, `130` interrupted (Ctrl-C: the indexer closes within
-`MOF_INDEX_CLOSE_TIMEOUT_S`). Run it again to resume: documents already `ready` are not fetched again.
+`MOF_INDEX_CLOSE_TIMEOUT_S`). Run it again to resume: documents already `ready` are not fetched again;
+facts are requested again once the companyfacts/submissions cache entries pass their TTL
+(`MOF_CACHE_TTL_COMPANYFACTS_H`, `MOF_CACHE_TTL_SUBMISSIONS_H`). It refuses `MOF_CACHE=off` and
+`MOF_COMPANIES_SOURCE=store` (exit 2). It always reads SEC, never a company store: with
+`MOF_COMPANIES_SOURCE=auto` the warmed facts serve as the fallback when the store is stale. With no progress
+for `MOF_WARM_STALL_S` it lists the stuck documents and exits 1. If the filings index is open in another process
+(a running MCP server), warm stops with a message: stop that server first.
 
 ## Configuration and limits
 
@@ -846,6 +852,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_INDEX_WORKERS` | `1` | Filings indexed in parallel (1-32). |
 | `MOF_INDEX_CLOSE_TIMEOUT_S` | `10` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600. Past it the index is released; the document is resumed (`partial`) next time. |
 | `MOF_WARM_POLL_INTERVAL_S` | `5.0` | Seconds `myopenfund-mcp warm` waits between two looks at the SEC fetch (still warming) and at the indexing progress (above 0, at most 3600); `--poll-interval` overrides it. |
+| `MOF_WARM_STALL_S` | `1800` | Seconds without any progress after which `myopenfund-mcp warm` stops waiting for the documents still queued or indexing, lists them and exits 1 (1-604800). |
 | `MOF_RAG_ONNX_PROVIDER` | `cpu` | ONNX execution provider of the local embedding: `cpu` or `coreml`. |
 | `MOF_SEARCH_RRF_K` | `60` | Constant k of the reciprocal-rank fusion of a filings search (1-1000). |
 | `MOF_SEARCH_CANDIDATES` | `50` | Passages each retriever hands to the fusion (1-1000). |

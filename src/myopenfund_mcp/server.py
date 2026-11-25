@@ -166,14 +166,12 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
     if companies_live is None and settings.sec_contact and settings.companies_source != "store":
         # MOF_COMPANIES_SOURCE=store never reads SEC: no live source (nor cache folder) then.
         try:
-            from .companies.live import LiveSource
-            from .live.sec import build_sec
+            from .companies.build import build_live
         except ImportError:
             companies_live = None
         else:
-            sec = build_sec(settings)
             try:
-                companies_live = LiveSource(sec, settings)
+                sec, companies_live = build_live(settings)
             except ImportError:
                 companies_live = None
         if companies_live is None:
@@ -182,14 +180,11 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
     if companies_store is not None or companies_live is not None:
         from .companies.common import dict_to_utc
         from .companies.datasets import build_datasets_toolset
-        from .companies.router import SourceRouter
+        from .companies.build import build_router
         from .companies.tools import build_companies_toolset
 
         try:
-            router = SourceRouter(companies_store, companies_live, settings.companies_source,
-                                  freshness_budget_s=settings.sec_freshness_budget_s,
-                                  failure_ttl_s=settings.sec_failure_ttl_s,
-                                  check_workers=settings.companies_max_concurrency)
+            router = build_router(companies_store, companies_live, settings)
         except ValueError as exc:  # a source the mode needs is missing (from_env refuses it earlier)
             raise ConfigError(str(exc)) from None
         owned.append(router)  # its check threads: closed first at shutdown, then the sources
