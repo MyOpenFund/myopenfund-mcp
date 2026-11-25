@@ -15,8 +15,18 @@ def test_config_reads_variables():
 @pytest.mark.parametrize("doc", [".env.example", "README.md"])
 def test_every_server_variable_is_documented(doc):
     text = (ROOT / doc).read_text()
-    missing = [name for name in SERVER_VARS if name not in text]
+    # whole names: MOF_CACHE must not be satisfied by a mention of MOF_CACHE_DIR
+    mentioned = set(re.findall(r"\bMOF_[A-Z0-9_]+\b", text))
+    missing = [name for name in SERVER_VARS if name not in mentioned]
     assert missing == []
+
+
+def test_readme_has_the_no_infrastructure_section():
+    text = (ROOT / "README.md").read_text()
+    assert "## Try it at home, without any infrastructure" in text
+    for needle in ("MOF_SEC_CONTACT", "mcpServers", "myopenfund-mcp warm", "MOF_CACHE=off", "1.1 GB",
+                   "uvx --from", "companies_search_filings", "companies_filings"):
+        assert needle in text, needle
 
 
 ENV_EXAMPLE = (ROOT / ".env.example").read_text()

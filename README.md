@@ -21,6 +21,7 @@ stops the server at start with a clear configuration error (it never runs silent
 
 ## Contents
 
+- [Try it at home, without any infrastructure](#try-it-at-home-without-any-infrastructure)
 - [Quick start (stdio)](#quick-start-stdio)
 - [HTTP deployment](#http-deployment)
 - [Deploying the rag toolset](#deploying-the-rag-toolset)
@@ -31,6 +32,121 @@ stops the server at start with a clear configuration error (it never runs silent
 - [Local models](#local-models)
 - [Roadmap](#roadmap)
 - [Development](#development)
+
+## Try it at home, without any infrastructure
+
+No database, no store, no server to run: the company tools read the SEC's public EDGAR data directly,
+keep what they fetch in a cache folder on your machine, and search the filings with a small embedding
+model that runs locally. You need Python 3.12+ (through [uv](https://docs.astral.sh/uv/)), git, an MCP
+client, and about 2 GB of free disk space and memory for the model.
+
+**1. Install and run.** The package is published on PyPI as `myopenfund-mcp`; once the release is out,
+this is the whole install (the MCP client runs it for you, see step 2):
+
+```bash
+uvx --from "myopenfund-mcp[companies,filings]" myopenfund-mcp serve
+```
+
+Until the release, install from git instead (same extras, same command):
+
+```bash
+uvx --from "myopenfund-mcp[companies,filings] @ git+https://github.com/MyOpenFund/myopenfund-mcp" myopenfund-mcp serve
+```
+
+**2. Add it to your assistant and give your own SEC contact.** In an MCP client that reads an `mcpServers`
+block (Claude Desktop, Claude Code's `.mcp.json`, and most others), with the git form, which applies until the release (afterwards use `"myopenfund-mcp[companies,filings]"` alone):
+
+```json
+{
+  "mcpServers": {
+    "myopenfund": {
+      "command": "uvx",
+      "args": ["--from", "myopenfund-mcp[companies,filings] @ git+https://github.com/MyOpenFund/myopenfund-mcp", "myopenfund-mcp", "serve"],
+      "env": { "MOF_SEC_CONTACT": "Your Name your.email@example.com" }
+    }
+  }
+}
+```
+
+Replace the placeholder with your own name and e-mail. The SEC's fair-access rules ask every automated
+client to identify who is behind it, and it blocks the ones that do not. The value stays on your machine:
+it is sent only to sec.gov, in the `User-Agent` of each request, and it is never logged, shown in a tool
+result or put in an error. Without it the company tools are not mounted. Over stdio there is no token and
+nothing listens on the network.
+
+**3. Ask a question.** The scenario the MyOpenFund README suggests:
+
+> Since 2022, how have the big cloud providers financed their AI spending? Show me their capital
+> expenditure and their debt quarter by quarter, how their shares performed after each annual report, and
+> quote what each one says about it.
+
+The assistant resolves the companies (`companies_resolve`), reads their capital expenditure and debt
+(`companies_fundamentals`, `companies_facts`), gets the date each annual report became public
+(`companies_filings`, the `accepted_utc` of each 10-K is the event date), and quotes the reports
+(`companies_fetch_filings`, then `companies_search_filings` and `companies_read_filing`). Share prices are
+not in this server: they come from the market-data toolset, which is not part of this server yet, so the
+"how did the shares perform" part needs another source of prices; the event dates are what this server
+gives it.
+
+### What is fetched, and where it is kept
+
+- **Facts and filing lists** come from SEC's `companyfacts` and `submissions` endpoints, at most
+  `MOF_SEC_MAX_RPS` requests per second (SEC's own limit is 10). Filings come from SEC's archive and are
+  converted to text, then split into passages and embedded locally.
+- **Everything is cached** under `MOF_CACHE_DIR` (default: `~/.cache/myopenfund-mcp` on Linux,
+  `~/Library/Caches/myopenfund-mcp` on macOS, `%LOCALAPPDATA%\myopenfund-mcp` on Windows): HTTP answers,
+  the local filings index and the model. Facts and filing lists are reused for 24 hours
+  (`MOF_CACHE_TTL_COMPANYFACTS_H`, `MOF_CACHE_TTL_SUBMISSIONS_H`); the HTTP part is capped at
+  `MOF_CACHE_MAX_GB` (20 GB), the model and the index are never evicted. Delete the folder to start over.
+- **The embedding model is downloaded once, at the first fetch of filings**: about 1.1 GB, pinned to one
+  revision. Later runs read it from the cache. Nothing else is downloaded.
+- **`MOF_CACHE=off`** keeps nothing between runs: entries live in a temporary folder removed at exit, so
+  nothing survives a restart and `warm` refuses to run. Use it for a throwaway test only.
+
+### Where each company is read from (`MOF_COMPANIES_SOURCE`)
+
+`auto` (the default) uses your own company store when you have one and SEC otherwise; with no store
+configured, as here, everything comes from SEC. `store` reads only the store, `sec` only SEC (needs
+`MOF_SEC_CONTACT`). Every row of a company tool says its `source` (`store` or `sec`) and, when the choice
+needs explaining, a `reason` (for example `freshness_unchecked`: SEC could not be asked, so the store's
+answer is not checked for freshness). A store is optional: if you run one, point `MOF_COMPANIES_CATALOG` and
+`MOF_COMPANIES_DATA_ROOT` at it (see [Companies and datasets](#companies-and-datasets)).
+
+### How long it takes
+
+The first question about a filing is slow because the filing is downloaded, converted and embedded on your
+machine; later questions about it are answered from the index. Measured so far, on the Microsoft FY2024
+10-K (296,931 tokens, 731 passages): 213 s on 4 CPU cores in a container. A handful of companies over
+several years is therefore a matter of tens of minutes the first time. On Apple Silicon, set
+`MOF_RAG_ONNX_PROVIDER=coreml` to run the embedding on the Mac's accelerator instead of the CPU (`cpu`
+is the default). `MOF_RAG_ONNX_THREADS` limits the CPU threads. While a filing is still being prepared,
+the tools say so and which documents are not ready; ask again a little later.
+
+### Prepare the filings overnight (`warm`)
+
+Fetch and index the filings of the companies you will ask about before you ask, with the same code the
+tools use. Use the same `MOF_SEC_CONTACT` and the same cache folder as your assistant's configuration:
+
+```bash
+export MOF_SEC_CONTACT="Your Name your.email@example.com"
+uvx --from "myopenfund-mcp[companies,filings]" myopenfund-mcp warm \
+  --companies MSFT,AMZN,GOOGL,META --forms 10-K,10-Q --since 2022-01-01
+```
+
+Progress goes to stderr; run it again to resume, documents already `ready` are not fetched again. Stop
+your assistant's MCP server first, as only one process can hold the index. More in
+[Warming the cache ahead of questions](#warming-the-cache-ahead-of-questions-warm).
+
+### Small local models
+
+The tools are deterministic and the embedding is local, so no hosted model is involved on the server's
+side. A small local model (for example one served by Ollama, through an MCP-capable client) can call the
+tools; ask one question at a time, name the companies and the period, and prefer a model that handles tool
+calls well. Reading long filings and combining numbers is where small models struggle most, so check the
+quoted passages and figures against the `source` links of the results.
+
+> **MyOpenFund manages nobody's money and gives no investment advice.** What you do with these documents
+> and facts is your decision.
 
 ## Quick start (stdio)
 
