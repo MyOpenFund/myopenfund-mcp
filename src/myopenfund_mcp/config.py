@@ -243,10 +243,18 @@ class Settings:
     # MOF_COMPANIES_SOURCE: auto (the store when MOF_COMPANIES_CATALOG is set, SEC when MOF_SEC_CONTACT is,
     # neither = no companies toolset) | store | sec
     companies_source: str = "auto"
-    cache: str = "on"  # MOF_CACHE: on | off (off = nothing kept between calls)
+    # MOF_CACHE: on | off (off = entries live for the process only, in a temporary folder removed at exit)
+    cache: str = "on"
     # MOF_CACHE_DIR: absolute path; None = the platform's cache folder, found by cache_path() when needed
     cache_dir: str | None = None
-    cache_max_gb: int = 20  # MOF_CACHE_MAX_GB: size above which the oldest cached files are removed
+    # MOF_CACHE_MAX_GB: size of the cached HTTP bodies above which the oldest-written are removed (the
+    # model files and the local index live under the same folder, on top, and are never removed)
+    cache_max_gb: int = 20
+    # MOF_CACHE_EVICT_TO: fraction of MOF_CACHE_MAX_GB that eviction shrinks the cache down to
+    cache_evict_to: float = 0.9
+    # MOF_CACHE_TMP_GRACE_S: seconds a temporary file of an interrupted write is left before eviction
+    # removes it
+    cache_tmp_grace_s: int = 3600
     cache_ttl_submissions_h: int = 24  # MOF_CACHE_TTL_SUBMISSIONS_H: hours a filing list is reused
     cache_ttl_companyfacts_h: int = 24  # MOF_CACHE_TTL_COMPANYFACTS_H: hours a company-facts file is reused
     filings_max_docs: int = 40  # MOF_FILINGS_MAX_DOCS: filings downloaded and indexed by one call
@@ -320,6 +328,8 @@ class Settings:
             cache=(_get(env, "MOF_CACHE") or "on").lower(),
             cache_dir=_get(env, "MOF_CACHE_DIR"),
             cache_max_gb=_int(env, "MOF_CACHE_MAX_GB", 20, maximum=100_000),
+            cache_evict_to=_float(env, "MOF_CACHE_EVICT_TO", 0.9, 1.0),
+            cache_tmp_grace_s=_int(env, "MOF_CACHE_TMP_GRACE_S", 3600, minimum=60, maximum=86_400),
             cache_ttl_submissions_h=_int(env, "MOF_CACHE_TTL_SUBMISSIONS_H", 24, maximum=8760),
             cache_ttl_companyfacts_h=_int(env, "MOF_CACHE_TTL_COMPANYFACTS_H", 24, maximum=8760),
             filings_max_docs=_int(env, "MOF_FILINGS_MAX_DOCS", 40, maximum=1000),

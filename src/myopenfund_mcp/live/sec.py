@@ -6,7 +6,7 @@ import logging
 
 from company_corpus.live.sec import SecClient, SecGet
 
-from ..config import Settings
+from ..config import ConfigError, Settings
 from .cache import DiskCache, cache_key, open_cache
 
 log = logging.getLogger(__name__)
@@ -42,4 +42,13 @@ def build_sec(settings: Settings) -> CachedSec | None:
         timeout_s=settings.sec_timeout_s,
         retries=settings.sec_retries,
     )
-    return CachedSec(client, open_cache(settings))
+    try:
+        cache = open_cache(settings)
+    except (
+        OSError
+    ) as exc:  # the folder cannot be created or read; the error text may name a path, not the contact
+        raise ConfigError(
+            f"the cache folder cannot be used ({type(exc).__name__}): set MOF_CACHE_DIR to a "
+            "folder you can write to, or MOF_CACHE=off"
+        ) from exc
+    return CachedSec(client, cache)

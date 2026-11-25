@@ -286,6 +286,7 @@ def test_no_vault_defaults():
     assert s.sec_contact is None and s.companies_source == "auto"
     assert (s.sec_max_rps, s.sec_timeout_s, s.sec_retries, s.sec_call_budget_s) == (5.0, 30, 4, 50)
     assert (s.cache, s.cache_max_gb) == ("on", 20)
+    assert (s.cache_evict_to, s.cache_tmp_grace_s) == (0.9, 3600)
     assert s.cache_dir is None and s.cache_path().endswith("myopenfund-mcp")
     assert (s.cache_ttl_submissions_h, s.cache_ttl_companyfacts_h) == (24, 24)
     assert (s.filings_max_docs, s.index_workers, s.rag_onnx_provider) == (40, 1, "cpu")
@@ -340,7 +341,8 @@ def test_contact_is_never_shown_or_echoed():
         {"MOF_SEC_MAX_RPS": "fast"}, {"MOF_SEC_MAX_RPS": "nan"}, {"MOF_SEC_MAX_RPS": "inf"},
         {"MOF_COMPANIES_SOURCE": "web"}, {"MOF_CACHE": "maybe"}, {"MOF_RAG_ONNX_PROVIDER": "tpu"},
         {"MOF_SEC_TIMEOUT_S": "0"}, {"MOF_SEC_RETRIES": "-1"}, {"MOF_SEC_CALL_BUDGET_S": "0"},
-        {"MOF_CACHE_MAX_GB": "0"}, {"MOF_CACHE_TTL_SUBMISSIONS_H": "0"}, {"MOF_FILINGS_MAX_DOCS": "0"},
+        {"MOF_CACHE_MAX_GB": "0"}, {"MOF_CACHE_EVICT_TO": "0"}, {"MOF_CACHE_EVICT_TO": "1.1"},
+        {"MOF_CACHE_TMP_GRACE_S": "59"}, {"MOF_CACHE_TTL_SUBMISSIONS_H": "0"}, {"MOF_FILINGS_MAX_DOCS": "0"},
         {"MOF_INDEX_WORKERS": "0"}, {"MOF_SEARCH_RRF_K": "0"}, {"MOF_SEARCH_CANDIDATES": "0"},
         {"MOF_SEARCH_EIGENMIND": "perhaps"}, {"MOF_FILINGS_DEFAULT_FORMS": ","},
         {"MOF_CHUNK_MAX_TOKENS": "0"}, {"MOF_CHUNK_OVERLAP_TOKENS": "480"},
