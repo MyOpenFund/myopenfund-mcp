@@ -127,14 +127,20 @@ def test_ollama_chat_posts_a_non_streaming_request(monkeypatch):
         chat = llm_smoke.ollama_chat(f"http://127.0.0.1:{server.server_port}/", "some-model", timeout_s=5)
         tools = [{"type": "function", "function": {"name": "t", "description": "", "parameters": {}}}]
         reply = chat([{"role": "user", "content": "q"}], tools)
+        body = received["body"]
+        custom = llm_smoke.ollama_chat(f"http://127.0.0.1:{server.server_port}/", "m", timeout_s=5,
+                                       options={"temperature": 0.7, "seed": 3, "num_ctx": 16384})
+        custom([{"role": "user", "content": "q"}], tools)
+        custom_body = received["body"]
     finally:
         server.shutdown()
         server.server_close()
     assert reply == {"role": "assistant", "content": "3"}
+    assert custom_body["options"] == {"temperature": 0.7, "seed": 3, "num_ctx": 16384}
     assert received["path"] == "/api/chat"
-    body = received["body"]
     assert body["model"] == "some-model" and body["stream"] is False and body["tools"] == tools
     assert body["messages"] == [{"role": "user", "content": "q"}]
+    assert body["options"] == {"temperature": 0}  # the default stays deterministic
 
 
 @pytest.mark.llm

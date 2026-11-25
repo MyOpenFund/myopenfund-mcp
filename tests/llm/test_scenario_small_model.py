@@ -8,10 +8,14 @@ The server runs in memory over a fake SEC (no network): `FakeLive` answers `comp
 and the real `FilingsIndexer` (FakeEmbedder, no model download) holds four synthetic 10-Ks, fetched
 and indexed before the model is asked: the test measures the model and the tool descriptions.
 
-A run passes when (a) the final answer contains the FY2024 capex value of both companies, equal to the
-rows the tools returned (formatting-tolerant: billions or millions, commas, rounding within REL_TOL),
-and (b) it quotes a passage (QUOTE_WORDS words in a row) of a `companies_search_filings` hit and gives
+A run passes when (a) the final answer (minus any <think> block and quoted spans) gives the FY2024 capex
+value of each company, equal to the rows the tools returned (formatting-tolerant: billions or millions,
+commas, rounding within REL_TOL), ATTRIBUTED to that company: the value sits in a sentence or line that
+names that company and not the other; where a segment names both or neither, the values must come in the
+same order as the names (a table's header line gives the order for its rows); and (b) it quotes a passage (QUOTE_WORDS words in a row) of a `companies_search_filings` hit and gives
 that hit's `url`. The scenario runs RUNS times; the criterion is at least REQUIRED passes (4 of 6).
+Runs are independent samples: temperature SAMPLING_TEMPERATURE and a distinct seed per run. A run that
+hits an Ollama error (HTTP, timeout, malformed tool call) counts as a FAIL with the error, not an abort.
 
 Opt-in: marker `llm`, needs a running Ollama. The model comes from MOF_MCP_IT_OLLAMA_MODEL (default
 qwen3:4b). If the 4B model fails the criterion, the documented default test model is the smallest one
@@ -29,6 +33,7 @@ import datetime as dt
 import os
 import re
 import time
+import urllib.error
 from collections.abc import Iterable
 
 import anyio
@@ -48,6 +53,12 @@ REQUIRED = 4
 MAX_ROUNDS = 8
 REL_TOL = 0.005  # a model may round $44,477 million to "$44.5 billion": 0.5% is accepted
 QUOTE_WORDS = 6  # a quotation: this many words in a row copied from a search hit
+# Sampling: the six runs must be independent draws, not one deterministic run six times.
+SAMPLING_TEMPERATURE = 0.7  # a typical chat temperature: enough variance between runs, still usable
+SEED_BASE = 1000  # run n uses seed SEED_BASE + n: different draws, reproducible on a re-run
+# Context: ~5-6k tokens of tool definitions plus tool results exceed Ollama's default window, which
+# would truncate the prompt silently. 16384 fits; on the Mac OLLAMA_CONTEXT_LENGTH can raise the default.
+NUM_CTX = 16384
 QUESTION = ("For Microsoft and Alphabet, what were capital expenditures in FY2023 and FY2024, and what "
             "does each company's annual report say about financing them? Quote and cite.")
 OLLAMA_URL = os.environ.get("MOF_MCP_IT_OLLAMA_URL")
@@ -78,21 +89,31 @@ _AMOUNT = re.compile(r"(?<![\w.,])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?
 _DATE_WORDS = re.compile(r"\b(?:fy|fiscal|year|q[1-4])\s*['’]?\d{2,4}\b", re.IGNORECASE)
 
 
-def amounts(text: str) -> set[float]:
-    """Every number of `text` as USD: '$44.5 billion', '44,477 million', '44477000000' all give a
-    value. A number with no unit counts as dollars and, too, as millions (a table's 'in millions')."""
-    found: set[float] = set()
-    for match in _AMOUNT.finditer(_DATE_WORDS.sub(" ", text)):
+def amount_spans(text: str) -> list[tuple[float, int]]:
+    """(USD value, position) of every number of `text`: '$44.5 billion', '44,477 million' and
+    '44477000000' all give a value. A number with no unit counts as dollars and, too, as millions
+    (a table's 'in millions'), so it yields two entries at one position."""
+    found: list[tuple[float, int]] = []
+    blanked = _DATE_WORDS.sub(lambda m: " " * len(m.group()), text)  # same length: positions stay valid
+    for match in _AMOUNT.finditer(blanked):
         number, unit = float(match.group(1).replace(",", "")), match.group(2)
         if unit:
-            found.add(number * _UNITS[unit.lower()])
+            found.append((number * _UNITS[unit.lower()], match.start()))
         else:
-            found.update((number, number * 1e6))
+            found.extend(((number, match.start()), (number * 1e6, match.start())))
     return found
 
 
+def amounts(text: str) -> set[float]:
+    return {value for value, _pos in amount_spans(text)}
+
+
+def _close(found: float, value: float, rel_tol: float = REL_TOL) -> bool:
+    return abs(found - value) <= rel_tol * abs(value)
+
+
 def contains_amount(text: str, value: float, *, rel_tol: float = REL_TOL) -> bool:
-    return any(abs(found - value) <= rel_tol * abs(value) for found in amounts(text))
+    return any(_close(found, value, rel_tol) for found in amounts(text))
 
 
 def fy2024_rows(results: Iterable[tuple[str, dict, object]]) -> dict[str, float]:
@@ -103,8 +124,8 @@ def fy2024_rows(results: Iterable[tuple[str, dict, object]]) -> dict[str, float]
             continue
         for row in content.get("rows") or []:
             if (row.get("original_tag") == CAPEX_TAG and row.get("frequency") == "annual"
-                    and str(row.get("valid_date", ""))[:4] == "2024" and row.get("entity_value", row.get("cik"))):
-                values[row.get("cik") or row["entity_value"]] = row["value"]
+                    and str(row.get("valid_date", ""))[:4] == "2024" and row.get("cik")):
+                values[row["cik"]] = row["value"]
     return values
 
 
@@ -129,15 +150,67 @@ def quotes_a_hit(answer: str, hits: list[dict], *, words: int = QUOTE_WORDS) -> 
     return False
 
 
+_THINK = re.compile(r"<think>.*?(?:</think>|\Z)", re.IGNORECASE | re.DOTALL)
+_QUOTED = re.compile(r'"[^"]*"|“[^”]*”|```.*?```', re.DOTALL)
+_URL = re.compile(r"https?://\S+")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+_NAME = {MSFT: re.compile(r"\b(?:microsoft|msft)\b", re.IGNORECASE),
+         GOOGL: re.compile(r"\b(?:alphabet|google|googl)\b", re.IGNORECASE)}
+
+
+def strip_think(answer: str) -> str:
+    return _THINK.sub("", answer).strip()
+
+
+def _segments(text: str) -> list[str]:
+    """Lines, then sentences: the units in which a figure is read as belonging to a company."""
+    return [part for line in text.splitlines() for part in _SENTENCE_END.split(line) if part.strip()]
+
+
+def _value_pos(segment: str, value: float) -> int | None:
+    return next((pos for found, pos in sorted(amount_spans(segment), key=lambda a: a[1])
+                 if _close(found, value)), None)
+
+
+def attributed(answer: str, given: dict[str, float]) -> set[str]:
+    """The ciks whose FY2024 value appears in `answer` as that company's own.
+
+    Quoted spans, URLs and a <think> block are ignored. A segment (line or sentence) naming one company
+    credits its figures to that company only. A segment naming both, or neither, credits both values only
+    if they appear in the same order as the names (for 'neither', the names of the latest header line:
+    both names, no figure); a lone value in such a segment is ambiguous and counts for nobody."""
+    plain = _URL.sub(" ", _QUOTED.sub(" ", strip_think(answer)))
+    credited: set[str] = set()
+    header: list[str] = []  # companies in the order a header line names them
+    for segment in _segments(plain):
+        named = sorted((m.start(), cik) for cik, rx in _NAME.items() if (m := rx.search(segment)))
+        order = [cik for _pos, cik in named]
+        if len(order) == 1:
+            if _value_pos(segment, given[order[0]]) is not None:
+                credited.add(order[0])
+            continue
+        if len(order) == 2 and not amount_spans(segment):
+            header = order
+        expected = order or header
+        if len(expected) != 2:
+            continue
+        where = [_value_pos(segment, given[cik]) for cik in expected]
+        if None not in where and where[0] < where[1]:  # type: ignore[operator]
+            credited.update(expected)
+    return credited
+
+
 def scenario_passed(results: list[tuple[str, dict, object]], answer: str) -> tuple[bool, str]:
     """(pass, why not). `results`: (tool, arguments, structured result) in call order."""
+    answer = strip_think(answer)
     given = fy2024_rows(results)
     missing = sorted({MSFT, GOOGL} - set(given))
     if missing:
         return False, f"no FY2024 capex row from companies_facts for {missing}"
-    absent = [NAMES[c] for c in (MSFT, GOOGL) if not contains_amount(answer, given[c])]
+    credited = attributed(answer, given)
+    absent = [NAMES[c] for c in (MSFT, GOOGL) if c not in credited]
     if absent:
-        return False, f"answer lacks the FY2024 capex of {absent}"
+        return False, f"answer lacks the FY2024 capex of {absent}, attributed to the right company"
     if not quotes_a_hit(answer, search_hits(results)):
         return False, "no quoted passage with the url of a companies_search_filings hit"
     return True, ""
@@ -247,6 +320,18 @@ async def run_once(make_client, chat) -> tuple[bool, str, list[tuple[str, dict]]
     return ok, why, calls, answer
 
 
+#: What a flaky Ollama raises mid-run: HTTP errors and timeouts (OSError), malformed JSON or tool call.
+RUN_ERRORS = (OSError, urllib.error.URLError, ValueError, KeyError, TypeError)
+
+
+async def run_guarded(make_client, chat) -> tuple[bool, str, list[tuple[str, dict]], str]:
+    """run_once, but an Ollama error makes this run a FAIL carrying the error instead of aborting."""
+    try:
+        return await run_once(make_client, chat)
+    except RUN_ERRORS as exc:
+        return False, f"error: {type(exc).__name__}: {exc}", [], ""
+
+
 # --- offline tests (default suite) --------------------------------------------------------------------
 
 
@@ -309,6 +394,76 @@ def test_criterion_fails(results, answer, needle):
     assert not ok and needle in why
 
 
+QUOTE_TAIL = (' Microsoft: "We fund our capital expenditures for datacenters from cash generated by operations" '
+              "(https://www.sec.gov/Archives/edgar/data/1/a).")
+
+
+@pytest.mark.parametrize("answer", [
+    "Microsoft FY2024 capex: $44.5 billion; Alphabet FY2024: $52.5 billion." + QUOTE_TAIL,
+    "Microsoft FY2024 capex: $44.5 billion.\nAlphabet FY2024 capex: $52.5 billion." + QUOTE_TAIL,
+    "Alphabet spent $52.5 billion and Microsoft $44.5 billion in FY2024." + QUOTE_TAIL.replace("Microsoft:", "Alphabet:"),
+    "| Microsoft | 44,477 | 28,107 |\n| Alphabet | 52,535 | 32,251 |\n" + QUOTE_TAIL,  # row table, in millions
+    "| | Microsoft | Alphabet |\n| FY2024 | 44,477 | 52,535 |\n| FY2023 | 28,107 | 32,251 |\n" + QUOTE_TAIL,
+    "<think>Microsoft $44.5 billion, Alphabet $52.5 billion</think> Microsoft $44.5 billion, Alphabet $52.5 billion." + QUOTE_TAIL,
+], ids=["one-line", "lines", "reversed-names", "row-table", "column-table", "with-think"])
+def test_attribution_accepts_each_value_with_its_company(answer):
+    assert scenario_passed(GOOD_RESULTS, answer) == (True, "")
+
+
+@pytest.mark.parametrize(("answer", "needle"), [
+    ("Microsoft FY2024 capex: $52.5 billion; Alphabet FY2024: $44.5 billion." + QUOTE_TAIL, "Microsoft"),  # swapped
+    ("Microsoft FY2024 capex: $52.5 billion.\nAlphabet FY2024 capex: $44.5 billion." + QUOTE_TAIL, "Microsoft"),
+    ("Alphabet spent $44.5 billion and Microsoft $52.5 billion in FY2024." + QUOTE_TAIL, "Microsoft"),
+    ("| Microsoft | 52,535 | 28,107 |\n| Alphabet | 44,477 | 32,251 |\n" + QUOTE_TAIL, "Microsoft"),
+    ("| | Microsoft | Alphabet |\n| FY2024 | 52,535 | 44,477 |\n" + QUOTE_TAIL, "Microsoft"),
+    ("Microsoft and Alphabet spent $44.5 billion." + QUOTE_TAIL, "Alphabet"),  # one value, two names: ambiguous
+    ("The two spent $44.5 billion and $52.5 billion." + QUOTE_TAIL, "Microsoft"),  # no names, no header
+    # pasting the passages (figures only inside quotes, or unnamed prose) is not an answer
+    ('"Cash used was $44,477 million" and "Cash used was $52,535 million" ' + QUOTE_TAIL, "Microsoft"),
+    ("<think>Microsoft $44.5 billion, Alphabet $52.5 billion</think> I cannot tell." + QUOTE_TAIL, "Microsoft"),
+])
+def test_attribution_rejects_misattributed_or_unattributed_values(answer, needle):
+    ok, why = scenario_passed(GOOD_RESULTS, answer)
+    assert not ok and "attributed" in why and needle in why
+
+
+def test_strip_think_removes_closed_and_unclosed_blocks():
+    assert strip_think("<think>a</think> b") == "b" and strip_think("c <think>never closed") == "c"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error", [
+    urllib.error.HTTPError("http://x", 500, "boom", None, None), TimeoutError("timed out"),
+    urllib.error.URLError("refused"), ValueError("bad json"), KeyError("function"),
+])
+async def test_a_failing_chat_makes_the_run_a_fail_not_an_abort(tmp_path, error):
+    indexer, make_client = await warm_server(tmp_path)
+
+    def chat(messages, tools):
+        raise error
+
+    try:
+        ok, why, calls, answer = await run_guarded(make_client, chat)
+    finally:
+        indexer.close()
+    assert not ok and why.startswith("error: ") and calls == [] and answer == ""
+
+
+@pytest.mark.anyio
+async def test_malformed_tool_call_arguments_make_the_run_a_fail(tmp_path):
+    indexer, make_client = await warm_server(tmp_path)
+
+    def chat(messages, tools):
+        return {"role": "assistant", "content": "", "tool_calls": [{"function": {
+            "name": "companies_facts", "arguments": "{not json"}}]}
+
+    try:
+        ok, why, _calls, _answer = await run_guarded(make_client, chat)
+    finally:
+        indexer.close()
+    assert not ok and why.startswith("error: ")
+
+
 @pytest.mark.anyio
 async def test_scripted_good_model_passes_on_the_offline_server(tmp_path):
     """Plays a well-behaved model against the real tools: the fixtures, the tools and the criterion agree."""
@@ -358,15 +513,16 @@ async def test_scripted_good_model_passes_on_the_offline_server(tmp_path):
 @pytest.mark.skipif(not OLLAMA_URL, reason="MOF_MCP_IT_OLLAMA_URL not set")
 async def test_small_model_scenario(tmp_path):
     model = os.environ.get("MOF_MCP_IT_OLLAMA_MODEL") or DEFAULT_MODEL
-    chat = llm_smoke.ollama_chat(OLLAMA_URL, model)
     indexer, make_client = await warm_server(tmp_path)
     passes, report = 0, []
     try:
         for n in range(1, RUNS + 1):
-            ok, why, calls, answer = await run_once(make_client, chat)
+            chat = llm_smoke.ollama_chat(OLLAMA_URL, model, options={
+                "temperature": SAMPLING_TEMPERATURE, "seed": SEED_BASE + n, "num_ctx": NUM_CTX})
+            ok, why, calls, answer = await run_guarded(make_client, chat)
             passes += ok
             report.append(f"run {n}: {'PASS' if ok else 'FAIL'} rounds={len(calls)} "
-                          f"tools={[c[0] for c in calls]} {why}\n  answer: {answer[:600]!r}")
+                          f"tools={[c[0] for c in calls]} {why}\n  answer: {answer!r}")
             print(report[-1])
     finally:
         indexer.close()
