@@ -1027,10 +1027,11 @@ async def test_filings_store_mode_lists_the_forms_it_cannot_answer(tmp_path):
                          companies_source="store")
     finally:
         s.close()
-    assert four["rows"] == [] and four["forms_not_covered"] == ["4"]
+    assert four["rows"] == [] and four["forms_not_covered"] == ["4"] and four["all_forms_covered"] is False
     assert len(mixed["rows"]) == 2 and mixed["forms_not_covered"] == ["DEF 14A"]
-    assert len(every["rows"]) == 3 and every["forms_not_covered"] and "10-K" in every["forms_not_covered"][0]
-    assert len(ok["rows"]) == 1 and ok["forms_not_covered"] == []
+    assert len(every["rows"]) == 3 and every["forms_not_covered"] == [] and every["all_forms_covered"] is False
+    assert "10-K" in every["covered_forms"] and "8-K/A" in every["covered_forms"]
+    assert len(ok["rows"]) == 1 and ok["forms_not_covered"] == [] and ok["all_forms_covered"] is True
 
 
 async def test_filings_flag_the_end_of_day_fallback_on_both_sources():
@@ -1059,3 +1060,32 @@ async def test_filings_flag_the_end_of_day_fallback_on_both_sources():
     assert [r["source"] for r in res["rows"]] == ["store", "store"]
     assert (by[K24]["accepted_is_fallback"], by["a-2"]["accepted_is_fallback"]) == (True, False)
     assert by[K24]["accepted_utc"] == "2024-11-02T03:59:59+00:00"
+
+
+async def test_filings_auto_without_a_sec_contact_answers_the_covered_forms_and_reports_the_rest(tmp_path):
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    try:  # auto, no live source: like store mode, never [sec_contact_missing]
+        every = await _call(s, "companies_filings", {"companies": ["AAPL"]})
+        four = await _call(s, "companies_filings", {"companies": ["AAPL"], "forms": ["4"]})
+        tenk = await _call(s, "companies_filings", {"companies": ["AAPL"], "forms": ["10-K"]})
+    finally:
+        s.close()
+    assert len(every["rows"]) == 3 and every["all_forms_covered"] is False and every["forms_not_covered"] == []
+    assert "10-K" in every["covered_forms"] and all(isinstance(f, str) for f in every["covered_forms"])
+    assert four["rows"] == [] and four["forms_not_covered"] == ["4"]
+    assert len(tenk["rows"]) == 2 and tenk["all_forms_covered"] is True and tenk["forms_not_covered"] == []
+    assert {r["source"] for r in every["rows"] + tenk["rows"]} == {"store"}
+
+
+async def test_filings_live_fallback_is_capped_at_now():
+    import datetime as dt
+
+    from source_fakes import APPLE, K24, FakeLive, FakeStore
+
+    today = dt.datetime.now(dt.UTC).astimezone(dt.timezone(dt.timedelta(hours=-5))).date()
+    live = FakeLive(refs={APPLE: [_filing(APPLE, K24, "10-K", None, today, None)]})
+    res = await _routed_call(FakeStore(ciks=()), live, "companies_filings", {"companies": [APPLE]})
+    row = res["rows"][0]
+    assert row["accepted_is_fallback"] is True
+    assert dt.datetime.fromisoformat(row["accepted_utc"]) <= dt.datetime.now(dt.UTC)

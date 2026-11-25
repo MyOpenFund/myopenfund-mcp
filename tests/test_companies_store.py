@@ -773,29 +773,38 @@ def test_filings_collected_known_at_falls_back_to_the_end_of_the_filing_day_in_n
 
 
 def test_filings_store_and_live_agree_on_url_doc_id_and_acceptance(tmp_path):
+    """The store row is what company-corpus's producer writes (filings_rows, manifest-style source_doc_id),
+    the live ref comes from the submissions: the two sources must agree on every accession."""
     import datetime as dt
     from unittest import mock
 
     from companies_fixture import AAPL, seed
-    from live_fixture import AAPL_K24, FakeSec
+    from company_corpus.config import Config
+    from company_corpus.live.filings import fetch_submissions
+    from company_corpus.opendata.filings import filings_rows
+    from live_fixture import FakeSec
     from test_companies_live import _settings
 
     from myopenfund_mcp.companies.live import LiveSource
     from myopenfund_mcp.companies.store import CompaniesStore
 
+    now = dt.datetime(2026, 11, 25, tzinfo=dt.UTC)
+    produced = filings_rows(AAPL, fetch_submissions(AAPL, FakeSec(), max_age_s=None, now=now),
+                            manifest_doc_ids=frozenset(), config=Config(), now=now).rows
+    assert produced and all(r["source_doc_id"] for r in produced)
     live = LiveSource(FakeSec(), _settings())
     cfg = seed(tmp_path, filings=True)
     s = CompaniesStore(str(cfg.data_root), cfg.catalog)
     try:
-        [lref] = [r for r in live.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
-                  if r.accession == AAPL_K24]
-        row = {"filing_ref": AAPL_K24, "form": "10-K", "report_date": lref.report_date,
-               "valid_date": lref.filed, "known_at": lref.accepted, "known_at_kind": "published",
-               "source_doc_id": None}
-        with mock.patch.object(s, "read", return_value=[row]):
-            [sref] = s.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
+        lrefs = {r.accession: r for r in live.filings(AAPL, forms=None, period_from=None, period_to=None)}
+        with mock.patch.object(s, "read", return_value=produced):
+            srefs = {r.accession: r for r in s.filings(AAPL, forms=None, period_from=None, period_to=None)}
     finally:
         s.close()
         live.close()
-    assert (sref.url, sref.doc_id, sref.accepted) == (lref.url, lref.doc_id, lref.accepted)
-    assert sref.accepted == dt.datetime(2024, 11, 1, 20, 6, 22, tzinfo=dt.UTC)
+    assert set(srefs) == {r["filing_ref"] for r in produced} <= set(lrefs)
+    for accn, sref in srefs.items():
+        lref = lrefs[accn]
+        assert (sref.url, sref.doc_id, sref.accepted, sref.filed, sref.report_date, sref.form) == (
+            lref.url, lref.doc_id, lref.accepted, lref.filed, lref.report_date, lref.form)
+    assert srefs["0000320193-24-000123"].accepted == dt.datetime(2024, 11, 1, 20, 6, 22, tzinfo=dt.UTC)

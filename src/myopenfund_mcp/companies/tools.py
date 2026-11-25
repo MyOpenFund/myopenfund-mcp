@@ -412,9 +412,8 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         companies: Annotated[list[CompanyId], Field(description=COMPANIES_DESCRIPTION, min_length=1)],
         forms: Annotated[list[str] | None, Field(
             description="Forms, e.g. ['10-K', '10-Q', '8-K']; a base form includes its amendments "
-                        "('10-K' also returns '10-K/A'); omitted = all forms (the store holds only "
-                        "10-K, 10-Q, 10-KT, 10-QT, 20-F, 40-F, 6-K, 8-K and their amendments: for any "
-                        "other form, or all forms, SEC answers)")] = None,
+                        "('10-K' also returns '10-K/A'); omitted = all forms (the store covers report forms only, see "
+                        "`covered_forms` in the result; for the others SEC answers)")] = None,
         period_from: Annotated[dt.date | None, Field(
             description="Report period end on or after, YYYY-MM-DD")] = None,
         period_to: Annotated[dt.date | None, Field(
@@ -428,12 +427,16 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         "10-K" include amendments ("10-K/A"). Call companies_resolve first if you only have a name.
         `accepted_is_fallback` true = EDGAR gave no acceptance time and `accepted_utc` is the end of the
         filing day in New York (23:59:59): a bound, not the true moment: for an intraday event study
-        treat that row's time as unknown (the next trading day is safe). Rows: newest `accepted_utc`
+        treat that row's time as unknown (the next trading day is safe); a store row whose fallback was
+        capped at the producer's same-day run time is not flagged until the next producer run, and its
+        time is an upper bound. Rows: newest `accepted_utc`
         first across the companies; `report_date` is the period the filing reports on, `filed` the
         filing date; `url` is the filing's EDGAR folder and `doc_id` its document id; datetimes are UTC;
         `source` says where a company's rows come from (store or sec_live), `reason` why SEC answered
-        when the store could have. With MOF_COMPANIES_SOURCE=store, `forms_not_covered` lists the
-        requested forms the store cannot answer. `[warming]` = still fetching from SEC: call again."""
+        when the store could have. When only the store can answer (MOF_COMPANIES_SOURCE=store, or no SEC
+        contact), the result adds `covered_forms` (the report forms the store holds), `all_forms_covered`
+        (false when `forms` is omitted or names others) and `forms_not_covered` (the requested forms the
+        store cannot answer). `[warming]` = still fetching from SEC: call again."""
         page, offset = check(companies, period_from, period_to, limit, cursor)
         wanted = [f.strip().upper() for f in forms] if forms is not None else None
         if wanted is not None and (not wanted or not all(wanted)):
@@ -441,9 +444,8 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         when = dt.datetime.now(dt.UTC)
         covered = covered_forms()
         in_store = wanted is not None and all(f in covered for f in wanted)
-        store_mode = router.mode == "store"
-        not_covered = ([f for f in wanted if f not in covered] if wanted is not None else
-                       ["forms other than " + ", ".join(sorted(covered))]) if store_mode else []
+        store_only = router.live is None  # store mode, or auto without SEC contact: no fallback to SEC
+        not_covered = [f for f in wanted if f not in covered] if wanted is not None else []
 
         async def one(h, routes, budget):
             route = routes[h["cik"]]
@@ -460,13 +462,13 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                 if published is None:  # the store failed: SEC answers for this call
                     routes.update(dict.fromkeys(held, Route(LIVE, STORE_UNAVAILABLE)))
                     budget.go_live()
-                elif not published and store_mode:
+                elif not published and store_only:
                     raise tool_error(UNKNOWN_DATASET, "the store publishes no filings dataset; use "
                                                       "MOF_COMPANIES_SOURCE=auto with MOF_SEC_CONTACT")
                 elif not published:
                     routes.update(dict.fromkeys(held, Route(LIVE, STORE_NO_FILINGS)))
                     budget.go_live()
-                elif not in_store and not store_mode:
+                elif not in_store and not store_only:
                     routes.update(dict.fromkeys(held, Route(LIVE, STORE_FORMS_NOT_COVERED)))
                     budget.go_live()
             found = await _per_company(hits, lambda h: one(h, routes, budget))
@@ -474,10 +476,11 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         for h, (route, refs) in zip(hits, found, strict=True):
             for r in refs:
                 accepted, fallback = r.accepted, False
-                if accepted is None and r.filed is not None:  # EDGAR gave no time: the store's fallback
-                    accepted = fallback_acceptance(r.filed)
-                if accepted is not None:
-                    fallback = r.filed is not None and accepted == fallback_acceptance(r.filed)
+                if accepted is None and r.filed is not None:
+                    # EDGAR gave no time: the fallback, capped at now as company-corpus caps it
+                    accepted, fallback = min(fallback_acceptance(r.filed), when), True
+                elif accepted is not None and r.filed is not None:
+                    fallback = accepted == fallback_acceptance(r.filed)
                 rows.append({"cik": h["cik"], "name": h["current_name"], "form": r.form,
                              "accession": r.accession, "report_date": r.report_date, "filed": r.filed,
                              "accepted_utc": accepted, "accepted_is_fallback": fallback, "url": r.url,
@@ -486,8 +489,9 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                                  if r["accepted_utc"] else 0), r["cik"], r["accession"]))
         chunk, nxt = page_of(rows, page, offset)
         out = {"returned": len(chunk), "total": len(rows), "next_cursor": nxt, "rows": rows_to_utc(chunk)}
-        if store_mode:
-            out["forms_not_covered"] = not_covered
+        if store_only:
+            out.update(covered_forms=list(covered), all_forms_covered=in_store,
+                       forms_not_covered=not_covered)
         return cap_result(out, settings, hint="filter forms or a period range, or ask for a smaller limit")
 
     return co

@@ -42,16 +42,20 @@ def _config():
     return Config()
 
 
-def covered_forms() -> frozenset[str]:
+def covered_forms() -> tuple[str, ...]:
     """The forms the store's ``filings`` dataset holds: company-corpus's ``store_report_forms`` (a
-    producer setting; ``/A`` variants listed). Any other form is not in the store."""
-    return frozenset(f.upper() for f in _config().store_report_forms)
+    producer setting; ``/A`` variants listed), in its order. Any other form is not in the store."""
+    return tuple(f.upper() for f in _config().store_report_forms)
 
 
 def fallback_acceptance(filed: date) -> datetime:
     """The acceptance time company-corpus gives a filing EDGAR dated without one: the filing date at
     ``store_known_at_fallback_time`` in ``store_known_at_fallback_tz`` (23:59:59 New York by default), in
-    UTC. A row whose ``accepted_utc`` equals it is flagged ``accepted_is_fallback``."""
+    UTC. A row whose ``accepted_utc`` equals it is flagged ``accepted_is_fallback``.
+
+    Residual: company-corpus caps the fallback at the producer's run time, so a store row written by a
+    same-day run holds that earlier time, which is not this value: it is not flagged until the next
+    producer run rewrites it, and its time is an upper bound (the filing was accepted by then)."""
     from zoneinfo import ZoneInfo
 
     c = _config()
