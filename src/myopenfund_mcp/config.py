@@ -240,6 +240,11 @@ class Settings:
     sec_timeout_s: int = 30  # MOF_SEC_TIMEOUT_S: seconds one request to SEC may take
     sec_retries: int = 4  # MOF_SEC_RETRIES: retries of a failed request (0 = none)
     sec_call_budget_s: int = 50  # MOF_SEC_CALL_BUDGET_S: time budget of one tool call that fetches from SEC
+    # MOF_SEC_POSITIONS_LOOKBACK_Y: years before now whose filings get statement positions when a call
+    # names no period start (positions cost three requests per filing)
+    sec_positions_lookback_y: int = 5
+    # MOF_SEC_MEMO_COMPANIES: companies whose live tables are kept in memory (the oldest built is dropped)
+    sec_memo_companies: int = 50
     # MOF_COMPANIES_SOURCE: auto (the store when MOF_COMPANIES_CATALOG is set, SEC when MOF_SEC_CONTACT is,
     # neither = no companies toolset) | store | sec
     companies_source: str = "auto"
@@ -324,6 +329,8 @@ class Settings:
             sec_timeout_s=_int(env, "MOF_SEC_TIMEOUT_S", 30, maximum=600),
             sec_retries=_int(env, "MOF_SEC_RETRIES", 4, minimum=0, maximum=20),
             sec_call_budget_s=_int(env, "MOF_SEC_CALL_BUDGET_S", 50, maximum=3600),
+            sec_positions_lookback_y=_int(env, "MOF_SEC_POSITIONS_LOOKBACK_Y", 5, maximum=50),
+            sec_memo_companies=_int(env, "MOF_SEC_MEMO_COMPANIES", 50, maximum=10000),
             companies_source=_get(env, "MOF_COMPANIES_SOURCE") or "auto",
             cache=(_get(env, "MOF_CACHE") or "on").lower(),
             cache_dir=_get(env, "MOF_CACHE_DIR"),

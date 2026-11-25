@@ -285,6 +285,7 @@ def test_no_vault_defaults():
     s = Settings.from_env({})
     assert s.sec_contact is None and s.companies_source == "auto"
     assert (s.sec_max_rps, s.sec_timeout_s, s.sec_retries, s.sec_call_budget_s) == (5.0, 30, 4, 50)
+    assert (s.sec_positions_lookback_y, s.sec_memo_companies) == (5, 50)
     assert (s.cache, s.cache_max_gb) == ("on", 20)
     assert (s.cache_evict_to, s.cache_tmp_grace_s) == (0.9, 3600)
     assert s.cache_dir is None and s.cache_path().endswith("myopenfund-mcp")
@@ -350,6 +351,8 @@ def test_contact_is_never_shown_or_echoed():
         {"MOF_SEC_CONTACT": "a@b.c\r\nX: y"}, {"MOF_SEC_CONTACT": "\u00e9@b.c"},
         {"MOF_SEC_CONTACT": "a" * 201}, {"MOF_SEC_MAX_RPS": "10.5"}, {"MOF_SEC_TIMEOUT_S": "601"},
         {"MOF_SEC_RETRIES": "21"}, {"MOF_SEC_CALL_BUDGET_S": "3601"}, {"MOF_CACHE_MAX_GB": "100001"},
+        {"MOF_SEC_POSITIONS_LOOKBACK_Y": "0"}, {"MOF_SEC_POSITIONS_LOOKBACK_Y": "51"},
+        {"MOF_SEC_MEMO_COMPANIES": "0"}, {"MOF_SEC_MEMO_COMPANIES": "10001"},
         {"MOF_CACHE_TTL_COMPANYFACTS_H": "0"}, {"MOF_CACHE_TTL_COMPANYFACTS_H": "8761"},
         {"MOF_CACHE_TTL_SUBMISSIONS_H": "8761"}, {"MOF_FILINGS_MAX_DOCS": "1001"}, {"MOF_INDEX_WORKERS": "33"},
         {"MOF_SEARCH_RRF_K": "1001"}, {"MOF_SEARCH_CANDIDATES": "1001"}, {"MOF_CHUNK_MAX_TOKENS": "8193"},

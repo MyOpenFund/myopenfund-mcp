@@ -46,6 +46,7 @@ FIELDS = {
     "MOF_RAG_DATE_FILTER_RETRY_S": "rag_date_filter_retry_s",
     "MOF_SEC_CONTACT": "sec_contact", "MOF_SEC_MAX_RPS": "sec_max_rps", "MOF_SEC_TIMEOUT_S": "sec_timeout_s",
     "MOF_SEC_RETRIES": "sec_retries", "MOF_SEC_CALL_BUDGET_S": "sec_call_budget_s",
+    "MOF_SEC_POSITIONS_LOOKBACK_Y": "sec_positions_lookback_y", "MOF_SEC_MEMO_COMPANIES": "sec_memo_companies",
     "MOF_COMPANIES_SOURCE": "companies_source", "MOF_CACHE": "cache", "MOF_CACHE_DIR": "cache_dir",
     "MOF_CACHE_MAX_GB": "cache_max_gb", "MOF_CACHE_EVICT_TO": "cache_evict_to",
     "MOF_CACHE_TMP_GRACE_S": "cache_tmp_grace_s", "MOF_CACHE_TTL_SUBMISSIONS_H": "cache_ttl_submissions_h",

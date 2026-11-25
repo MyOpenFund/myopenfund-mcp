@@ -373,11 +373,13 @@ class CompaniesStore:
     def describe(self, dataset: str) -> dict:
         return self._run(lambda s: s.describe(dataset))
 
-    def concept_rows(self, cik: str, as_of: datetime) -> tuple[list[dict], list[dict]]:
+    def concept_rows(self, cik: str, as_of: datetime, *, period_from: date | None = None,
+                     period_to: date | None = None) -> tuple[list[dict], list[dict]]:
         """``(selection_rows, vintages)`` for one issuer: company-corpus's concept selection on
         its ``fundamentals`` vintages and ``filing_statements`` knowable at ``as_of``, and those
         vintages (``summaries`` needs them for publication dates). ``([], [])`` without
-        fundamentals."""
+        fundamentals. ``period_from``/``period_to`` are accepted and ignored (the live source
+        fetches positions for that period; the store holds them all already)."""
         from company_corpus.concepts.selection import run_selection
 
         if not isinstance(cik, str) or not cik:

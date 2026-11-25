@@ -102,6 +102,13 @@ def test_concept_rows_give_revenue_and_vintages(store):
     assert len([v for v in vint if v["original_tag"] == REV]) == 3  # restatement kept
 
 
+def test_concept_rows_take_and_ignore_a_period(store):
+    """Same signature as the live source; the store holds every position already."""
+    bounded = store.concept_rows(AAPL, LATER, period_from=date(2030, 1, 1), period_to=date(2030, 12, 31))
+    plain = store.concept_rows(AAPL, LATER)
+    assert [sorted(map(repr, part)) for part in bounded] == [sorted(map(repr, part)) for part in plain]
+
+
 def test_concept_rows_of_a_bank_without_positions(store):
     rows, vint = store.concept_rows(JPM, LATER)
     assert {r["concept"] for r in rows} >= {"revenue", "net_income"}
