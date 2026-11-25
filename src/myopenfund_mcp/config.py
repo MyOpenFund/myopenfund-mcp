@@ -292,6 +292,9 @@ class Settings:
     # MOF_INDEX_CLOSE_TIMEOUT_S: seconds closing the filings indexer waits for its workers' current step
     # (a batch, a fetch, a model load); past it the index is released and the workers die with the process
     index_close_timeout_s: int = 10
+    # MOF_WARM_POLL_INTERVAL_S: seconds `myopenfund-mcp warm` waits between two looks at the SEC fetch
+    # (still warming) and at the indexing progress; the --poll-interval option overrides it
+    warm_poll_interval_s: float = 5.0
     rag_onnx_provider: str = "cpu"  # MOF_RAG_ONNX_PROVIDER: cpu | coreml
     search_rrf_k: int = 60  # MOF_SEARCH_RRF_K: constant k of the reciprocal-rank fusion of a search
     search_candidates: int = 50  # MOF_SEARCH_CANDIDATES: passages each retriever hands to the fusion
@@ -378,6 +381,7 @@ class Settings:
             filings_not_ready_listed=_int(env, "MOF_FILINGS_NOT_READY_LISTED", 10, minimum=0, maximum=1000),
             index_workers=_int(env, "MOF_INDEX_WORKERS", 1, maximum=32),
             index_close_timeout_s=_int(env, "MOF_INDEX_CLOSE_TIMEOUT_S", 10, minimum=0, maximum=3600),
+            warm_poll_interval_s=_float(env, "MOF_WARM_POLL_INTERVAL_S", 5.0, 3600.0),
             rag_onnx_provider=_get(env, "MOF_RAG_ONNX_PROVIDER") or "cpu",
             search_rrf_k=_int(env, "MOF_SEARCH_RRF_K", 60, maximum=1000),
             search_candidates=_int(env, "MOF_SEARCH_CANDIDATES", 50, maximum=1000),

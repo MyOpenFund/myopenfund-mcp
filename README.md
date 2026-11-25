@@ -759,6 +759,21 @@ unknown token is rejected with HTTP `401` before any tool runs.
 - Revoke a client: remove its entry and restart. Configuration errors name the faulty entry by position,
   never by content, so a misplaced token is not echoed into logs.
 
+### Warming the cache ahead of questions (`warm`)
+
+```bash
+.venv/bin/myopenfund-mcp warm --companies MSFT,AMZN --forms 10-K,10-Q --since 2022-01-01 [--until 2025-12-31]
+```
+
+Fetches the facts of each company (issuer tables and statement positions) and its filings in the window,
+then downloads and indexes every document until it is `ready`, through the same code the tools use: later
+questions are answered from the cache. Needs `MOF_SEC_CONTACT` and the `[companies,filings]` extras.
+`--forms` defaults to `MOF_FILINGS_DEFAULT_FORMS`; `--poll-interval SECONDS` (default
+`MOF_WARM_POLL_INTERVAL_S`) is the wait between two looks at the progress. Progress lines go to stderr
+(`[warm] 12/20 documents ready (3 indexing)`). Exit codes: `0` all ready, `1` a step or document failed
+(listed), `2` bad arguments or no `MOF_SEC_CONTACT`, `130` interrupted (Ctrl-C: the indexer closes within
+`MOF_INDEX_CLOSE_TIMEOUT_S`). Run it again to resume: documents already `ready` are not fetched again.
+
 ## Configuration and limits
 
 Environment variables only (a `.env` file in a deployment); see [`.env.example`](.env.example). An unset
@@ -830,6 +845,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_FILINGS_NOT_READY_LISTED` | `10` | Not-yet-ready documents listed in a search result (`not_ready`, 0-1000); `not_ready_total` counts them all. |
 | `MOF_INDEX_WORKERS` | `1` | Filings indexed in parallel (1-32). |
 | `MOF_INDEX_CLOSE_TIMEOUT_S` | `10` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600. Past it the index is released; the document is resumed (`partial`) next time. |
+| `MOF_WARM_POLL_INTERVAL_S` | `5.0` | Seconds `myopenfund-mcp warm` waits between two looks at the SEC fetch (still warming) and at the indexing progress (above 0, at most 3600); `--poll-interval` overrides it. |
 | `MOF_RAG_ONNX_PROVIDER` | `cpu` | ONNX execution provider of the local embedding: `cpu` or `coreml`. |
 | `MOF_SEARCH_RRF_K` | `60` | Constant k of the reciprocal-rank fusion of a filings search (1-1000). |
 | `MOF_SEARCH_CANDIDATES` | `50` | Passages each retriever hands to the fusion (1-1000). |
