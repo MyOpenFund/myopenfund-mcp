@@ -59,7 +59,7 @@ python -m venv .venv
 
 The extras pick the toolsets: `[vault]` (documents and pipeline health), `[companies]` (company data:
 `pip install "myopenfund-mcp[companies]"`) and `[rag]` (passage search: `pip install "myopenfund-mcp[rag]"`),
-combinable (`"myopenfund-mcp[vault,companies,rag]"`). The PyPI distribution is `myopenfund-mcp`; the
+combinable (`"myopenfund-mcp[vault,companies,rag]"`). The server is listed in the official MCP Registry as `io.github.MyOpenFund/myopenfund-mcp`. The PyPI distribution is `myopenfund-mcp`; the
 command (`myopenfund-mcp`), the import name (`myopenfund_mcp`) and the repository name are unchanged. The
 MyOpenFund packages it builds on (`myopenfund-vault-query`, `myopenfund-open-data-store`,
 `myopenfund-company-corpus`, `myopenfund-rag-engine`) are installed from PyPI by the extras.
@@ -867,6 +867,8 @@ that needs an unreleased sibling version waits for that sibling's release before
 Bump `__version__` in `src/myopenfund_mcp/__init__.py` in a PR (the version is read from there). Run `pip install -e .` again locally so the installed metadata follows. After the PR merges, go to Actions, then release, then Run workflow: pick the `main` branch and target `pypi`. Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `v<version>` and the GitHub Release itself.
 It fails before publishing if it is not run on the default branch or if that tag already exists. Target `testpypi` is a rehearsal: it publishes to TestPyPI and creates no tag and no release.
 Pushing a tag `v<version>` by hand still works: the workflow checks that the tag equals the package version and is on the default branch, then publishes and attaches the files to the Release.
+After the PyPI release the workflow also updates the MCP Registry listing (`server.json`, whose versions must equal `__version__`); to back-fill a version already on PyPI, go to Actions, then mcp-registry, then Run workflow on `main`.
+Publishing the same version to the registry twice may be rejected; bump the version for a new listing.
 If PyPI got the package but the tag or the Release is missing, re-run the failed `github-release` job from Actions; do not push the tag by hand (the re-run would fail at the PyPI upload).
 A Dependabot PR that raises a sibling's cap needs the range in `pyproject.toml` edited and the constraints regenerated (`python3.13 scripts/update_constraints.py`); never merge it as a single pin.
 

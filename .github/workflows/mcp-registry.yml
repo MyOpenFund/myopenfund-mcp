@@ -1,0 +1,72 @@
+name: mcp-registry
+
+# Lists the published PyPI version in the official MCP Registry. Called by release.yml
+# after the PyPI release; Actions -> mcp-registry -> Run workflow (on main) back-fills
+# a version that is already on PyPI. The registry checks the package's README marker.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish-registry:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: mcp-registry
+      cancel-in-progress: false
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.16
+    steps:
+      - name: Branch guard (a dispatch must run on main)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "run this workflow on main (got $REF): pick the main branch in Run workflow"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the versions and that PyPI has this one
+        run: |
+          version="$(python3 -c "
+          import json, re, sys
+          server = json.load(open('server.json'))
+          init = open('src/myopenfund_mcp/__init__.py').read()
+          package = re.search(r'__version__\s*=\s*\"([^\"]+)\"', init).group(1)
+          found = {server['version'], server['packages'][0]['version'], package}
+          if len(found) != 1:
+              sys.exit('version mismatch: server.json %s, packages[0] %s, __init__ %s' % (server['version'], server['packages'][0]['version'], package))
+          print(package)
+          ")" || exit 1
+          code="$(curl -sS --retry 5 --retry-all-errors --retry-delay 10 -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/myopenfund-mcp/$version/json")" || { echo "could not reach PyPI to check $version"; exit 1; }
+          if [ "$code" = "404" ]; then
+            echo "myopenfund-mcp $version is not on PyPI: publish to PyPI first"
+            exit 1
+          elif [ "$code" != "200" ]; then
+            echo "PyPI answered HTTP $code for myopenfund-mcp $version: cannot confirm it is published"
+            exit 1
+          fi
+          echo "myopenfund-mcp $version is on PyPI and matches server.json"
+      - uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+      - name: Install mcp-publisher (cosign-verified)
+        run: |
+          archive="mcp-publisher_linux_amd64.tar.gz"
+          base="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/$archive.sigstore.json"
+          cosign verify-blob --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$archive"
+          tar xzf "$archive" mcp-publisher
+      - name: Log in with GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+      - name: Publish to the MCP Registry
+        run: ./mcp-publisher publish
