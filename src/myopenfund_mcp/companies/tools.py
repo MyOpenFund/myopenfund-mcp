@@ -26,6 +26,7 @@ from ..errors import (
     TOO_MANY_COMPANIES,
     UNKNOWN_COMPANY,
     UNKNOWN_CONCEPT,
+    UNKNOWN_DATASET,
     UNKNOWN_METRIC,
     WARMING,
     tool_error,
@@ -43,7 +44,16 @@ from .common import (
     store_call,
     time_budget,
 )
-from .router import LIVE, STORE, STORE_NO_FILINGS, STORE_UNAVAILABLE, Route, SourceRouter
+from .router import (
+    LIVE,
+    STORE,
+    STORE_FORMS_NOT_COVERED,
+    STORE_NO_FILINGS,
+    STORE_UNAVAILABLE,
+    Route,
+    SourceRouter,
+)
+from .store import covered_forms, fallback_acceptance
 
 Frequency = Literal["annual", "semiannual", "quarterly", "instant"]
 #: as filed in the store; ytd9 = the 9-month year-to-date, which only derives an unreported Q4
@@ -402,7 +412,9 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         companies: Annotated[list[CompanyId], Field(description=COMPANIES_DESCRIPTION, min_length=1)],
         forms: Annotated[list[str] | None, Field(
             description="Forms, e.g. ['10-K', '10-Q', '8-K']; a base form includes its amendments "
-                        "('10-K' also returns '10-K/A'); omitted = all")] = None,
+                        "('10-K' also returns '10-K/A'); omitted = all forms (the store holds only "
+                        "10-K, 10-Q, 10-KT, 10-QT, 20-F, 40-F, 6-K, 8-K and their amendments: for any "
+                        "other form, or all forms, SEC answers)")] = None,
         period_from: Annotated[dt.date | None, Field(
             description="Report period end on or after, YYYY-MM-DD")] = None,
         period_to: Annotated[dt.date | None, Field(
@@ -414,44 +426,68 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         """Filings of companies with the exact time each became public on EDGAR. `accepted_utc` is
         when the filing became public on EDGAR: the event date for share-price studies. Forms like
         "10-K" include amendments ("10-K/A"). Call companies_resolve first if you only have a name.
-        Rows: newest `accepted_utc` first across the companies; `report_date` is the period the
-        filing reports on, `filed` the filing date; `url` is the filing's EDGAR folder and `doc_id` its
-        document id; datetimes are UTC; `source` says where a company's rows come from (store or
-        sec_live), `reason` why SEC answered when the store could have. `[warming]` = still fetching
-        from SEC: call again."""
+        `accepted_is_fallback` true = EDGAR gave no acceptance time and `accepted_utc` is the end of the
+        filing day in New York (23:59:59): a bound, not the true moment: for an intraday event study
+        treat that row's time as unknown (the next trading day is safe). Rows: newest `accepted_utc`
+        first across the companies; `report_date` is the period the filing reports on, `filed` the
+        filing date; `url` is the filing's EDGAR folder and `doc_id` its document id; datetimes are UTC;
+        `source` says where a company's rows come from (store or sec_live), `reason` why SEC answered
+        when the store could have. With MOF_COMPANIES_SOURCE=store, `forms_not_covered` lists the
+        requested forms the store cannot answer. `[warming]` = still fetching from SEC: call again."""
         page, offset = check(companies, period_from, period_to, limit, cursor)
         wanted = [f.strip().upper() for f in forms] if forms is not None else None
         if wanted is not None and (not wanted or not all(wanted)):
             raise tool_error(INVALID_ARGUMENT, "forms must name at least one form, e.g. ['10-K']")
         when = dt.datetime.now(dt.UTC)
+        covered = covered_forms()
+        in_store = wanted is not None and all(f in covered for f in wanted)
+        store_mode = router.mode == "store"
+        not_covered = ([f for f in wanted if f not in covered] if wanted is not None else
+                       ["forms other than " + ", ".join(sorted(covered))]) if store_mode else []
 
         async def one(h, routes, budget):
             route = routes[h["cik"]]
-            if route.source == STORE and not await call(router.filings_published):
-                if router.mode == "store":  # no live source to ask: the store has no filings
-                    return route, []
-                route = Route(LIVE, STORE_NO_FILINGS)
-                budget.go_live()
             return await on_live(h, route, budget, "filings", cik=h["cik"], forms=wanted,
-                                 period_from=period_from, period_to=period_to)
+                                 period_from=period_from, period_to=period_to, as_of=when)
 
         with time_budget(settings, budget_s) as scope:
             budget = _Budget(settings, scope, live_enabled=router.live_enabled)
             hits = await lookup(companies)
             routes = await plan(hits, when, budget)
+            held = [h["cik"] for h in hits if routes[h["cik"]].source == STORE]
+            if held:
+                published = await call(router.filings_published)
+                if published is None:  # the store failed: SEC answers for this call
+                    routes.update(dict.fromkeys(held, Route(LIVE, STORE_UNAVAILABLE)))
+                    budget.go_live()
+                elif not published and store_mode:
+                    raise tool_error(UNKNOWN_DATASET, "the store publishes no filings dataset; use "
+                                                      "MOF_COMPANIES_SOURCE=auto with MOF_SEC_CONTACT")
+                elif not published:
+                    routes.update(dict.fromkeys(held, Route(LIVE, STORE_NO_FILINGS)))
+                    budget.go_live()
+                elif not in_store and not store_mode:
+                    routes.update(dict.fromkeys(held, Route(LIVE, STORE_FORMS_NOT_COVERED)))
+                    budget.go_live()
             found = await _per_company(hits, lambda h: one(h, routes, budget))
         rows = []
         for h, (route, refs) in zip(hits, found, strict=True):
             for r in refs:
+                accepted, fallback = r.accepted, False
+                if accepted is None and r.filed is not None:  # EDGAR gave no time: the store's fallback
+                    accepted = fallback_acceptance(r.filed)
+                if accepted is not None:
+                    fallback = r.filed is not None and accepted == fallback_acceptance(r.filed)
                 rows.append({"cik": h["cik"], "name": h["current_name"], "form": r.form,
                              "accession": r.accession, "report_date": r.report_date, "filed": r.filed,
-                             "accepted_utc": r.accepted, "url": r.url, "doc_id": r.doc_id,
-                             **_origin(route)})
+                             "accepted_utc": accepted, "accepted_is_fallback": fallback, "url": r.url,
+                             "doc_id": r.doc_id, **_origin(route)})
         rows.sort(key=lambda r: (r["accepted_utc"] is None, -(r["accepted_utc"].timestamp()
                                  if r["accepted_utc"] else 0), r["cik"], r["accession"]))
         chunk, nxt = page_of(rows, page, offset)
-        return cap_result({"returned": len(chunk), "total": len(rows), "next_cursor": nxt,
-                           "rows": rows_to_utc(chunk)}, settings,
-                          hint="filter forms or a period range, or ask for a smaller limit")
+        out = {"returned": len(chunk), "total": len(rows), "next_cursor": nxt, "rows": rows_to_utc(chunk)}
+        if store_mode:
+            out["forms_not_covered"] = not_covered
+        return cap_result(out, settings, hint="filter forms or a period range, or ask for a smaller limit")
 
     return co

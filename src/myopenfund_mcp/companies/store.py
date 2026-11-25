@@ -35,6 +35,30 @@ from pathlib import Path
 from ..config import Q4_RULES
 
 
+@cache
+def _config():
+    from company_corpus.config import Config
+
+    return Config()
+
+
+def covered_forms() -> frozenset[str]:
+    """The forms the store's ``filings`` dataset holds: company-corpus's ``store_report_forms`` (a
+    producer setting; ``/A`` variants listed). Any other form is not in the store."""
+    return frozenset(f.upper() for f in _config().store_report_forms)
+
+
+def fallback_acceptance(filed: date) -> datetime:
+    """The acceptance time company-corpus gives a filing EDGAR dated without one: the filing date at
+    ``store_known_at_fallback_time`` in ``store_known_at_fallback_tz`` (23:59:59 New York by default), in
+    UTC. A row whose ``accepted_utc`` equals it is flagged ``accepted_is_fallback``."""
+    from zoneinfo import ZoneInfo
+
+    c = _config()
+    return datetime.combine(filed, time.fromisoformat(c.store_known_at_fallback_time),
+                            ZoneInfo(c.store_known_at_fallback_tz)).astimezone(UTC)
+
+
 class StoreUnknownDataset(LookupError):
     pass
 
@@ -424,19 +448,19 @@ class CompaniesStore:
         return self._run(go)
 
     def filings(self, cik: str, *, forms=None, period_from: date | None = None,
-                period_to: date | None = None) -> list:
+                period_to: date | None = None, as_of: datetime | None = None) -> list:
         """The issuer's filings in the ``filings`` dataset as company-corpus ``FilingRef`` (the live source's
-        shape), newest accepted first, as known now. ``accepted`` is ``known_at`` when it is the
-        publication time (``published``), else 23:59:59 New York of the filing date (the market-data
-        fallback). ``forms`` and the ``report_date`` window follow ``list_filings`` (a ``/A`` form matches
+        shape), newest accepted first, as known at ``as_of`` (default now). ``accepted`` is
+        ``known_at`` when it is the publication time (``published``), else the fallback acceptance (see
+        :func:`fallback_acceptance`; company-corpus itself writes the fallback into ``known_at`` for a
+        filing EDGAR dated without a time, so the two are told apart by value). ``forms`` and the ``report_date`` window follow ``list_filings`` (a ``/A`` form matches
         its base form; a filing without a report date is excluded when a bound is set); ``url`` and
         ``doc_id`` are built as company-corpus builds them. ``[]`` while the dataset is not published."""
         from collections import Counter
-        from zoneinfo import ZoneInfo
 
         from company_corpus.live.filings import ARCHIVES, FilingRef, cik_to_path_int, source_doc_id
 
-        rows = self.read("filings", as_of=datetime.now(UTC), limit=None, columns=None,
+        rows = self.read("filings", as_of=as_of or datetime.now(UTC), limit=None, columns=None,
                          filters={"entity_scheme": ["cik"], "entity_value": [cik]})
         wanted = {f.upper() for f in forms} if forms is not None else None
         refs, seen = [], set()
@@ -454,8 +478,7 @@ class CompaniesStore:
                 continue
             seen.add(accn)
             filed, known = r["valid_date"], r["known_at"]
-            accepted = (known.astimezone(UTC) if r["known_at_kind"] == "published" else
-                        datetime.combine(filed, time(23, 59, 59), ZoneInfo("America/New_York")).astimezone(UTC))
+            accepted = known.astimezone(UTC) if r["known_at_kind"] == "published" else fallback_acceptance(filed)
             refs.append(FilingRef(
                 cik=cik, accession=accn, form=form, report_date=report, filed=filed, accepted=accepted,
                 primary_document=None,

@@ -692,7 +692,7 @@ async def test_store_companies_are_read_in_one_store_read():
     from source_fakes import APPLE, APPLE_REFS, JPM, MSFT, FakeLive, FakeStore
 
     store = FakeStore(ciks=(APPLE, JPM))
-    store.filings[JPM] = list(store.filings[APPLE])
+    store.known[JPM] = list(store.known[APPLE])
     store.positions[JPM] = set(store.positions[APPLE])
     live = FakeLive(refs={APPLE: list(APPLE_REFS), JPM: list(APPLE_REFS)})
     res = await _routed_call(store, live, "companies_facts", {"companies": [APPLE, JPM, MSFT]})
@@ -824,7 +824,7 @@ async def test_a_slow_failing_sec_leaves_store_companies_answered_unchecked():
 
     store = FakeStore(ciks=(APPLE, MSFT, JPM))
     for c in (MSFT, JPM):
-        store.filings[c] = list(store.filings[APPLE])
+        store.known[c] = list(store.known[APPLE])
         store.positions[c] = set(store.positions[APPLE])
     live = FakeLive(refs={c: list(APPLE_REFS) for c in (APPLE, MSFT, JPM)})
 
@@ -878,7 +878,7 @@ async def test_filings_microsoft_10k_from_2022_with_amendment_in_utc():
     first = res["rows"][0]
     assert first["accepted_utc"] == "2024-08-15T13:00:00+00:00"
     assert set(first) == {"cik", "name", "form", "accession", "report_date", "filed", "accepted_utc", "url",
-                          "doc_id", "source", "reason"}
+                          "doc_id", "source", "reason", "accepted_is_fallback"}
     assert (first["cik"], first["name"], first["report_date"], first["filed"]) == (
         MSFT, "MICROSOFT CORP", "2024-06-30", "2024-08-15")
     assert (first["source"], first["reason"]) == ("sec_live", "not_in_store")
@@ -935,7 +935,8 @@ async def test_filings_from_the_real_store_route_store_with_utc_acceptance(tmp_p
     cfg = seed(tmp_path, filings=True)
     s = CompaniesStore(str(cfg.data_root), cfg.catalog)
     try:
-        res = await _call(s, "companies_filings", {"companies": ["AAPL"]})
+        res = await _call(s, "companies_filings", {"companies": ["AAPL"],
+                                                 "forms": ["10-K", "8-K"]})
         k = await _call(s, "companies_filings", {"companies": ["AAPL"], "forms": ["10-K"],
                                                   "period_to": "2024-12-31"})
     finally:
@@ -957,7 +958,7 @@ async def test_filings_store_without_filings_dataset_is_read_live():
                              companies_source="auto")
     row = res["rows"][0]
     assert (row["source"], row["accession"], row["accepted_utc"]) == ("sec_live", "a-1", None)
-    assert row["reason"] in ("store_no_filings", "store_behind")
+    assert row["reason"] == "store_no_filings"
 
 
 async def test_filings_description_states_the_event_date():
@@ -966,5 +967,95 @@ async def test_filings_description_states_the_event_date():
     async with _routed(FakeStore(), FakeLive()) as c:
         tool = {t.name: t for t in await c.list_tools()}["companies_filings"]
     for text in ("accepted_utc", "became public on EDGAR", "event date for share-price studies",
-                 '"10-K/A"', "companies_resolve"):
+                 '"10-K/A"', "companies_resolve", "accepted_is_fallback", "forms_not_covered"):
         assert text in tool.description
+
+
+def _apple_refs(accepted=None):
+    import datetime as dt
+
+    from source_fakes import APPLE, K24
+
+    return {APPLE: [_filing(APPLE, K24, "DEF 14A", None, dt.date(2024, 11, 1),
+                            accepted or dt.datetime(2024, 11, 1, 20, tzinfo=dt.UTC))]}
+
+
+async def test_filings_store_mode_without_a_filings_dataset_is_a_coded_error(tmp_path):
+    cfg = seed(tmp_path)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    try:
+        async with _client(s, companies_source="store") as c:
+            with pytest.raises(ToolError, match=r"^\[unknown_dataset\] the store publishes no filings"):
+                await c.call_tool("companies_filings", {"companies": ["AAPL"]})
+    finally:
+        s.close()
+
+
+@pytest.mark.parametrize("forms", [["4"], ["DEF 14A"], None, ["10-K", "4"]])
+async def test_filings_auto_goes_live_for_forms_the_store_does_not_hold(forms):
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    store, live = FakeStore(), FakeLive(refs=_apple_refs())
+    store.filing_refs = {APPLE: []}
+    args = {"companies": [APPLE]} | ({"forms": forms} if forms else {})
+    res = await _routed_call(store, live, "companies_filings", args)
+    row = res["rows"][0] if forms in (None, ["DEF 14A"]) else None
+    assert "filings" not in [c.split(":")[0] for c in store.calls] and "forms_not_covered" not in res
+    if row:
+        assert (row["source"], row["reason"]) == ("sec_live", "store_forms_not_covered")
+
+
+async def test_filings_auto_serves_covered_forms_from_the_store():
+    from source_fakes import APPLE, K24, FakeLive, FakeStore
+
+    store, live = FakeStore(), FakeLive(refs=_apple_refs())
+    store.filing_refs = {APPLE: [_filing(APPLE, K24, "10-K/A", None, None, None)]}
+    res = await _routed_call(store, live, "companies_filings", {"companies": [APPLE], "forms": ["10-K"]})
+    assert [(r["source"], r["accession"]) for r in res["rows"]] == [("store", K24)]
+
+
+async def test_filings_store_mode_lists_the_forms_it_cannot_answer(tmp_path):
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    try:
+        four = await _call(s, "companies_filings", {"companies": ["AAPL"], "forms": ["4"]},
+                           companies_source="store")
+        mixed = await _call(s, "companies_filings", {"companies": ["AAPL"], "forms": ["10-K", "def 14a"]},
+                            companies_source="store")
+        every = await _call(s, "companies_filings", {"companies": ["AAPL"]}, companies_source="store")
+        ok = await _call(s, "companies_filings", {"companies": ["AAPL"], "forms": ["8-K"]},
+                         companies_source="store")
+    finally:
+        s.close()
+    assert four["rows"] == [] and four["forms_not_covered"] == ["4"]
+    assert len(mixed["rows"]) == 2 and mixed["forms_not_covered"] == ["DEF 14A"]
+    assert len(every["rows"]) == 3 and every["forms_not_covered"] and "10-K" in every["forms_not_covered"][0]
+    assert len(ok["rows"]) == 1 and ok["forms_not_covered"] == []
+
+
+async def test_filings_flag_the_end_of_day_fallback_on_both_sources():
+    import datetime as dt
+
+    from source_fakes import APPLE, K24, FakeLive, FakeStore
+
+    from myopenfund_mcp.companies.store import fallback_acceptance
+
+    day = dt.date(2024, 11, 1)
+    end = fallback_acceptance(day)
+    assert end == dt.datetime(2024, 11, 2, 3, 59, 59, tzinfo=dt.UTC)
+    # live: no acceptance time from EDGAR -> the fallback, flagged; a real time is not
+    live = FakeLive(refs={APPLE: [_filing(APPLE, K24, "10-K", None, day, None),
+                                  _filing(APPLE, "a-2", "10-K", None, day, dt.datetime(2024, 11, 1, 20, tzinfo=dt.UTC))]})
+    res = await _routed_call(FakeStore(ciks=()), live, "companies_filings", {"companies": [APPLE]})
+    by = {r["accession"]: r for r in res["rows"]}
+    assert (by[K24]["accepted_utc"], by[K24]["accepted_is_fallback"]) == ("2024-11-02T03:59:59+00:00", True)
+    assert by["a-2"]["accepted_is_fallback"] is False
+    # store: the same fallback instant is flagged, a published one is not
+    store = FakeStore()
+    store.filing_refs = {APPLE: [_filing(APPLE, K24, "10-K", None, day, end),
+                                 _filing(APPLE, "a-2", "10-K", None, day, dt.datetime(2024, 11, 1, 20, tzinfo=dt.UTC))]}
+    res = await _routed_call(store, FakeLive(), "companies_filings", {"companies": [APPLE], "forms": ["10-K"]})
+    by = {r["accession"]: r for r in res["rows"]}
+    assert [r["source"] for r in res["rows"]] == ["store", "store"]
+    assert (by[K24]["accepted_is_fallback"], by["a-2"]["accepted_is_fallback"]) == (True, False)
+    assert by[K24]["accepted_utc"] == "2024-11-02T03:59:59+00:00"

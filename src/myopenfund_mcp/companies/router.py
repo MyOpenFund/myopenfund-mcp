@@ -73,6 +73,8 @@ STORE_UNAVAILABLE, NO_STORE = "store_unavailable", "no_store"
 FRESHNESS_UNCHECKED = "freshness_unchecked"
 #: the store holds the company but publishes no ``filings`` dataset: its filings are read from SEC
 STORE_NO_FILINGS = "store_no_filings"
+#: the requested forms are not all in the store's ``filings`` dataset (``covered_forms``): read from SEC
+STORE_FORMS_NOT_COVERED = "store_forms_not_covered"
 #: the caller's mistakes, never a store failure: they propagate, no fallback
 _ARGUMENT_ERRORS = (StoreBadArgument, StoreUnknownDataset)
 #: the live source's methods that take a per-call wait (``budget_s``)
@@ -210,9 +212,16 @@ class SourceRouter:
             self._state = state
         return state
 
-    def filings_published(self) -> bool:
-        """Whether the store publishes the ``filings`` dataset (as of its current publication)."""
-        return self.store is not None and self._store_state().filings_published
+    def filings_published(self) -> bool | None:
+        """Whether the store publishes the ``filings`` dataset (as of its current publication); None
+        when the store failed and ``auto`` can answer from SEC instead."""
+        try:
+            return self.store is not None and self._store_state().filings_published
+        except Exception as exc:
+            if not self._can_fall_back(exc):
+                raise
+            log.warning("companies: store failed, answering from SEC (%s)", type(exc).__name__)
+            return None
 
     def _executor(self) -> ThreadPoolExecutor:
         with self._lock:
@@ -348,6 +357,8 @@ class SourceRouter:
             route = Route(LIVE, STORE_UNAVAILABLE)
         if self.live is None:
             raise LiveNotConfigured(company, route.reason or NO_STORE)
+        if method == "filings":  # SEC's list is always as known now
+            kwargs.pop("as_of", None)
         if budget_s is not None and method in _BUDGETED:
             kwargs["budget_s"] = budget_s
         return route, getattr(self.live, method)(**kwargs)

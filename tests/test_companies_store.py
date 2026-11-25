@@ -770,3 +770,32 @@ def test_filings_collected_known_at_falls_back_to_the_end_of_the_filing_day_in_n
     assert ref.accepted == dt.datetime(2025, 1, 16, 4, 59, 59, tzinfo=dt.UTC)
     assert ref.url == "https://www.sec.gov/Archives/edgar/data/320193/000032019325000001"
     assert ref.doc_id
+
+
+def test_filings_store_and_live_agree_on_url_doc_id_and_acceptance(tmp_path):
+    import datetime as dt
+    from unittest import mock
+
+    from companies_fixture import AAPL, seed
+    from live_fixture import AAPL_K24, FakeSec
+    from test_companies_live import _settings
+
+    from myopenfund_mcp.companies.live import LiveSource
+    from myopenfund_mcp.companies.store import CompaniesStore
+
+    live = LiveSource(FakeSec(), _settings())
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    try:
+        [lref] = [r for r in live.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
+                  if r.accession == AAPL_K24]
+        row = {"filing_ref": AAPL_K24, "form": "10-K", "report_date": lref.report_date,
+               "valid_date": lref.filed, "known_at": lref.accepted, "known_at_kind": "published",
+               "source_doc_id": None}
+        with mock.patch.object(s, "read", return_value=[row]):
+            [sref] = s.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
+    finally:
+        s.close()
+        live.close()
+    assert (sref.url, sref.doc_id, sref.accepted) == (lref.url, lref.doc_id, lref.accepted)
+    assert sref.accepted == dt.datetime(2024, 11, 1, 20, 6, 22, tzinfo=dt.UTC)

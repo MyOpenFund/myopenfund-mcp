@@ -121,7 +121,7 @@ def test_as_of_between_a_report_and_its_positions():
 def test_filings_published_and_nothing_at_sec_by_as_of_answers_from_the_store():
     """No IndexError: as_of before any filing, a CIK SEC does not know, filings without acceptance time."""
     store = FakeStore(ciks=(APPLE, MSFT))
-    store.filings[MSFT] = []
+    store.known[MSFT] = []
     live = FakeLive(refs={APPLE: list(APPLE_REFS), MSFT: [Ref("0000789019-26-000001", None, "10-Q")]})
     router = _router(store, live)
     assert router.route(APPLE, dt.datetime(2020, 1, 1, tzinfo=dt.UTC)) == STORE
@@ -196,7 +196,7 @@ def test_what_the_store_holds_is_remembered_until_a_publication():
     store = FakeStore(filings={APPLE: [(K24, ACCEPTED_K24)]})  # the 8-K is not in the store yet
     router = _router(store, FakeLive())
     assert router.route(APPLE) == Route("sec_live", "store_behind")
-    store.filings[APPLE].append((E24, ACCEPTED_E24))
+    store.known[APPLE].append((E24, ACCEPTED_E24))
     assert router.route(APPLE) == Route("sec_live", "store_behind")  # same publication: remembered
     assert store.calls.count("known_filings:filings") == 1
     store.batches += 1  # a publication drops it
@@ -474,7 +474,7 @@ def test_real_store_publication_invalidates_what_was_remembered(real):
 def _three_store_companies():
     store = FakeStore(ciks=(APPLE, MSFT, JPM))
     for c in (MSFT, JPM):
-        store.filings[c] = list(store.filings[APPLE])
+        store.known[c] = list(store.known[APPLE])
         store.positions[c] = set(store.positions[APPLE])
     return store
 

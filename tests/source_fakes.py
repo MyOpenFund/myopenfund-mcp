@@ -114,7 +114,7 @@ class FakeStore(_Recording):
     def __init__(self, ciks=(APPLE,), *, filings=..., positions=None, value=100, fail=None):
         super().__init__(fail)
         self.ciks = list(ciks)
-        self.filings = (
+        self.known = (
             {APPLE: [(K23, ACCEPTED_K23), (K24, ACCEPTED_K24), (E24, ACCEPTED_E24)]}
             if filings is ...
             else filings
@@ -122,6 +122,7 @@ class FakeStore(_Recording):
         self.positions = {APPLE: {K24, K23}} if positions is None else positions
         self.value = value
         self.batches = 1
+        self.filing_refs: dict = {}  # cik -> FilingRef list the store's filings() answers
 
     def freshness(self) -> dict:
         self._enter("freshness")
@@ -130,7 +131,7 @@ class FakeStore(_Recording):
     def datasets(self) -> list[dict]:
         self._enter("datasets")
         names = ["entity_observations", "fundamentals", "filing_statements"]
-        return [{"name": n} for n in names + (["filings"] if self.filings is not None else [])]
+        return [{"name": n} for n in names + (["filings"] if self.known is not None else [])]
 
     def entities(self) -> list[dict]:
         self._enter("entities")
@@ -147,8 +148,12 @@ class FakeStore(_Recording):
     def known_filings(self, cik, *, dataset="filings") -> list[dict]:
         self._enter(f"known_filings:{dataset}", cik)
         if dataset == "filings":
-            return [{"filing_ref": a, "known_at": k} for a, k in (self.filings or {}).get(cik, [])]
+            return [{"filing_ref": a, "known_at": k} for a, k in (self.known or {}).get(cik, [])]
         return [{"filing_ref": K24, "known_at": ACCEPTED_K24}] if cik in self.ciks else []
+
+    def filings(self, cik, *, forms=None, period_from=None, period_to=None, as_of=None):
+        self._enter("filings", cik)
+        return [r for r in self.filing_refs.get(cik, []) if forms is None or r.form.upper().removesuffix("/A") in forms or r.form.upper() in forms]
 
     def concept_rows(self, cik, as_of):  # the store's signature as the existing tests patch it
         self._enter("concept_rows", cik)
