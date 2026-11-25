@@ -992,6 +992,19 @@ later (such as an answer tool over RAG) are optional, always support a local bac
 when no LLM is configured. Tool descriptions are directive and arguments are validated against the input
 schema, to help small models call them correctly.
 
+How small is small enough is measured, not assumed: `tests/llm/test_scenario_small_model.py` asks a local
+model, over a fake SEC (no network, no download), to compare the capital expenditures of two companies in
+two fiscal years and to quote and cite what each annual report says about financing them. A run passes
+when the answer has both FY2024 values, equal to the rows the tools returned, and quotes a passage with
+the `url` of a `companies_search_filings` result; the model must pass at least 4 runs of 6. The default
+test model is `qwen3:4b`; if it fails, the documented default is the smallest model that passes. Run it
+with a local Ollama (`ollama pull qwen3:4b`):
+
+```bash
+MOF_MCP_IT_OLLAMA_URL=http://127.0.0.1:11434 MOF_MCP_IT_OLLAMA_MODEL=qwen3:4b \
+  .venv/bin/python -m pytest -m llm tests/llm/test_scenario_small_model.py -s
+```
+
 ## Roadmap
 
 - **v1** (this release): `server_info` and the `vault_*` toolset over the central-bank corpus, read-only;
@@ -1017,7 +1030,7 @@ with an explicit marker:
 - `pytest -m integration`: against a real vault database, with `MOF_MCP_IT_DATABASE_URL` set.
 - `pytest -m integration tests/integration/test_real_store.py`: against a real company store, with `MOF_MCP_IT_COMPANIES_CATALOG` and `MOF_MCP_IT_COMPANIES_DATA_ROOT` set (optional: `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, default 120; `MOF_MCP_IT_ASSERT_LATENCY=1` to enforce the 5 s criterion, on the NAS only; add `-s` or `-rP` to see the printed fundamentals latency).
 - `pytest -m integration tests/integration/test_real_qdrant.py`: `rag_search` against a **throwaway** Qdrant (never a production one: the test creates and deletes collections), with `MOF_MCP_IT_QDRANT_URL` set (e.g. `http://127.0.0.1:6333`). The test creates, seeds (through rag-engine, with its model-free `FakeEmbedder`) and deletes collections named `mof-mcp-it-*`. Optional, for a Qdrant with keys: `MOF_MCP_IT_QDRANT_API_KEY` (can write) and `MOF_MCP_IT_QDRANT_READ_ONLY_API_KEY` (given to the server).
-- `pytest -m llm`: a scripted session with a local model, with `MOF_MCP_IT_OLLAMA_URL` set.
+- `pytest -m llm`: scripted sessions with a local model, with `MOF_MCP_IT_OLLAMA_URL` set (optional: `MOF_MCP_IT_OLLAMA_MODEL`, default `qwen3:4b` for the scenario test; see [Local models](#local-models)).
 
 Build the image with `docker build -t myopenfund-mcp .`; `docker run --rm myopenfund-mcp myopenfund-mcp
 --help` lists the commands.
