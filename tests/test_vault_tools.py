@@ -500,7 +500,7 @@ async def test_search_description_states_the_total_order():
 
 
 def test_installed_vault_query_breaks_ties_by_doc_id_then_corpus():
-    """The pin is myopenfund-vault-query 0.1.0 (the former 0.6.0): ORDER BY ends with doc_id, corpus."""
+    """The pinned myopenfund-vault-query (the former 0.6.0 line): ORDER BY ends with doc_id, corpus."""
     import inspect
     import tomllib
     from importlib.metadata import version

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "myopenfund-mcp"
 dynamic = ["version"]
-description = "One MCP server over the MyOpenFund bricks: official documents and pipeline health today, RAG and company data next."
+description = "One MCP server over the MyOpenFund bricks: official documents, pipeline health, RAG search and company data."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -44,6 +44,10 @@ myopenfund-mcp = "myopenfund_mcp.cli:main"
 
 [tool.hatch.version]
 path = "src/myopenfund_mcp/__init__.py"
+
+# The sdist carries the sources and the tests, not the repository's CI or local MCP client files.
+[tool.hatch.build.targets.sdist]
+exclude = ["/.github", "/.mcp.json"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/myopenfund_mcp"]

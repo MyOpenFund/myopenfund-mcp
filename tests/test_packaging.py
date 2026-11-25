@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 REPO = Path(__file__).resolve().parents[1]
 DIST = "myopenfund-mcp"
@@ -17,10 +18,11 @@ CREDIT = (
 RELEASE = REPO / ".github" / "workflows" / "release.yml"
 TESTS = REPO / ".github" / "workflows" / "tests.yml"
 BLOB = "https://github.com/MyOpenFund/myopenfund-mcp/blob/main/"
+# extra -> the sibling distributions (with their own extras) it names; the ranges are checked by rule
 SIBLINGS = {
-    "vault": ["myopenfund-vault-query>=0.1.0,<0.2"],
-    "companies": ["myopenfund-open-data-store[reader]>=0.1.0,<0.2", "myopenfund-company-corpus>=0.1.0,<0.2"],
-    "rag": ["myopenfund-rag-engine[onnx]>=0.1.0,<0.2"],
+    "vault": [("myopenfund-vault-query", set())],
+    "companies": [("myopenfund-open-data-store", {"reader"}), ("myopenfund-company-corpus", set())],
+    "rag": [("myopenfund-rag-engine", {"onnx"})],
 }
 
 
@@ -101,7 +103,9 @@ def test_readme_credit_install_and_migration():
     lines = text.splitlines()
     assert lines[0] == "# myopenfund-mcp"
     assert next(line for line in lines[1:] if line.strip()) == CREDIT
+    # the registry's case rule is unverified: both spellings are present
     assert "<!-- mcp-name: io.github.myopenfund/myopenfund-mcp -->" in text
+    assert "<!-- mcp-name: io.github.MyOpenFund/myopenfund-mcp -->" in text
     assert 'uvx --from "myopenfund-mcp[vault]" myopenfund-mcp serve' in text
     assert f'pip install "{DIST}[companies]"' in text
     assert "pip uninstall -y vault-query open-data-store company-corpus rag-engine" in text
@@ -122,10 +126,36 @@ def test_readme_links_are_absolute():
     assert "https://github.com/MyOpenFund/myopenfund-mcp#tools" in text
 
 
+def _next_breaking(floor: str) -> Version:
+    """The first version that may break a caller of `floor`: 0.m.x -> 0.(m+1); M.x.y -> M+1."""
+    v = Version(floor)
+    return Version(f"0.{v.minor + 1}") if v.major == 0 else Version(str(v.major + 1))
+
+
+def _assert_floor_and_cap(r: Requirement) -> None:
+    """Exactly `>=X.Y.Z` and the next breaking version as cap, consistent with the floor."""
+    ops = {s.operator: Version(s.version) for s in r.specifier}
+    assert len(r.specifier) == 2 and set(ops) == {">=", "<"}, r
+    assert ops["<"] == _next_breaking(str(ops[">="])), r
+
+
+def test_cap_rule_accepts_the_next_breaking_version_only():
+    import pytest
+
+    for ok in ("x>=0.1.0,<0.2", "x>=0.4.2,<0.5", "x>=1.1.0,<2", "x>=2.0,<3"):
+        _assert_floor_and_cap(Requirement(ok))
+    for bad in ("x>=0.1.0", "x>=0.1.0,<0.3", "x>=1.1.0,<1.2", "x==0.1.0", "x>=0.1.0,<0.2,!=0.1.5"):
+        with pytest.raises(AssertionError):
+            _assert_floor_and_cap(Requirement(bad))
+
+
 def test_extras_name_the_published_siblings_capped():
     extras = _pyproject()["project"]["optional-dependencies"]
     for name, expected in SIBLINGS.items():
-        assert extras[name] == expected, name
+        reqs = [Requirement(d) for d in extras[name]]
+        assert [(r.name, r.extras) for r in reqs] == expected, name
+        for r in reqs:
+            _assert_floor_and_cap(r)
 
 
 def test_sibling_dependencies_are_capped():
@@ -139,7 +169,7 @@ def test_sibling_dependencies_are_capped():
         "myopenfund-rag-engine",
     }
     for r in siblings:
-        assert {(s.operator, s.version) for s in r.specifier} == {(">=", "0.1.0"), ("<", "0.2")}, r
+        _assert_floor_and_cap(r)
 
 
 def test_no_git_urls_or_direct_references_in_metadata():
@@ -348,3 +378,110 @@ def test_tests_workflow_keeps_its_jobs_adds_package_and_runs_weekly():
     assert "twine check --strict" in runs
     locked = " ".join(s.get("run", "") for s in workflow["jobs"]["locked"]["steps"])
     assert "--build-constraint build-constraints.txt" in locked
+
+
+# ---- fail-closed approval gate (release hardening) -------------------------
+
+
+def _gate_job():
+    job = _workflow(RELEASE)["jobs"]["build"]
+    gate = [i for i, s in enumerate(job["steps"]) if s.get("name") == "Check the approval gate"]
+    assert len(gate) == 1
+    return job, gate[0]
+
+
+def test_release_checks_the_approval_gate_before_building():
+    job, gate = _gate_job()
+    assert job["permissions"] == {"contents": "read", "actions": "read"}
+    step = job["steps"][gate]
+    run = step["run"]
+    assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "inputs.target == 'testpypi'" in step["env"]["ENV_NAME"]
+    assert "'testpypi'" in step["env"]["ENV_NAME"] and "'pypi'" in step["env"]["ENV_NAME"]
+    assert 'gh api "repos/$GITHUB_REPOSITORY/environments/$ENV_NAME"' in run
+    assert "if ! " in run  # an API failure (non-200) is tested, not ignored
+    assert "required_reviewers" in run and "exit 1" in run
+    for i, other in enumerate(job["steps"]):
+        uses = other.get("uses", "")
+        building = uses.startswith(
+            ("actions/checkout@", "actions/setup-python@", "actions/upload-artifact@")
+        ) or "build" in other.get("run", "")
+        if i != gate and (building or other.get("name", "").startswith("Build")):
+            assert gate < i, other
+
+
+def _run_gate(tmp_path, response, status):
+    """Run the gate step against a stub `gh` that prints `response` and exits `status`."""
+    import os
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("jq") is None or shutil.which("bash") is None:
+        pytest.skip("needs jq and bash")
+    job, gate = _gate_job()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "gh"
+    stub.write_text(f"#!/bin/sh\ncat <<'JSON'\n{response}\nJSON\nexit {status}\n")
+    stub.chmod(0o755)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "GITHUB_REPOSITORY": "MyOpenFund/example",
+        "ENV_NAME": "pypi",
+    }
+    return subprocess.run(
+        ["bash", "-e", "-c", job["steps"][gate]["run"]],
+        env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+
+
+def test_gate_passes_with_a_required_reviewer(tmp_path):
+    rules = (
+        '{"protection_rules": [{"type": "wait_timer"}, {"type": "required_reviewers",'
+        ' "reviewers": [{"type": "User", "reviewer": {"login": "release-approver"}}]}]}'
+    )
+    assert _run_gate(tmp_path, rules, 0).returncode == 0
+
+
+def test_gate_fails_without_a_required_reviewer(tmp_path):
+    for rules in (
+        '{"protection_rules": []}',
+        '{"protection_rules": [{"type": "required_reviewers", "reviewers": []}]}',
+        '{"protection_rules": [{"type": "branch_policy"}]}',
+        "{}",
+    ):
+        result = _run_gate(tmp_path, rules, 0)
+        assert result.returncode == 1, rules
+        assert "required reviewer" in result.stdout + result.stderr
+
+
+def test_gate_fails_closed_when_the_api_call_fails(tmp_path):
+    result = _run_gate(tmp_path, "gh: Not Found (HTTP 404)", 1)
+    assert result.returncode == 1
+    assert "HTTP 404" in result.stdout + result.stderr
+
+
+def test_description_says_what_the_server_serves_today():
+    description = _pyproject()["project"]["description"]
+    assert not re.search(r"\bnext\b", description.lower())
+    for served in ("official documents", "pipeline health", "RAG", "company data"):
+        assert served in description, served
+
+
+def test_the_sdist_leaves_out_the_ci_files_and_the_local_mcp_config():
+    sdist = _pyproject()["tool"]["hatch"]["build"]["targets"]["sdist"]
+    assert {"/.github", "/.mcp.json"} <= set(sdist["exclude"])
+    assert not any("tests" in entry for entry in sdist["exclude"])
+
+
+def test_how_to_release_names_the_version_source_and_the_dependabot_rule():
+    text = (REPO / "README.md").read_text(encoding="utf-8")
+    section = text.split("**How to release**", 1)[1].split("\n\n", 3)[1]
+    assert "`__version__` in `src/myopenfund_mcp/__init__.py`" in section
+    assert "and `version`" not in section
+    assert "pip install -e ." in section
+    dependabot = [line for line in section.splitlines() if "Dependabot" in line]
+    assert len(dependabot) == 1
+    assert "scripts/update_constraints.py" in dependabot[0] and "single pin" in dependabot[0]

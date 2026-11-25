@@ -3,6 +3,7 @@
 Created and maintained by [Marc Jeulin](https://github.com/jeulinmarc), part of [MyOpenFund](https://github.com/MyOpenFund).
 
 <!-- mcp-name: io.github.myopenfund/myopenfund-mcp -->
+<!-- mcp-name: io.github.MyOpenFund/myopenfund-mcp -->
 
 One [MCP](https://modelcontextprotocol.io) server over the MyOpenFund bricks: official documents and
 pipeline health, cited passage search over the embedded corpus, and company data.
@@ -863,10 +864,11 @@ that needs an unreleased sibling version waits for that sibling's release before
 
 **How to release**
 
-Bump `__version__` in `src/myopenfund_mcp/__init__.py` in a PR. After it merges, go to Actions, then release, then Run workflow: pick the `main` branch and target `pypi`. Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `v<version>` and the GitHub Release itself.
+Bump `__version__` in `src/myopenfund_mcp/__init__.py` in a PR (the version is read from there). Run `pip install -e .` again locally so the installed metadata follows. After the PR merges, go to Actions, then release, then Run workflow: pick the `main` branch and target `pypi`. Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `v<version>` and the GitHub Release itself.
 It fails before publishing if it is not run on the default branch or if that tag already exists. Target `testpypi` is a rehearsal: it publishes to TestPyPI and creates no tag and no release.
 Pushing a tag `v<version>` by hand still works: the workflow checks that the tag equals the package version and is on the default branch, then publishes and attaches the files to the Release.
 If PyPI got the package but the tag or the Release is missing, re-run the failed `github-release` job from Actions; do not push the tag by hand (the re-run would fail at the PyPI upload).
+A Dependabot PR that raises a sibling's cap needs the range in `pyproject.toml` edited and the constraints regenerated (`python3.13 scripts/update_constraints.py`); never merge it as a single pin.
 
 The default test run needs no database, network or model. Opt-in suites are excluded by default and run
 with an explicit marker:
