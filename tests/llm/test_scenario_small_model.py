@@ -30,6 +30,7 @@ session that plays a well-behaved model through the same server, so the opt-in t
 from __future__ import annotations
 
 import datetime as dt
+import http.client
 import os
 import re
 import time
@@ -82,10 +83,21 @@ NAMES = {MSFT: "Microsoft", GOOGL: "Alphabet"}
 
 # --- normaliser and pass criterion (pure) -------------------------------------------------------------
 
-_UNITS = {"trillion": 1e12, "billion": 1e9, "bn": 1e9, "b": 1e9, "million": 1e6, "mm": 1e6, "m": 1e6,
-          "thousand": 1e3, "k": 1e3}
-_AMOUNT = re.compile(r"(?<![\w.,])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?:\s*(trillion|billion|bn|million|mm|thousand|[bmk])\b)?",
-                     re.IGNORECASE)
+# English units (billion = 1e9) and the French "milliard(s)"/"million(s)". A French "billion" (1e12) is not read.
+_UNITS = {"trillion": 1e12, "billion": 1e9, "milliard": 1e9, "bn": 1e9, "b": 1e9, "million": 1e6, "mm": 1e6,
+          "m": 1e6, "thousand": 1e3, "k": 1e3}
+_SPACES = " \u00a0\u202f\u2009"  # regular, no-break, narrow no-break and thin space: French thousands
+# Formats: 44,477.5 (English) | 44 477,5 (French thousands, comma decimal) | 44,5 / 44.5 (decimal).
+_AMOUNT = re.compile(
+    rf"(?<![\w.,])(\d{{1,3}}(?:,\d{{3}})+(?:\.\d+)?|\d{{1,3}}(?:[{_SPACES}]\d{{3}})+(?:,\d+)?|\d+(?:[.,]\d+)?)"
+    rf"(?:[{_SPACES}]*(trillions?|billions?|milliards?|millions?|bn|mm|thousand|[bmk])\b)?", re.IGNORECASE)
+
+
+def _number(text: str) -> float:
+    text = re.sub(f"[{_SPACES}]", "", text)
+    if "," in text and "." not in text and not re.fullmatch(r"\d{1,3}(?:,\d{3})+", text):
+        text = text.replace(",", ".")  # decimal comma
+    return float(text.replace(",", ""))
 _DATE_WORDS = re.compile(r"\b(?:fy|fiscal|year|q[1-4])\s*['’]?\d{2,4}\b", re.IGNORECASE)
 
 
@@ -96,9 +108,10 @@ def amount_spans(text: str) -> list[tuple[float, int]]:
     found: list[tuple[float, int]] = []
     blanked = _DATE_WORDS.sub(lambda m: " " * len(m.group()), text)  # same length: positions stay valid
     for match in _AMOUNT.finditer(blanked):
-        number, unit = float(match.group(1).replace(",", "")), match.group(2)
+        number, unit = _number(match.group(1)), match.group(2)
         if unit:
-            found.append((number * _UNITS[unit.lower()], match.start()))
+            key = unit.lower() if unit.lower() in _UNITS else unit.lower()[:-1]
+            found.append((number * _UNITS[key], match.start()))
         else:
             found.extend(((number, match.start()), (number * 1e6, match.start())))
     return found
@@ -176,21 +189,32 @@ def attributed(answer: str, given: dict[str, float]) -> set[str]:
     """The ciks whose FY2024 value appears in `answer` as that company's own.
 
     Quoted spans, URLs and a <think> block are ignored. A segment (line or sentence) naming one company
-    credits its figures to that company only. A segment naming both, or neither, credits both values only
+    credits its figures to that company only, and the company stays current: following segments naming
+    nobody credit their figures to it until another name or a two-name header appears (heading then
+    bullets, "They rose to ..."). A segment naming both, or neither, credits both values only
     if they appear in the same order as the names (for 'neither', the names of the latest header line:
     both names, no figure); a lone value in such a segment is ambiguous and counts for nobody."""
     plain = _URL.sub(" ", _QUOTED.sub(" ", strip_think(answer)))
     credited: set[str] = set()
+    current: str | None = None  # the company a heading or sentence named alone: its figures follow
     header: list[str] = []  # companies in the order a header line names them
     for segment in _segments(plain):
         named = sorted((m.start(), cik) for cik, rx in _NAME.items() if (m := rx.search(segment)))
         order = [cik for _pos, cik in named]
         if len(order) == 1:
+            current, header = order[0], []
+        elif not order:
+            if current is not None:  # no name: the figures belong to the last company named alone
+                if _value_pos(segment, given[current]) is not None:
+                    credited.add(current)
+                continue
+        else:
+            has_values = bool(amount_spans(segment))
+            current, header = None, (order if not has_values else [])
+        if len(order) == 1:
             if _value_pos(segment, given[order[0]]) is not None:
                 credited.add(order[0])
             continue
-        if len(order) == 2 and not amount_spans(segment):
-            header = order
         expected = order or header
         if len(expected) != 2:
             continue
@@ -321,7 +345,7 @@ async def run_once(make_client, chat) -> tuple[bool, str, list[tuple[str, dict]]
 
 
 #: What a flaky Ollama raises mid-run: HTTP errors and timeouts (OSError), malformed JSON or tool call.
-RUN_ERRORS = (OSError, urllib.error.URLError, ValueError, KeyError, TypeError)
+RUN_ERRORS = (OSError, http.client.HTTPException, urllib.error.URLError, ValueError, KeyError, TypeError)
 
 
 async def run_guarded(make_client, chat) -> tuple[bool, str, list[tuple[str, dict]], str]:
@@ -338,6 +362,7 @@ async def run_guarded(make_client, chat) -> tuple[bool, str, list[tuple[str, dic
 @pytest.mark.parametrize("text", [
     "$44.477 billion", "44,477 million", "USD 44477 million", "44477000000", "$44,477,000,000",
     "about $44.5 billion", "44.5bn", "44,477.0 M", "capex was 44,477 (in millions)",
+    "44,5 milliards", "44 477 millions", "44\u202f477 millions", "44\u00a0477,0 millions", "44,477 Md$ ou 44 477 millions",
 ])
 def test_normaliser_reads_msft_fy2024_in_any_format(text):
     assert contains_amount(text, 44_477_000_000)
@@ -345,7 +370,7 @@ def test_normaliser_reads_msft_fy2024_in_any_format(text):
 
 @pytest.mark.parametrize("text", [
     "$44.0 billion", "$45 billion", "44.477 million", "28,107 million", "FY2024 Q4 2024", "no figure",
-    "$4.4477 billion",
+    "$4.4477 billion", "44,5 millions",
 ])
 def test_normaliser_rejects_other_values(text):
     assert not contains_amount(text, 44_477_000_000)
@@ -405,7 +430,14 @@ QUOTE_TAIL = (' Microsoft: "We fund our capital expenditures for datacenters fro
     "| Microsoft | 44,477 | 28,107 |\n| Alphabet | 52,535 | 32,251 |\n" + QUOTE_TAIL,  # row table, in millions
     "| | Microsoft | Alphabet |\n| FY2024 | 44,477 | 52,535 |\n| FY2023 | 28,107 | 32,251 |\n" + QUOTE_TAIL,
     "<think>Microsoft $44.5 billion, Alphabet $52.5 billion</think> Microsoft $44.5 billion, Alphabet $52.5 billion." + QUOTE_TAIL,
-], ids=["one-line", "lines", "reversed-names", "row-table", "column-table", "with-think"])
+    "### Microsoft (MSFT)\n- **FY2024**: $44.477 billion\n- FY2023: $28.107 billion\n\n### Alphabet (GOOGL)\n- **FY2024**: $52.535 billion\n" + QUOTE_TAIL,
+    "**Microsoft**\n- FY2024 capex: $44.5 billion\n**Alphabet**\n- FY2024 capex: $52.5 billion\n" + QUOTE_TAIL,
+    "1. Microsoft:\n   - FY2024 capex: $44,477 million\n2. Alphabet:\n   - FY2024 capex: $52,535 million\n" + QUOTE_TAIL,
+    "Microsoft's capex were $28.1 billion in FY2023. They rose to $44.5 billion in FY2024. Alphabet's capex "
+    "were $32.3 billion in FY2023. They rose to $52.5 billion in FY2024." + QUOTE_TAIL,
+    "Microsoft: 44,5 milliards de dollars en FY2024. Alphabet: 52 535 millions en FY2024." + QUOTE_TAIL,
+], ids=["one-line", "lines", "reversed-names", "row-table", "column-table", "with-think", "heading-bullets",
+        "bold-heading", "numbered-heading", "anaphora", "french-numbers"])
 def test_attribution_accepts_each_value_with_its_company(answer):
     assert scenario_passed(GOOD_RESULTS, answer) == (True, "")
 
@@ -421,6 +453,10 @@ def test_attribution_accepts_each_value_with_its_company(answer):
     # pasting the passages (figures only inside quotes, or unnamed prose) is not an answer
     ('"Cash used was $44,477 million" and "Cash used was $52,535 million" ' + QUOTE_TAIL, "Microsoft"),
     ("<think>Microsoft $44.5 billion, Alphabet $52.5 billion</think> I cannot tell." + QUOTE_TAIL, "Microsoft"),
+    ("### Microsoft (MSFT)\n- **FY2024**: $52.535 billion\n\n### Alphabet (GOOGL)\n- **FY2024**: $44.477 billion\n" + QUOTE_TAIL, "Microsoft"),
+    ("Microsoft's capex rose to $52.5 billion in FY2024. Alphabet's capex rose to $44.5 billion." + QUOTE_TAIL, "Microsoft"),
+    # a two-name header ends the carry: the figures that follow are read by header order
+    ("Microsoft:\n| | Microsoft | Alphabet |\n| FY2024 | 52,535 | 44,477 |\n" + QUOTE_TAIL, "Microsoft"),
 ])
 def test_attribution_rejects_misattributed_or_unattributed_values(answer, needle):
     ok, why = scenario_passed(GOOD_RESULTS, answer)
@@ -434,7 +470,7 @@ def test_strip_think_removes_closed_and_unclosed_blocks():
 @pytest.mark.anyio
 @pytest.mark.parametrize("error", [
     urllib.error.HTTPError("http://x", 500, "boom", None, None), TimeoutError("timed out"),
-    urllib.error.URLError("refused"), ValueError("bad json"), KeyError("function"),
+    urllib.error.URLError("refused"), http.client.IncompleteRead(b"partial"), ValueError("bad json"), KeyError("function"),
 ])
 async def test_a_failing_chat_makes_the_run_a_fail_not_an_abort(tmp_path, error):
     indexer, make_client = await warm_server(tmp_path)
