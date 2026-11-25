@@ -16,6 +16,7 @@ from .audit import AuditMiddleware
 from .auth import HashedTokenVerifier, caller_tier, parse_tokens
 from .config import ConfigError, Settings
 from .errors import BACKEND_UNAVAILABLE, error_code
+from .filings import GRAPH_NOT_AVAILABLE
 from .paging import jsonable
 
 log = logging.getLogger("myopenfund_mcp.server")
@@ -29,6 +30,14 @@ MISSING_LIVE_EXTRA = ("MOF_SEC_CONTACT is set but the [companies] extra is not i
 
 MISSING_RAG_EXTRA = ("MOF_RAG_QDRANT_HOST is set but the [rag] extra is not installed: "
                      "pip install 'myopenfund-mcp[rag]'")
+
+FILINGS_NO_SEC = ("not available: the filings tools download documents from SEC, which needs MOF_SEC_CONTACT "
+                  "(e.g. an email address)")
+FILINGS_STORE_MODE = ("not available: MOF_COMPANIES_SOURCE=store reads nothing from SEC; the filings tools need "
+                      "MOF_COMPANIES_SOURCE=auto or sec with MOF_SEC_CONTACT")
+FILINGS_NO_CLIENT = "not available: this server has no SEC client (its live source was given to it)"
+FILINGS_MISSING_EXTRA = ("not available: the [filings] extra is not installed: "
+                         "pip install 'myopenfund-mcp[companies,filings]'")
 
 RAG_IMPORT_FAILED = ("MOF_RAG_QDRANT_HOST is set but the rag toolset could not be imported, although the "
                      "[rag] extra seems installed: see the error logged just before this one")
@@ -63,20 +72,45 @@ def _close(owned: list) -> None:
 
 
 def build_server(settings: Settings, *, vault_reader=None, companies_store=None, companies_live=None,
-                 rag_backend=None) -> FastMCP:
-    """``companies_store`` / ``companies_live``: injected sources (tests); the server closes only the
-    ones it builds itself: at shutdown, or at once when a later step refuses to start."""
+                 rag_backend=None, filings_indexer=None) -> FastMCP:
+    """``companies_store`` / ``companies_live`` / ``filings_indexer``: injected sources (tests); the server
+    closes only the ones it builds itself: at shutdown, or at once when a later step refuses to start."""
     owned: list = []
     try:
         return _build_server(settings, owned, vault_reader=vault_reader, companies_store=companies_store,
-                             companies_live=companies_live, rag_backend=rag_backend)
+                             companies_live=companies_live, rag_backend=rag_backend,
+                             filings_indexer=filings_indexer)
     except BaseException:
         _close(owned)
         raise
 
 
+def _filings(settings: Settings, sec, injected, owned: list):
+    """``(lazy indexer, None)`` when the filings tools can be mounted, else ``(None, reason)``.
+
+    They need the ``[filings]`` extra and an SEC client (a contact, and a mode that reads SEC). Nothing is
+    built, opened or loaded here: the indexer is made by its first use, and closed at shutdown."""
+    if injected is not None:
+        from .filings.tools import LazyIndexer
+
+        return LazyIndexer(lambda: injected), None
+    if sec is None:
+        if not settings.sec_contact:
+            return None, FILINGS_NO_SEC
+        return None, FILINGS_STORE_MODE if settings.companies_source == "store" else FILINGS_NO_CLIENT
+    try:
+        from .filings.indexer import FilingsIndexer
+        from .filings.tools import LazyIndexer
+    except ImportError as exc:  # optional: the other toolsets run without it
+        log.info("filings: the [filings] extra is not importable (%s)", type(exc).__name__)
+        return None, FILINGS_MISSING_EXTRA
+    handle = LazyIndexer(partial(FilingsIndexer, settings, sec))
+    owned.append(handle)  # after the live source and the router: closed before them
+    return handle, None
+
+
 def _build_server(settings: Settings, owned: list, *, vault_reader, companies_store, companies_live,
-                  rag_backend) -> FastMCP:
+                  rag_backend, filings_indexer) -> FastMCP:
     auth_enabled = settings.transport == "http"
     if auth_enabled and not settings.tokens:
         raise ConfigError(
@@ -128,6 +162,7 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
             raise ConfigError(MISSING_COMPANIES_EXTRA)
         owned.append(companies_store)
     sec = None
+    filings, filings_reason = None, FILINGS_NO_SEC  # set with the companies toolset
     if companies_live is None and settings.sec_contact and settings.companies_source != "store":
         # MOF_COMPANIES_SOURCE=store never reads SEC: no live source (nor cache folder) then.
         try:
@@ -163,6 +198,12 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
                        namespace="datasets")
         root.mount(build_companies_toolset(router, settings, auth_enabled=auth_enabled),
                    namespace="companies")
+        filings, filings_reason = _filings(settings, sec, filings_indexer, owned)
+        if filings is not None:
+            from .filings.tools import build_filings_toolset
+
+            root.mount(build_filings_toolset(filings.get, router, settings, auth_enabled=auth_enabled),
+                       namespace="companies")
 
     if rag_backend is None and settings.rag_qdrant_host:
         # Same rule as the vault: configured but not installed refuses to start. A missing module is the
@@ -211,6 +252,10 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
         `languages`: the exact values rag_search accepts for these filters, null while not known).
         With the company store: `companies_freshness` (last publication, UTC; batch count), or
         `companies_freshness_error` if the store cannot be read.
+        `filings`: the filing-text tools (companies_fetch_filings, companies_search_filings,
+        companies_read_filing): `status` enabled with the embedding `model`, its `provider`, the
+        `chunker_version` and `documents` (`ready`, `total`; null until the first filings call opens the
+        index), or `status` with the reason they are not available; `graph`: not available yet.
         `companies_source` (auto, store or sec: where company data comes from), `sec_contact_configured`
         (whether SEC can be reached; never the contact itself), `cache` (`dir`: the SEC cache folder,
         `bytes`: its size, null while no cache is open).
@@ -238,6 +283,18 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
                 # The class only: an exception's text can hold the DSN.
                 log.warning("server_info: freshness read failed (%s)", type(exc).__name__)
                 info["freshness_error"] = error_code(exc, BACKEND_UNAVAILABLE)
+        if filings is not None:
+            from .filings.tools import filings_info
+
+            try:
+                indexer = filings.get()
+            except Exception as exc:  # noqa: BLE001 -- closed (shutting down): the rest still answers
+                log.warning("server_info: filings indexer unavailable (%s)", type(exc).__name__)
+                info["filings"] = {"status": "unavailable", "graph": GRAPH_NOT_AVAILABLE}
+            else:
+                info["filings"] = await anyio.to_thread.run_sync(partial(filings_info, indexer, settings))
+        else:
+            info["filings"] = {"status": filings_reason, "graph": GRAPH_NOT_AVAILABLE}
         if companies_store is not None:
             try:
                 with anyio.fail_after(settings.companies_query_timeout_s):

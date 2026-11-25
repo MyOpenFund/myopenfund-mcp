@@ -8,3 +8,6 @@ does. `setdefault`: a value set by the operator is kept.
 import os
 
 os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
+#: `server_info.filings.graph` until the graph tools exist
+GRAPH_NOT_AVAILABLE = "not available (OLAF after the V0)"

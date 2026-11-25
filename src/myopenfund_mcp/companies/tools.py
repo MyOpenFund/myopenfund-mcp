@@ -91,7 +91,49 @@ def _origin(route: Route) -> dict:
     return {"source": route.source, **({"reason": route.reason} if route.reason else {})}
 
 
-async def _per_company(hits: list[dict], fn) -> list:
+def check_companies(companies: list[str], settings: Settings) -> None:
+    """At most `companies_max_companies` companies per call, else `[too_many_companies]`."""
+    if len(companies) > settings.companies_max_companies:
+        raise tool_error(TOO_MANY_COMPANIES, f"{len(companies)} companies; at most "
+                                             f"{settings.companies_max_companies} per call")
+
+
+def check_period(period_from: dt.date | None, period_to: dt.date | None) -> None:
+    if period_from and period_to and period_from > period_to:
+        raise tool_error(INVALID_ARGUMENT, "period_from is after period_to")
+
+
+def unknown_company_hint(router: SourceRouter) -> str:
+    """What an `[unknown_company]` message suggests."""
+    # auto with a store and no contact: a company outside the store needs SEC, which is not configured
+    return ("not in the company store, and companies outside it are read from SEC, which needs "
+            "MOF_SEC_CONTACT (sec_contact_missing); or try companies_resolve"
+            if router.mode == "auto" and router.live is None else "try companies_resolve")
+
+
+async def lookup_companies(router: SourceRouter, companies: list[str], *, call, unknown_hint: str) -> list[dict]:
+    """One entity per distinct company (in the order given); unknown or ambiguous is an error (the
+    SEC resolver's own error when it failed and the store alone cannot resolve the query). `call`
+    runs a blocking router method within the caller's budget (`store_call`)."""
+    rows, sec_failure = await call(router.resolver_rows)
+    idx = res.index(rows)
+    out: dict[str, dict] = {}
+    for q in companies:
+        hits = res.resolve(idx, q)
+        if not hits:
+            if sec_failure is not None:
+                raise coded(sec_failure)
+            raise tool_error(UNKNOWN_COMPANY, f"no company matches {q!r}; {unknown_hint}")
+        if len(hits) > 1:
+            names = ", ".join(f"{h['current_name']} (CIK {h['cik']})" for h in hits[:10])
+            more = f" and {len(hits) - 10} more" if len(hits) > 10 else ""
+            raise tool_error(AMBIGUOUS_COMPANY,
+                             f"{q!r} matches {len(hits)} companies: {names}{more}; pass a CIK")
+        out.setdefault(hits[0]["cik"], hits[0])
+    return list(out.values())
+
+
+async def per_company(hits: list[dict], fn) -> list:
     """``fn(hit)`` for every company at once, results in the order of ``hits``. All or error: the first
     company (in that order) that failed otherwise decides the error; else, when some are still being
     fetched from SEC, one ``[warming]`` lists each of them with its progress."""
@@ -151,10 +193,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
     read = tier_check("read", auth_enabled=auth_enabled)
     budget_s = call_budget_s(settings, live=router.live_enabled)
 
-    # auto with a store and no contact: a company outside the store needs SEC, which is not configured
-    unknown_hint = ("not in the company store, and companies outside it are read from SEC, which needs "
-                    "MOF_SEC_CONTACT (sec_contact_missing); or try companies_resolve"
-                    if router.mode == "auto" and router.live is None else "try companies_resolve")
+    unknown_hint = unknown_company_hint(router)
 
     async def call(fn, /, **kwargs):
         return await store_call(fn, settings=settings, timeout_s=budget_s, **kwargs)
@@ -180,11 +219,8 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
 
     def check(companies, period_from, period_to, limit, cursor) -> tuple[int, int]:
         """Arguments every multi-company tool shares, checked before any store work: (page, offset)."""
-        if len(companies) > settings.companies_max_companies:
-            raise tool_error(TOO_MANY_COMPANIES, f"{len(companies)} companies; at most "
-                                                 f"{settings.companies_max_companies} per call")
-        if period_from and period_to and period_from > period_to:
-            raise tool_error(INVALID_ARGUMENT, "period_from is after period_to")
+        check_companies(companies, settings)
+        check_period(period_from, period_to)
         return clamp_limit(limit, settings), decode_cursor(cursor)
 
     def page_of(rows, page, offset):
@@ -193,24 +229,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         return chunk, (encode_cursor(end) if end < len(rows) and end <= MAX_OFFSET else None)
 
     async def lookup(companies: list[str]) -> list[dict]:
-        """One entity per distinct company (in the order given); unknown or ambiguous is an error (the
-        SEC resolver's own error when it failed and the store alone cannot resolve the query)."""
-        rows, sec_failure = await call(router.resolver_rows)
-        idx = res.index(rows)
-        out: dict[str, dict] = {}
-        for q in companies:
-            hits = res.resolve(idx, q)
-            if not hits:
-                if sec_failure is not None:
-                    raise coded(sec_failure)
-                raise tool_error(UNKNOWN_COMPANY, f"no company matches {q!r}; {unknown_hint}")
-            if len(hits) > 1:
-                names = ", ".join(f"{h['current_name']} (CIK {h['cik']})" for h in hits[:10])
-                more = f" and {len(hits) - 10} more" if len(hits) > 10 else ""
-                raise tool_error(AMBIGUOUS_COMPANY,
-                                 f"{q!r} matches {len(hits)} companies: {names}{more}; pass a CIK")
-            out.setdefault(hits[0]["cik"], hits[0])
-        return list(out.values())
+        return await lookup_companies(router, companies, call=call, unknown_hint=unknown_hint)
 
     @co.tool(auth=read, annotations=READ_ONLY)
     async def resolve(
@@ -285,7 +304,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                 routes[h["cik"]] = route
                 return part
 
-            for h, part in zip(live_hits, await _per_company(live_hits, one), strict=True):
+            for h, part in zip(live_hits, await per_company(live_hits, one), strict=True):
                 by_cik[h["cik"]] = part
         rows = [{"cik": h["cik"], "name": h["current_name"],
                  **{k: v for k, v in r.items() if k != "batch_id"}, **_origin(routes[h["cik"]])}
@@ -371,7 +390,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
             budget = _Budget(settings, scope, live_enabled=router.live_enabled)
             hits = await lookup(companies)
             routes = await plan(hits, when, budget)
-            found = await _per_company(hits, lambda h: one(h, routes, budget))
+            found = await per_company(hits, lambda h: one(h, routes, budget))
             for h, (route, sel, summaries) in zip(hits, found, strict=True):
                 cik, name, origin = h["cik"], h["current_name"], _origin(route)
                 # ends of this company's included duration periods (any concept, before the concept filter)
@@ -471,7 +490,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                 elif not in_store and not store_only:
                     routes.update(dict.fromkeys(held, Route(LIVE, STORE_FORMS_NOT_COVERED)))
                     budget.go_live()
-            found = await _per_company(hits, lambda h: one(h, routes, budget))
+            found = await per_company(hits, lambda h: one(h, routes, budget))
         rows = []
         for h, (route, refs) in zip(hits, found, strict=True):
             for r in refs:

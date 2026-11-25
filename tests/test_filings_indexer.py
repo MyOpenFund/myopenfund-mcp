@@ -771,8 +771,26 @@ def test_open_counts_no_document(tmp_path, monkeypatch):
         b.search("revenue", doc_ids=[DOC], limit=2)
         b.search("revenue", doc_ids=[DOC], limit=2)
         assert counted == [DOC]  # once, when first touched
+        b.search("revenue", doc_ids=None, limit=2)
+        assert counted == [DOC]  # doc_ids None: no reconciliation (the tools always pass doc_ids)
     finally:
         b.close()
+
+
+def test_search_reports_the_matched_scope(tmp_path):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=8))
+    try:
+        indexer.enqueue([ref(), ref("0000789019-24-000002", form="10-Q", report=dt.date(2024, 3, 31))])
+        wait_until(lambda: [s.state for s in indexer.status()] == ["ready", "ready"])
+        both = indexer.search("revenue", doc_ids=[DOC, "sec-0000789019-24-000002"], limit=2)
+        assert {s.doc_id for s in both.matched} == {DOC, "sec-0000789019-24-000002"}
+        only_k = indexer.search("revenue", doc_ids=[DOC, "sec-0000789019-24-000002"], forms=["10-K"], limit=2)
+        assert [s.doc_id for s in only_k.matched] == [DOC]
+        assert indexer.search("revenue", doc_ids=[], limit=2).matched == []
+        assert indexer.opened and indexer.model_name == SPEC.name
+    finally:
+        indexer.close()
+    assert not indexer.opened
 
 
 def test_fill_never_exceeds_the_budget_with_the_next_fields(tmp_path):

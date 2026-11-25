@@ -108,6 +108,7 @@ __all__ = [
     "chunk_options",
     "chunker_version",
     "document_chunks",
+    "filing_doc_id",
     "model_files_cached",
 ]
 
@@ -178,13 +179,22 @@ class StatusResult(list):
 
 class SearchResult(tuple):
     """`(hits, not_ready)` as `search` returns it, plus `unknown`: the requested doc_ids that were
-    never enqueued, in the order given."""
+    never enqueued, in the order given; and `matched`: the statuses of every requested document that
+    passes the `forms` and period filters (ready or not), the scope the search covered."""
 
     unknown: list[str]
+    matched: list[DocStatus]
 
-    def __new__(cls, hits: list[Hit], not_ready: list[DocStatus], unknown: Sequence[str] = ()) -> Self:
+    def __new__(
+        cls,
+        hits: list[Hit],
+        not_ready: list[DocStatus],
+        unknown: Sequence[str] = (),
+        matched: Sequence[DocStatus] = (),
+    ) -> Self:
         result = super().__new__(cls, (hits, not_ready))
         result.unknown = list(unknown)
+        result.matched = list(matched)
         return result
 
     @property
@@ -299,7 +309,8 @@ def _now() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
 
 
-def _default_doc_id(filing: FilingRef) -> str:
+def filing_doc_id(filing: FilingRef) -> str:
+    """The doc_id a filing is indexed under: its own, else `sec-<cik>-<accession>`."""
     return filing.doc_id or f"sec-{filing.cik}-{filing.accession}"
 
 
@@ -414,6 +425,17 @@ class FilingsIndexer:
     def models_dir(self) -> Path:
         """`<cache_path()>/models`, whatever MOF_CACHE says (R36: the model is software, not data)."""
         return Path(self._settings.cache_path()) / "models"
+
+    @property
+    def model_name(self) -> str:
+        """The embedding model's name (rag-engine's settings)."""
+        return self._spec.name
+
+    @property
+    def opened(self) -> bool:
+        """Whether this process holds the index open (nothing is opened by asking)."""
+        with self._lock:
+            return self._index is not None
 
     @property
     def index_dir(self) -> Path:
@@ -619,10 +641,10 @@ class FilingsIndexer:
         download = self._model_download_needed()
         self._start_workers()
         names = names or {}
-        self._reconcile(_default_doc_id(filing) for filing in refs)
+        self._reconcile(filing_doc_id(filing) for filing in refs)
         queued = False
         for filing in refs:
-            doc_id = _default_doc_id(filing)
+            doc_id = filing_doc_id(filing)
             filed = filing.filed.isoformat() if filing.filed else None
             title = f"{names.get(filing.cik) or f'CIK {filing.cik}'} {filing.form} {filed or 'undated'}"
             with self._lock:
@@ -688,11 +710,16 @@ class FilingsIndexer:
 
         Documents: `doc_ids` (every known document when None), restricted to `forms` (a form
         includes its `/A` amendments) and to a report period overlapping `period_from`..`period_to`
-        (the report date, or the filing date when the filing has none), as `companies_filings`."""
+        (the report date, or the filing date when the filing has none), as `companies_filings`.
+        The requested `ready` documents are reconciled with the index (once per process); with
+        `doc_ids` None nothing is (a count per known document would scan the index): the tools always
+        pass the documents they mean."""
         self._open()
         wanted = None if forms is None else {f.upper() for f in forms} | {f"{f.upper()}/A" for f in forms}
         all_rows = self._rows(doc_ids)
-        if any(row[6] == "ready" and row[0] not in self._reconciled for row in all_rows):
+        if doc_ids is not None and any(
+            row[6] == "ready" and row[0] not in self._reconciled for row in all_rows
+        ):
             self._reconcile(row[0] for row in all_rows if row[6] == "ready")
             all_rows = self._rows(doc_ids)
         rows = []
@@ -710,7 +737,7 @@ class FilingsIndexer:
         not_ready = [status for status in rows if status.state != "ready"]
         searchable = [status.doc_id for status in rows if status.chunks_done > 0]
         if not searchable:
-            return SearchResult([], not_ready, unknown)
+            return SearchResult([], not_ready, unknown, rows)
         embedder, _ = self._model()
         with self._lock:
             index = self._index
@@ -731,7 +758,7 @@ class FilingsIndexer:
             if self._closed:  # the index was closed under the search
                 raise IndexUnavailable("the filings index is closed") from None
             raise
-        return SearchResult(hits, not_ready, unknown)
+        return SearchResult(hits, not_ready, unknown, rows)
 
     def read(
         self,
