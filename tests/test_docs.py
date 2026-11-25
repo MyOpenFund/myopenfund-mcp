@@ -24,7 +24,8 @@ def test_every_server_variable_is_documented(doc):
 def test_readme_has_the_no_infrastructure_section():
     text = (ROOT / "README.md").read_text()
     heading = "## Try it at home, without any infrastructure"
-    assert heading in text
+    assert text.count(heading) == 1
+    assert text.count("## Contents") == 1
     section = text.split(heading, 1)[1].split("\n## Quick start", 1)[0]
     for needle in ("MOF_SEC_CONTACT", "mcpServers", "myopenfund-mcp warm", "MOF_CACHE=off", "1.1 GB",
                    "uvx --from", "companies_search_filings", "companies_filings"):
