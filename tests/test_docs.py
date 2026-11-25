@@ -54,8 +54,7 @@ FIELDS = {
     "MOF_SEARCH_EIGENMIND": "search_eigenmind", "MOF_FILINGS_DEFAULT_FORMS": "filings_default_forms",
     "MOF_CHUNK_MAX_TOKENS": "chunk_max_tokens", "MOF_CHUNK_OVERLAP_TOKENS": "chunk_overlap_tokens",
 }
-# Defaults that depend on the machine: the example shows a <placeholder> for them.
-MACHINE_DEFAULTS = {"MOF_CACHE_DIR"}
+
 COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
 
 
@@ -78,8 +77,8 @@ def test_env_example_defaults_match_settings(name, value):
     from myopenfund_mcp.config import Settings
 
     default = getattr(Settings(), FIELDS[name])
-    if name in MACHINE_DEFAULTS:
-        assert "<" in value, f"{name} default depends on the platform; its example must be a <placeholder>"
+    if isinstance(default, tuple):
+        assert value == ",".join(default)
     elif default is None or default == "":  # no default: the example shows a placeholder value
         assert "<" in value, f"{name} has no default; its example must be a <placeholder>"
     elif isinstance(default, bool):  # written as the server reads it: true / false

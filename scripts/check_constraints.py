@@ -1,6 +1,6 @@
 """Check that the running environment matches constraints.txt for every dependency of the server.
 
-    python scripts/check_constraints.py [--extras vault,companies,rag]
+    python scripts/check_constraints.py [--extras vault,companies,rag,filings]
     python scripts/check_constraints.py --build
 
 
@@ -123,7 +123,7 @@ def _build_requires() -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--extras", default="vault,companies,rag")
+    parser.add_argument("--extras", default="vault,companies,rag,filings")
     parser.add_argument("--constraints", default=str(ROOT / "constraints.txt"))
     parser.add_argument("--build", action="store_true",
                         help="check build-constraints.txt against the build requirements instead")

@@ -48,7 +48,8 @@ def test_constraints_are_exact_pins_without_urls():
     assert bad == []
     names = [line.split("==")[0].lower() for line in lines]
     assert names == sorted(names) and len(names) == len(set(names))
-    assert not {"myopenfund-mcp", "vault-query", "open-data-store", "company-corpus", "rag-engine"} & set(names)
+    assert not {"myopenfund-mcp", "vault-query", "open-data-store", "company-corpus", "rag-engine",
+                "myopenfund-rag-engine"} & set(names)
 
 
 def test_git_dependencies_are_pinned_by_full_commit():

@@ -115,7 +115,7 @@ the ones the CI tested:
   list only; the `locked` job also runs `scripts/check_constraints.py --build`, which reads every build
   requirement (this package's, and each git dependency's at its pinned commit) and fails when one is not
   pinned in the file at a version its specifier allows.
-- **Git dependencies** (`vault-query`, `open-data-store`, `company-corpus`, `rag-engine`): pinned by full
+- **Git dependencies** (`vault-query`, `open-data-store`, `company-corpus`, `myopenfund-rag-engine`): pinned by full
   commit in `pyproject.toml`, as before.
 
 The `install` service passes both files of the same commit as URLs (the same `<commit>` three times):
@@ -241,7 +241,7 @@ into a volume at each start of the stack.
 2. **Payload indexes, once, from the data side.** The filters and the list of valid filter values use
    Qdrant's payload indexes. Whoever owns the collection creates them, once per collection, with a key
    that can write, from an environment where `rag-engine` is installed (the ingestion's own, or any venv
-   with `pip install "rag-engine @ git+https://github.com/MyOpenFund/rag-engine@6be21ac393d82d7c5c1a058dcad8204ae15c7289"`,
+   with `pip install "myopenfund-rag-engine @ git+https://github.com/MyOpenFund/rag-engine@ce5a745a9e0b4a6a96c6b21d79aa0b7b1e7cc0e7"`,
    the commit this server is built on). Give the host AND the port: the engine's default port is 6333.
    The key is typed at a prompt here too:
 
@@ -803,14 +803,14 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_DATE_FILTER_MODE` | `auto` | How a date bound of `rag_search` is applied (rag-engine's `date_filter_mode`): `auto` (the intervals on a collection where `date_start` and `date_end` both have a datetime index, the `date` field elsewhere), `interval` (always the intervals; a collection in strict mode without the two indexes refuses it: `search_refused`) or `legacy` (always the `date` field). Lower case, exactly. See [Dates](#dates-in-rag_search). |
 | `MOF_RAG_DATE_FILTER_REFRESH_S` | `300` | `auto` mode: seconds the collection's answer (are the two indexes there?) is kept before a date-bounded call reads it again (0-86400; `0` reads it before every date-bounded search). The longest the server takes to use the intervals once the indexes exist, without a restart. |
 | `MOF_RAG_DATE_FILTER_RETRY_S` | `30` | `auto` mode: seconds before a collection whose answer could not be read is read again (1-3600). Meanwhile date-bounded calls use the last answer read, or `legacy` when none was. Such a failure refuses no call and is not remembered as an outage. |
-| `MOF_COMPANIES_SOURCE` | `auto` | No-vault mode: `auto` (the store when `MOF_COMPANIES_CATALOG` is set, else SEC when `MOF_SEC_CONTACT` is set, else no companies toolset), `store` (needs `MOF_COMPANIES_CATALOG`) or `sec` (needs `MOF_SEC_CONTACT`). Needs the `[companies]` extra. |
-| `MOF_SEC_CONTACT` | unset | E-mail or name sent in the User-Agent of every request to SEC, as their fair-access rules ask. Never logged, shown or put in an error. |
+| `MOF_COMPANIES_SOURCE` | `auto` | No-vault mode: `auto` (the store when `MOF_COMPANIES_CATALOG` is set, else SEC when `MOF_SEC_CONTACT` is set, else no companies toolset), `store` (needs `MOF_COMPANIES_CATALOG`) or `sec` (needs `MOF_SEC_CONTACT`). Needs the `[companies]` extra, which now also installs `markitdown` and `magika` (document conversion for live filings). |
+| `MOF_SEC_CONTACT` | unset | E-mail or name sent in the User-Agent of every request to SEC, as their fair-access rules ask. Printable ASCII, at most 200 characters. Never logged, shown or put in an error. |
 | `MOF_SEC_MAX_RPS` | `5.0` | Requests per second to SEC (above 0, at most 10, SEC's own limit). |
 | `MOF_SEC_TIMEOUT_S` | `30` | Seconds one request to SEC may take (1-600). |
 | `MOF_SEC_RETRIES` | `4` | Retries of a failed request to SEC (0-20). |
 | `MOF_SEC_CALL_BUDGET_S` | `50` | Time budget of one tool call that fetches from SEC, in seconds (1-3600). |
 | `MOF_CACHE` | `on` | Keep fetched data between calls: `on` or `off`. |
-| `MOF_CACHE_DIR` | platform cache folder + `/myopenfund-mcp` | Absolute path. Default: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. |
+| `MOF_CACHE_DIR` | platform cache folder + `/myopenfund-mcp` | Absolute path (`~` is not expanded). Default: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. |
 | `MOF_CACHE_MAX_GB` | `20` | Size above which the oldest cached files are removed (1-100000). |
 | `MOF_CACHE_TTL_SUBMISSIONS_H` | `24` | Hours a cached filing list is reused (1-8760). |
 | `MOF_CACHE_TTL_COMPANYFACTS_H` | `24` | Hours a cached company-facts file is reused (1-8760). |
@@ -850,7 +850,7 @@ schema, to help small models call them correctly.
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[vault,companies,rag,dev]"
+.venv/bin/pip install -e ".[vault,companies,rag,filings,dev]"
 .venv/bin/ruff check .
 .venv/bin/python -m pytest -q
 ```

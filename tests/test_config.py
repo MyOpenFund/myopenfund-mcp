@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from myopenfund_mcp.config import ConfigError, Settings
@@ -284,11 +286,11 @@ def test_no_vault_defaults():
     assert s.sec_contact is None and s.companies_source == "auto"
     assert (s.sec_max_rps, s.sec_timeout_s, s.sec_retries, s.sec_call_budget_s) == (5.0, 30, 4, 50)
     assert (s.cache, s.cache_max_gb) == ("on", 20)
-    assert s.cache_dir.endswith("myopenfund-mcp")
+    assert s.cache_dir is None and s.cache_path().endswith("myopenfund-mcp")
     assert (s.cache_ttl_submissions_h, s.cache_ttl_companyfacts_h) == (24, 24)
     assert (s.filings_max_docs, s.index_workers, s.rag_onnx_provider) == (40, 1, "cpu")
     assert (s.search_rrf_k, s.search_candidates, s.search_eigenmind) == (60, 50, False)
-    assert s.filings_default_forms == "10-K"
+    assert s.filings_default_forms == ("10-K",)
     assert (s.chunk_max_tokens, s.chunk_overlap_tokens) == (480, 32)
 
 
@@ -342,7 +344,13 @@ def test_contact_is_never_shown_or_echoed():
         {"MOF_INDEX_WORKERS": "0"}, {"MOF_SEARCH_RRF_K": "0"}, {"MOF_SEARCH_CANDIDATES": "0"},
         {"MOF_SEARCH_EIGENMIND": "perhaps"}, {"MOF_FILINGS_DEFAULT_FORMS": ","},
         {"MOF_CHUNK_MAX_TOKENS": "0"}, {"MOF_CHUNK_OVERLAP_TOKENS": "480"},
-        {"MOF_CACHE_DIR": "relative/dir"},
+        {"MOF_CACHE_DIR": "relative/dir"}, {"MOF_CACHE_DIR": "~/cache"},
+        {"MOF_SEC_CONTACT": "a@b.c\r\nX: y"}, {"MOF_SEC_CONTACT": "\u00e9@b.c"},
+        {"MOF_SEC_CONTACT": "a" * 201}, {"MOF_SEC_MAX_RPS": "10.5"}, {"MOF_SEC_TIMEOUT_S": "601"},
+        {"MOF_SEC_RETRIES": "21"}, {"MOF_SEC_CALL_BUDGET_S": "3601"}, {"MOF_CACHE_MAX_GB": "100001"},
+        {"MOF_CACHE_TTL_COMPANYFACTS_H": "0"}, {"MOF_CACHE_TTL_COMPANYFACTS_H": "8761"},
+        {"MOF_CACHE_TTL_SUBMISSIONS_H": "8761"}, {"MOF_FILINGS_MAX_DOCS": "1001"}, {"MOF_INDEX_WORKERS": "33"},
+        {"MOF_SEARCH_RRF_K": "1001"}, {"MOF_SEARCH_CANDIDATES": "1001"}, {"MOF_CHUNK_MAX_TOKENS": "8193"},
     ],
 )
 def test_bad_no_vault_values_are_refused(env):
@@ -355,3 +363,44 @@ def test_rps_is_a_float_up_to_ten_and_retries_may_be_zero():
     assert Settings.from_env({"MOF_SEC_MAX_RPS": "10"}).sec_max_rps == 10.0
     assert Settings.from_env({"MOF_SEC_RETRIES": "0"}).sec_retries == 0
     assert Settings.from_env({"MOF_SEARCH_EIGENMIND": "true"}).search_eigenmind is True
+
+
+def test_default_cache_dir_ignores_a_relative_base_and_names_a_missing_home(monkeypatch, tmp_path):
+    from myopenfund_mcp import config
+
+    monkeypatch.setattr(config.sys, "platform", "linux")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", "rel")
+    assert config.default_cache_dir() == str(tmp_path / ".cache" / "myopenfund-mcp")
+    monkeypatch.setattr(config.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", "rel")
+    assert config.default_cache_dir().endswith("myopenfund-mcp") and os.path.isabs(config.default_cache_dir())
+    monkeypatch.setattr(config.os.path, "expanduser", lambda p: p)  # no home directory
+    with pytest.raises(ConfigError, match="MOF_CACHE_DIR"):
+        config.default_cache_dir()
+
+
+def test_an_unusable_default_cache_dir_stops_no_deployment_that_never_asked_for_it(monkeypatch):
+    from myopenfund_mcp import config
+
+    monkeypatch.setattr(config.os.path, "expanduser", lambda p: p)
+    s = Settings.from_env({})  # vault-only: starts
+    with pytest.raises(ConfigError, match="MOF_CACHE_DIR"):
+        s.cache_path()
+
+
+def test_contact_error_never_echoes_the_value():
+    with pytest.raises(ConfigError) as err:
+        Settings.from_env({"MOF_SEC_CONTACT": "secret\u00e9@b.c"})
+    assert "secret" not in str(err.value)
+
+
+def test_forms_are_normalised_and_cache_is_case_insensitive():
+    s = Settings.from_env({"MOF_FILINGS_DEFAULT_FORMS": " 10-k, 10-Q ,10-K", "MOF_CACHE": "OFF"})
+    assert s.filings_default_forms == ("10-K", "10-Q") and s.cache == "off"
+
+
+def test_source_sec_with_a_catalogue_set_still_needs_the_contact():
+    with pytest.raises(ConfigError, match="MOF_SEC_CONTACT"):
+        Settings.from_env({"MOF_COMPANIES_SOURCE": "sec", "MOF_COMPANIES_CATALOG": "postgres:x",
+                           "MOF_COMPANIES_DATA_ROOT": "/d"})

@@ -21,7 +21,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - run: pip install -e ".[vault,companies,rag,dev]"
+      - run: pip install -e ".[vault,companies,rag,filings,dev]"
       - run: ruff check .
       - run: python -m pytest -q
   # The versions the deployment installs: constraints.txt (README, "Pinned versions"). The job above
@@ -38,7 +38,7 @@ jobs:
             pyproject.toml
             constraints.txt
             build-constraints.txt
-      - run: pip install -c constraints.txt --build-constraint build-constraints.txt -e ".[vault,companies,rag,dev]"
+      - run: pip install -c constraints.txt --build-constraint build-constraints.txt -e ".[vault,companies,rag,filings,dev]"
       - run: python scripts/check_constraints.py
       # Reads the git dependencies' build requirements from raw.githubusercontent.com at their pinned commits.
       - run: python scripts/check_constraints.py --build

@@ -30,19 +30,28 @@ CACHE_MODES = ("on", "off")  # MOF_CACHE
 ONNX_PROVIDERS = ("cpu", "coreml")
 #: Largest MOF_SEC_MAX_RPS: SEC's fair-access limit is 10 requests per second.
 SEC_MAX_RPS_LIMIT = 10.0
+#: Most characters of MOF_SEC_CONTACT (it travels in a User-Agent header).
+SEC_CONTACT_MAX_CHARS = 200
 _FORM = re.compile(r"[A-Za-z0-9][A-Za-z0-9./-]{0,19}")
 
 
 def default_cache_dir() -> str:
     """The per-user cache folder of the platform plus ``myopenfund-mcp``: ``$XDG_CACHE_HOME`` or
-    ``~/.cache`` on Linux, ``~/Library/Caches`` on macOS, ``%LOCALAPPDATA%`` on Windows."""
+    ``~/.cache`` on Linux, ``~/Library/Caches`` on macOS, ``%LOCALAPPDATA%`` on Windows. A relative
+    ``XDG_CACHE_HOME`` / ``LOCALAPPDATA`` is ignored (the XDG specification says so). Raises ConfigError
+    when no absolute folder can be found (no home directory): the caller then sets MOF_CACHE_DIR."""
     home = os.path.expanduser("~")
     if sys.platform == "darwin":
         base = os.path.join(home, "Library", "Caches")
     elif sys.platform.startswith("win"):
-        base = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        local = os.environ.get("LOCALAPPDATA", "")
+        base = local if os.path.isabs(local) else os.path.join(home, "AppData", "Local")
     else:
-        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
+        xdg = os.environ.get("XDG_CACHE_HOME", "")
+        base = xdg if os.path.isabs(xdg) else os.path.join(home, ".cache")
+    if not os.path.isabs(base):
+        raise ConfigError("no home directory found to place the cache in: set MOF_CACHE_DIR to an "
+                          "absolute path")
     return os.path.join(base, "myopenfund-mcp")
 
 
@@ -90,6 +99,15 @@ def _float(env: Mapping[str, str], name: str, default: float, maximum: float) ->
     if not math.isfinite(value) or value <= 0 or value > maximum:
         raise ConfigError(f"{name} must be above 0 and at most {maximum:g}, got {raw!r}")
     return value
+
+
+def _forms(raw: str) -> tuple[str, ...]:
+    """Comma-separated form types, stripped, upper-cased, without duplicates, in order."""
+    forms = [f.strip().upper() for f in raw.split(",")]
+    if not all(_FORM.fullmatch(f) for f in forms):
+        raise ConfigError("MOF_FILINGS_DEFAULT_FORMS must be comma-separated form types such as "
+                          f"10-K,10-Q, got {raw!r}")
+    return tuple(dict.fromkeys(forms))
 
 
 _TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
@@ -226,7 +244,8 @@ class Settings:
     # neither = no companies toolset) | store | sec
     companies_source: str = "auto"
     cache: str = "on"  # MOF_CACHE: on | off (off = nothing kept between calls)
-    cache_dir: str = field(default_factory=default_cache_dir)  # MOF_CACHE_DIR: platform cache dir
+    # MOF_CACHE_DIR: absolute path; None = the platform's cache folder, found by cache_path() when needed
+    cache_dir: str | None = None
     cache_max_gb: int = 20  # MOF_CACHE_MAX_GB: size above which the oldest cached files are removed
     cache_ttl_submissions_h: int = 24  # MOF_CACHE_TTL_SUBMISSIONS_H: hours a filing list is reused
     cache_ttl_companyfacts_h: int = 24  # MOF_CACHE_TTL_COMPANYFACTS_H: hours a company-facts file is reused
@@ -236,9 +255,14 @@ class Settings:
     search_rrf_k: int = 60  # MOF_SEARCH_RRF_K: constant k of the reciprocal-rank fusion of a search
     search_candidates: int = 50  # MOF_SEARCH_CANDIDATES: passages each retriever hands to the fusion
     search_eigenmind: bool = False  # MOF_SEARCH_EIGENMIND: add the graph retriever to a search (off until evaluated)
-    filings_default_forms: str = "10-K"  # MOF_FILINGS_DEFAULT_FORMS: comma-separated form types
+    # MOF_FILINGS_DEFAULT_FORMS: comma-separated form types, stripped and without duplicates
+    filings_default_forms: tuple[str, ...] = ("10-K",)
     chunk_max_tokens: int = 480  # MOF_CHUNK_MAX_TOKENS: largest passage, in tokens
     chunk_overlap_tokens: int = 32  # MOF_CHUNK_OVERLAP_TOKENS: tokens shared by neighbouring passages
+
+    def cache_path(self) -> str:
+        """The cache folder: MOF_CACHE_DIR, or the platform default (ConfigError when there is none)."""
+        return self.cache_dir or default_cache_dir()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -293,8 +317,8 @@ class Settings:
             sec_retries=_int(env, "MOF_SEC_RETRIES", 4, minimum=0, maximum=20),
             sec_call_budget_s=_int(env, "MOF_SEC_CALL_BUDGET_S", 50, maximum=3600),
             companies_source=_get(env, "MOF_COMPANIES_SOURCE") or "auto",
-            cache=_get(env, "MOF_CACHE") or "on",
-            cache_dir=_get(env, "MOF_CACHE_DIR") or default_cache_dir(),
+            cache=(_get(env, "MOF_CACHE") or "on").lower(),
+            cache_dir=_get(env, "MOF_CACHE_DIR"),
             cache_max_gb=_int(env, "MOF_CACHE_MAX_GB", 20, maximum=100_000),
             cache_ttl_submissions_h=_int(env, "MOF_CACHE_TTL_SUBMISSIONS_H", 24, maximum=8760),
             cache_ttl_companyfacts_h=_int(env, "MOF_CACHE_TTL_COMPANYFACTS_H", 24, maximum=8760),
@@ -304,7 +328,7 @@ class Settings:
             search_rrf_k=_int(env, "MOF_SEARCH_RRF_K", 60, maximum=1000),
             search_candidates=_int(env, "MOF_SEARCH_CANDIDATES", 50, maximum=1000),
             search_eigenmind=_bool(env, "MOF_SEARCH_EIGENMIND", False),
-            filings_default_forms=_get(env, "MOF_FILINGS_DEFAULT_FORMS") or "10-K",
+            filings_default_forms=_forms(_get(env, "MOF_FILINGS_DEFAULT_FORMS") or "10-K"),
             chunk_max_tokens=_int(env, "MOF_CHUNK_MAX_TOKENS", 480, minimum=16, maximum=8192),
             chunk_overlap_tokens=_int(env, "MOF_CHUNK_OVERLAP_TOKENS", 32, minimum=0, maximum=2048),
         )
@@ -319,16 +343,19 @@ class Settings:
                               "to identify itself")
         if settings.cache not in CACHE_MODES:
             raise ConfigError(f"MOF_CACHE must be one of {', '.join(CACHE_MODES)}, got {settings.cache!r}")
-        if not os.path.isabs(settings.cache_dir):
-            raise ConfigError("MOF_CACHE_DIR must be an absolute path: a relative one would depend on the "
-                              "directory the server is started from")
+        if settings.cache_dir is not None and not os.path.isabs(settings.cache_dir):
+            raise ConfigError("MOF_CACHE_DIR must be an absolute path ('~' is not expanded): a relative one "
+                              "would depend on the directory the server is started from")
+        if settings.sec_contact is not None and (
+            len(settings.sec_contact) > SEC_CONTACT_MAX_CHARS
+            or not all(" " <= c <= "~" for c in settings.sec_contact)
+        ):
+            # The value is never echoed: it is the secret itself.
+            raise ConfigError(f"MOF_SEC_CONTACT must be printable ASCII (no line break, no accent), at most "
+                              f"{SEC_CONTACT_MAX_CHARS} characters")
         if settings.rag_onnx_provider not in ONNX_PROVIDERS:
             raise ConfigError(f"MOF_RAG_ONNX_PROVIDER must be one of {', '.join(ONNX_PROVIDERS)}, "
                               f"got {settings.rag_onnx_provider!r}")
-        forms = [f.strip() for f in settings.filings_default_forms.split(",")]
-        if not all(_FORM.fullmatch(f) for f in forms):
-            raise ConfigError("MOF_FILINGS_DEFAULT_FORMS must be comma-separated form types such as "
-                              f"10-K,10-Q, got {settings.filings_default_forms!r}")
         if settings.chunk_overlap_tokens >= settings.chunk_max_tokens:
             raise ConfigError(
                 f"MOF_CHUNK_OVERLAP_TOKENS ({settings.chunk_overlap_tokens}) must be below "
