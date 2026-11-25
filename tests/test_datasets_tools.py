@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import sys
 import time
 
@@ -283,3 +284,61 @@ def test_rows_to_csv_writes_decimals_exactly():
     assert lines[1] == '123456789012345678.123456,"a,b"'
     assert Decimal(lines[2].split(",")[0]) == Decimal("0.1")
     assert "e" not in lines[2].lower().split(",")[0]
+
+
+# --- restricted market sources (market-data spec §13): never in a page, a count, a cursor or a CSV ------
+
+@pytest.fixture
+def market_store(tmp_path):
+    pytest.importorskip("market_data", reason="the [market] extra is not installed: no source registry")
+    from market_fixture import seed_market
+
+    cfg = seed_market(tmp_path)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    yield s
+    s.close()
+
+
+async def test_datasets_export_csv_filters_restricted(market_store):
+    from market_fixture import PRIV_LABEL, PRIV_TOKEN, UNREGISTERED
+
+    async with _client(market_store) as c:  # stdio: stored restricted rows are not the caller's own data
+        csv_all = (await c.call_tool("datasets_export_csv", {"dataset": "prices"})).data
+        csv_cols = (await c.call_tool("datasets_export_csv", {"dataset": "prices",
+                                                              "columns": ["valid_date", "close"]})).data
+        read = (await c.call_tool("datasets_read_asof", {"dataset": "prices", "limit": 1})).data
+        ids = "instrument_identifiers"
+        first = (await c.call_tool("datasets_read_asof", {"dataset": ids, "limit": 2,
+                                                          "columns": ["instrument_id", "id_value"]})).data
+        second = (await c.call_tool("datasets_export_csv", {"dataset": ids, "limit": 2,
+                                                            "cursor": first["next_cursor"]})).data
+    assert csv_all["returned"] == 0 and csv_all["csv"] == "" and csv_all["next_cursor"] is None
+    assert csv_cols["returned"] == 0 and csv_cols["csv"].strip() == '"valid_date","close"'
+    assert read["returned"] == 0 and read["rows"] == [] and read["next_cursor"] is None
+    # I1's three open labels (openfigi ticker and FIGI, sec CIK); its tiingo series and all of I2 dropped,
+    # with the projection leaving out source_code (the filter runs before it)
+    assert first["returned"] == 2 and second["returned"] == 1 and second["next_cursor"] is None
+    text = json.dumps([csv_all, csv_cols, read, first, second])
+    for leaked in (PRIV_LABEL, PRIV_TOKEN, "tiingo", "private_history", UNREGISTERED):
+        assert leaked not in text
+
+
+async def test_datasets_serve_restricted_rows_to_an_allowed_client_only(market_store):
+    from http_server import free_port, serve
+    from market_fixture import N_PRIVATE, N_TIINGO, UNREGISTERED
+
+    from myopenfund_mcp.auth import hash_token
+
+    port, allowed, other = free_port(), "t-notebook-" + "n" * 40, "t-agents-" + "a" * 40
+    settings = Settings(transport="http", port=port,
+                        tokens=f"notebook:{hash_token(allowed)}:read,agents:{hash_token(other)}:read",
+                        market_restricted_allow={"notebook": frozenset({"tiingo", "private_history"})})
+    with serve(build_server(settings, companies_store=market_store), port) as url:
+        async with Client(url, auth=allowed) as c:
+            rows = (await c.call_tool("datasets_read_asof", {"dataset": "prices"})).data["rows"]
+        async with Client(url, auth=other) as c:
+            none = (await c.call_tool("datasets_export_csv", {"dataset": "prices"})).data
+    by_source = {s: sum(r["source_code"] == s for r in rows) for s in {r["source_code"] for r in rows}}
+    assert by_source == {"tiingo": N_TIINGO, "private_history": N_PRIVATE}  # never the unregistered source
+    assert UNREGISTERED not in json.dumps(rows)
+    assert none["returned"] == 0 and none["csv"] == ""

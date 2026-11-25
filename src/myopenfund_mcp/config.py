@@ -13,6 +13,7 @@ import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 
 class ConfigError(ValueError):
@@ -171,9 +172,30 @@ def _check_rag_host(host: str) -> None:
                           "(the port is MOF_RAG_QDRANT_PORT, TLS is MOF_RAG_QDRANT_HTTPS)")
 
 
-def _restricted_allow(env: Mapping[str, str]) -> dict[str, frozenset[str]]:
-    """MOF_MARKET_RESTRICTED_ALLOW, checked against the clients of MOF_MCP_TOKENS and the restricted codes
-    of the source registry. Unset = {} without importing the [market] extra."""
+#: Default MOF_MARKET_NO_RESTRICTED_CLIENTS: the agents' client (spec §13: it may post publicly).
+NO_RESTRICTED_CLIENTS = ("agents",)
+
+
+def _no_restricted_clients(env: Mapping[str, str]) -> tuple[str, ...]:
+    """MOF_MARKET_NO_RESTRICTED_CLIENTS: client ids, comma-separated, without duplicates, in order. An id is
+    never echoed (a token pasted here must not reach a log): errors name the entry by position."""
+    from . import auth  # auth imports this module
+
+    raw = _get(env, "MOF_MARKET_NO_RESTRICTED_CLIENTS")
+    if raw is None:
+        return NO_RESTRICTED_CLIENTS
+    ids = [item.strip() for item in raw.split(",") if item.strip()]
+    for position, client in enumerate(ids, start=1):
+        if not auth.is_valid_client_id(client):
+            raise ConfigError(f"MOF_MARKET_NO_RESTRICTED_CLIENTS entry {position}: a client id is 1-32 "
+                              "characters of A-Z a-z 0-9 _ . -")
+    return tuple(dict.fromkeys(ids))
+
+
+def _restricted_allow(env: Mapping[str, str], never: tuple[str, ...]) -> Mapping[str, frozenset[str]]:
+    """MOF_MARKET_RESTRICTED_ALLOW, checked against the clients of MOF_MCP_TOKENS, the restricted codes of
+    the source registry and the clients that never get one (`never`). Unset = empty without importing the
+    [market] extra."""
     spec = _get(env, "MOF_MARKET_RESTRICTED_ALLOW")
     if spec is None:
         return {}
@@ -184,7 +206,7 @@ def _restricted_allow(env: Mapping[str, str]) -> dict[str, frozenset[str]]:
         raise ConfigError("MOF_MARKET_RESTRICTED_ALLOW names clients of MOF_MCP_TOKENS, which is not set: "
                           "without tokens no client can be given restricted sources")
     client_ids = frozenset(e.client_id for e in auth.parse_tokens(tokens))
-    return auth.parse_restricted_allow(spec, client_ids, auth.registered_restricted_sources())
+    return auth.parse_restricted_allow(spec, client_ids, auth.registered_restricted_sources(), frozenset(never))
 
 
 @dataclass(frozen=True)
@@ -330,8 +352,21 @@ class Settings:
     chunk_overlap_tokens: int = 32  # MOF_CHUNK_OVERLAP_TOKENS: tokens shared by neighbouring passages
     market_source: str = "auto"  # MOF_MARKET_SOURCE: auto | store | live
     # MOF_MARKET_RESTRICTED_ALLOW: client:src1|src2,... restricted sources whose stored rows each client of
-    # MOF_MCP_TOKENS may read (auth.allowed_restricted_for); default none; kept out of repr
-    market_restricted_allow: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
+    # MOF_MCP_TOKENS may read (auth.allowed_restricted_for); default none; kept out of repr. A read-only
+    # mapping (a dict given in code is copied into one): no runtime code can widen the gate.
+    market_restricted_allow: Mapping[str, frozenset[str]] = field(
+        default_factory=lambda: MappingProxyType({}), repr=False)
+    # MOF_MARKET_NO_RESTRICTED_CLIENTS: clients the allow-list may never name (spec §13: the agents' token)
+    market_no_restricted_clients: tuple[str, ...] = NO_RESTRICTED_CLIENTS
+    market_max_instruments: int = 10  # MOF_MARKET_MAX_INSTRUMENTS: instruments per market_prices call
+    market_max_rows: int = 5000  # MOF_MARKET_MAX_ROWS: rows per market_prices result (refused above, never cut)
+    market_live_timeout_s: int = 60  # MOF_MARKET_LIVE_TIMEOUT_S: time budget of a live market-data fetch
+
+    def __post_init__(self) -> None:
+        allow = self.market_restricted_allow
+        if not isinstance(allow, MappingProxyType):
+            object.__setattr__(self, "market_restricted_allow",
+                               MappingProxyType({k: frozenset(v) for k, v in dict(allow).items()}))
 
     def cache_path(self) -> str:
         """The cache folder: MOF_CACHE_DIR, or the platform default (ConfigError when there is none)."""
@@ -343,6 +378,7 @@ class Settings:
         transport = _get(env, "MOF_MCP_TRANSPORT") or "stdio"
         if transport not in ("stdio", "http"):
             raise ConfigError(f"MOF_MCP_TRANSPORT must be 'stdio' or 'http', got {transport!r}")
+        no_restricted = _no_restricted_clients(env)
         settings = cls(
             transport=transport,
             host=_get(env, "MOF_MCP_HOST") or "127.0.0.1",
@@ -420,11 +456,18 @@ class Settings:
             chunk_max_tokens=_int(env, "MOF_CHUNK_MAX_TOKENS", 480, minimum=16, maximum=8192),
             chunk_overlap_tokens=_int(env, "MOF_CHUNK_OVERLAP_TOKENS", 32, minimum=0, maximum=2048),
             market_source=_get(env, "MOF_MARKET_SOURCE") or "auto",
-            market_restricted_allow=_restricted_allow(env),
+            market_restricted_allow=_restricted_allow(env, no_restricted),
+            market_no_restricted_clients=no_restricted,
+            market_max_instruments=_int(env, "MOF_MARKET_MAX_INSTRUMENTS", 10, maximum=100),
+            market_max_rows=_int(env, "MOF_MARKET_MAX_ROWS", 5000, maximum=1_000_000),
+            market_live_timeout_s=_int(env, "MOF_MARKET_LIVE_TIMEOUT_S", 60, maximum=3600),
         )
         if settings.market_source not in MARKET_SOURCES:
             raise ConfigError(f"MOF_MARKET_SOURCE must be one of {', '.join(MARKET_SOURCES)}, "
                               f"got {settings.market_source!r}")
+        if settings.market_source == "store" and not settings.companies_catalog:
+            raise ConfigError("MOF_MARKET_SOURCE=store requires MOF_COMPANIES_CATALOG "
+                              "(and MOF_COMPANIES_DATA_ROOT): market prices are read from the same store")
         if settings.companies_source not in COMPANIES_SOURCES:
             raise ConfigError(f"MOF_COMPANIES_SOURCE must be one of {', '.join(COMPANIES_SOURCES)}, "
                               f"got {settings.companies_source!r}")

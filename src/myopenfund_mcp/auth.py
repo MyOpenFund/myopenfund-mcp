@@ -18,7 +18,9 @@ Over stdio there is no token: the local user owns the process and gets every tie
 
 Restricted market sources (market-data spec §13) are two notions, never one set:
 - STORED restricted rows a deployment serves: `allowed_restricted_for`, the client's entry of
-  MOF_MARKET_RESTRICTED_ALLOW, empty by default and always empty without a client id (stdio included).
+  MOF_MARKET_RESTRICTED_ALLOW, empty by default and always empty without a client id (stdio included). The
+  clients of MOF_MARKET_NO_RESTRICTED_CLIENTS (default `agents`: the agents' token, which may post publicly)
+  can never be given an entry.
 - LIVE fetches: `live_restricted_for`. Over stdio the fetch uses the caller's own key and returns to that
   caller: their own data, every restricted source. Over HTTP it would use the deployment's key, so serving
   it is redistribution: the client's list again.
@@ -136,21 +138,37 @@ def caller_tier(token: AccessToken | None, *, auth_enabled: bool) -> str:
 def registered_restricted_sources() -> frozenset[str]:
     """The `restricted` source codes of the installed open-data-store source registry (its entry points:
     market-data declares massive, tiingo, private_history). Read only when MOF_MARKET_RESTRICTED_ALLOW is
-    set, so a deployment without the market feature never imports it."""
+    set or the market toolset is mounted, so a deployment without the market feature never imports it.
+
+    ConfigError when open-data-store >= 0.2.0 is missing, when the registry cannot be read (a broken plugin
+    entry point, a source declared twice: the class only, never the plugin's text) and when it declares no
+    restricted source (market-data, which declares them, is not installed). Any other ImportError (a broken
+    install) propagates with its cause."""
     try:
         from open_data_store.sources import restricted_codes
-    except ImportError:
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("open_data_store"):
+            raise
         raise ConfigError(f"{_ALLOW} needs the [market] extra: the source registry of open-data-store "
                           ">= 0.2.0 is not installed") from None
-    return restricted_codes()
+    try:
+        codes = restricted_codes()
+    except Exception as exc:  # noqa: BLE001 -- a plugin's own text may name private paths or symbols
+        raise ConfigError(f"{_ALLOW}: the source registry could not be read ({type(exc).__name__}); check "
+                          "the installed source plugins (open_data_store.sources entry points)") from None
+    if not codes:
+        raise ConfigError(f"{_ALLOW}: the source registry declares no restricted source: install the [market] "
+                          "extra (market-data declares them)")
+    return frozenset(codes)
 
 
-def parse_restricted_allow(spec: str, client_ids: frozenset[str],
-                           restricted: frozenset[str]) -> dict[str, frozenset[str]]:
+def parse_restricted_allow(spec: str, client_ids: frozenset[str], restricted: frozenset[str],
+                           never: frozenset[str] = frozenset()) -> dict[str, frozenset[str]]:
     """Entries of MOF_MARKET_RESTRICTED_ALLOW, `client:src1|src2,client2:src3`. Each client must be one of
-    MOF_MCP_TOKENS (`client_ids`), each source a `restricted` code of the registry (`restricted`): opening
-    an open source means nothing, and a typo must not pass silently. Errors name the entry by position,
-    never by content (a token or a private symbol may sit in it)."""
+    MOF_MCP_TOKENS (`client_ids`) and not one of `never` (MOF_MARKET_NO_RESTRICTED_CLIENTS: spec §13, the
+    agents' token never gets restricted sources), each source a `restricted` code of the registry
+    (`restricted`): opening an open source means nothing, and a typo must not pass silently. Errors name the
+    entry by position, never by content (a token or a private symbol may sit in it)."""
     allow: dict[str, frozenset[str]] = {}
     items = [item.strip() for item in spec.split(",") if item.strip()]
     for position, item in enumerate(items, start=1):
@@ -160,6 +178,9 @@ def parse_restricted_allow(spec: str, client_ids: frozenset[str],
         client, sources = parts[0], [s.strip() for s in parts[1].split("|")]
         if client not in client_ids:
             raise ConfigError(f"{_ALLOW} entry {position}: the client is not a client of MOF_MCP_TOKENS")
+        if client in never:
+            raise ConfigError(f"{_ALLOW} entry {position}: the client is one of MOF_MARKET_NO_RESTRICTED_CLIENTS, "
+                              "which never get restricted sources (spec §13)")
         if client in allow:
             raise ConfigError(f"{_ALLOW} entry {position}: client already given to an earlier entry")
         if sources == [""]:
@@ -178,7 +199,8 @@ def parse_restricted_allow(spec: str, client_ids: frozenset[str],
 def allowed_restricted_for(client_id: str | None, settings: Settings) -> frozenset[str]:
     """Restricted sources whose STORED rows may be served to this caller: its entry of
     MOF_MARKET_RESTRICTED_ALLOW, empty by default. No client id (stdio) gets none: the store's restricted
-    rows are not the caller's own data. The agents' token is never given an entry (spec §13)."""
+    rows are not the caller's own data. A client of MOF_MARKET_NO_RESTRICTED_CLIENTS (the agents' token,
+    spec §13) has no entry: the configuration refuses one."""
     if client_id is None:
         return frozenset()
     return settings.market_restricted_allow.get(client_id, frozenset())
@@ -192,3 +214,13 @@ def live_restricted_for(client_id: str | None, settings: Settings,
     if settings.transport == "stdio" and client_id is None:
         return frozenset(restricted)
     return allowed_restricted_for(client_id, settings)
+
+
+def caller_client_id(*, auth_enabled: bool) -> str | None:
+    """The client id of the request's bearer token over HTTP; None over stdio (no token)."""
+    if not auth_enabled:
+        return None
+    from fastmcp.server.dependencies import get_access_token
+
+    token = get_access_token()
+    return token.client_id if token is not None else None

@@ -76,6 +76,9 @@ FIELDS = {
     "MOF_SEARCH_EIGENMIND": "search_eigenmind", "MOF_FILINGS_DEFAULT_FORMS": "filings_default_forms",
     "MOF_CHUNK_MAX_TOKENS": "chunk_max_tokens", "MOF_CHUNK_OVERLAP_TOKENS": "chunk_overlap_tokens",
     "MOF_MARKET_SOURCE": "market_source", "MOF_MARKET_RESTRICTED_ALLOW": "market_restricted_allow",
+    "MOF_MARKET_NO_RESTRICTED_CLIENTS": "market_no_restricted_clients",
+    "MOF_MARKET_MAX_INSTRUMENTS": "market_max_instruments", "MOF_MARKET_MAX_ROWS": "market_max_rows",
+    "MOF_MARKET_LIVE_TIMEOUT_S": "market_live_timeout_s",
 }
 
 COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
@@ -102,7 +105,7 @@ def test_env_example_defaults_match_settings(name, value):
     default = getattr(Settings(), FIELDS[name])
     if isinstance(default, tuple):
         assert value == ",".join(default)
-    elif default is None or default == "" or default == {}:  # no default: the example shows a placeholder value
+    elif default is None or default == "" or default == {}:  # a read-only mapping compares equal to {} too  # no default: the example shows a placeholder value
         assert "<" in value, f"{name} has no default; its example must be a <placeholder>"
     elif isinstance(default, bool):  # written as the server reads it: true / false
         assert value == str(default).lower()

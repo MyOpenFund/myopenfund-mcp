@@ -10,7 +10,9 @@ from myopenfund_mcp.auth import (
     caller_tier,
     hash_token,
     live_restricted_for,
+    parse_restricted_allow,
     parse_tokens,
+    registered_restricted_sources,
     tier_check,
 )
 from myopenfund_mcp.config import ConfigError, Settings
@@ -143,10 +145,57 @@ def _http(allow: dict[str, frozenset[str]]) -> Settings:
 
 
 def test_agents_token_gets_no_restricted():
-    s = _http({"notebook": frozenset({"massive", "tiingo"})})
+    """Spec §13: the agents' token never gets restricted sources. An allow-list entry for a client of
+    MOF_MARKET_NO_RESTRICTED_CLIENTS (default `agents`) is refused, by position only."""
+    clients, never = frozenset({"notebook", "agents"}), frozenset({"agents"})
+    with pytest.raises(ConfigError, match=r"entry 2: .*MOF_MARKET_NO_RESTRICTED_CLIENTS"):
+        parse_restricted_allow("notebook:massive,agents:tiingo", clients, RESTRICTED, never)
+    allow = parse_restricted_allow("notebook:massive|tiingo", clients, RESTRICTED, never)
+    s = _http(allow)
     assert allowed_restricted_for("agents", s) == frozenset()
     assert live_restricted_for("agents", s, RESTRICTED) == frozenset()
     assert allowed_restricted_for("notebook", s) == frozenset({"massive", "tiingo"})
+
+
+def _registry(monkeypatch, restricted_codes):
+    from open_data_store import sources
+
+    monkeypatch.setattr(sources, "restricted_codes", restricted_codes)
+
+
+def test_registry_failure_is_a_config_error_without_the_plugins_text(monkeypatch):
+    pytest.importorskip("open_data_store.sources")
+    from open_data_store.contracts.base import ContractError
+
+    def broken():
+        raise ContractError("source 'x' declared twice: plugin-secret-text")
+
+    _registry(monkeypatch, broken)
+    with pytest.raises(ConfigError, match=r"^MOF_MARKET_RESTRICTED_ALLOW: the source registry .*ContractError") as err:
+        registered_restricted_sources()
+    assert "plugin-secret-text" not in str(err.value) and err.value.__cause__ is None
+
+
+def test_registry_without_restricted_sources_names_the_market_extra(monkeypatch):
+    pytest.importorskip("open_data_store.sources")
+    _registry(monkeypatch, lambda: frozenset())
+    with pytest.raises(ConfigError, match=r"declares no restricted source.*\[market\] extra"):
+        registered_restricted_sources()
+
+
+def test_other_import_errors_keep_their_cause(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def broken(name, *args, **kwargs):
+        if name == "open_data_store.sources":
+            raise ImportError("libsomething.so: cannot open shared object file")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken)
+    with pytest.raises(ImportError, match="libsomething"):
+        registered_restricted_sources()
 
 
 def test_stored_rows_are_denied_by_default_on_every_channel():
