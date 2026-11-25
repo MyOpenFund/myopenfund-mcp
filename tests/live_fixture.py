@@ -30,6 +30,8 @@ AAPL_K24, AAPL_Q24, AAPL_K23, AAPL_E24 = (
     "0000320193-24-000130",
 )
 MSFT_K24, MSFT_K23 = "0000950170-24-087843", "0000950170-23-035122"
+#: Microsoft's Q1 FY2025 10-Q: its folder answers 404, so it borrows the FY2024 10-K's positions
+MSFT_Q25 = "0000950170-24-118967"
 
 AAPL_FILINGS = [  # (accession, acceptance, form, filingDate, reportDate), newest first
     (AAPL_E24, "2024-11-05T21:00:00.000Z", "8-K", "2024-11-05", "2024-10-31"),
@@ -38,6 +40,7 @@ AAPL_FILINGS = [  # (accession, acceptance, form, filingDate, reportDate), newes
     (AAPL_K23, "2023-11-03T20:00:00.000Z", "10-K", "2023-11-03", "2023-09-30"),
 ]
 MSFT_FILINGS = [
+    (MSFT_Q25, "2024-10-30T20:05:00.000Z", "10-Q", "2024-10-30", "2024-09-30"),
     (MSFT_K24, "2024-07-30T20:06:22.000Z", "10-K", "2024-07-30", "2024-06-30"),
     (MSFT_K23, "2023-07-27T20:00:00.000Z", "10-K", "2023-07-27", "2023-06-30"),
 ]
@@ -165,6 +168,16 @@ def _msft_facts() -> dict:
                         start="2023-07-01",
                         accn=MSFT_K24,
                         filed="2024-07-30",
+                    ),
+                    point(
+                        65585000000,
+                        "2024-09-30",
+                        start="2024-07-01",
+                        accn=MSFT_Q25,
+                        form="10-Q",
+                        filed="2024-10-30",
+                        fy=2025,
+                        fp="Q1",
                     ),
                     point(  # FY2023 re-reported by the FY2024 10-K (whose positions are recorded)
                         211915000000,

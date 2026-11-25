@@ -245,6 +245,9 @@ class Settings:
     sec_positions_lookback_y: int = 5
     # MOF_SEC_MEMO_COMPANIES: companies whose live tables are kept in memory (the oldest built is dropped)
     sec_memo_companies: int = 50
+    # MOF_SEC_POSITIONS_DONOR_DEPTH: earlier report filings looked through for the positions a filing
+    # without its own borrows, as the store's selection does (0 = none)
+    sec_positions_donor_depth: int = 4
     # MOF_SEC_FAILURE_TTL_S: seconds a failed fetch of a company is remembered: calls meanwhile get its
     # error at once instead of starting the fetch again
     sec_failure_ttl_s: int = 60
@@ -334,6 +337,7 @@ class Settings:
             sec_call_budget_s=_int(env, "MOF_SEC_CALL_BUDGET_S", 50, maximum=3600),
             sec_positions_lookback_y=_int(env, "MOF_SEC_POSITIONS_LOOKBACK_Y", 5, maximum=50),
             sec_memo_companies=_int(env, "MOF_SEC_MEMO_COMPANIES", 50, maximum=10000),
+            sec_positions_donor_depth=_int(env, "MOF_SEC_POSITIONS_DONOR_DEPTH", 4, minimum=0, maximum=40),
             sec_failure_ttl_s=_int(env, "MOF_SEC_FAILURE_TTL_S", 60, maximum=3600),
             companies_source=_get(env, "MOF_COMPANIES_SOURCE") or "auto",
             cache=(_get(env, "MOF_CACHE") or "on").lower(),

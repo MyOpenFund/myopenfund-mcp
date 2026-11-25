@@ -19,7 +19,9 @@ from live_fixture import (
     ARCHIVES,
     COMPANYFACTS_URL,
     MSFT,
+    MSFT_K23,
     MSFT_K24,
+    MSFT_Q25,
     MSFT_REVENUE_FY2024,
     NOFACTS,
     REV,
@@ -35,8 +37,6 @@ from myopenfund_mcp.config import Settings
 NOW = datetime(2026, 11, 25, 12, tzinfo=UTC)
 TAG = f"us-gaap:{REV}"  # original_tag as stored
 LATER = datetime(2026, 1, 1, tzinfo=UTC)
-#: Apple's 10-K/10-Q filings in the default 5-year window (the 8-K gets no positions)
-AAPL_POSITIONS_FILINGS = 3
 
 
 class Clock:
@@ -220,20 +220,31 @@ def test_tables_are_memoised_for_the_companyfacts_ttl(make, clock):
     assert dict(sec.calls)[facts] == 3600  # the TTL reaches the cache as max_age_s
 
 
-def test_positions_only_for_the_window(make):
+def test_positions_of_the_period_filings_and_their_donor_only(make):
     sec = FakeSec()
     src = make(sec)
-    src.concept_rows(AAPL, LATER, period_from=date(2024, 1, 1), period_to=date(2024, 12, 31))
+    rows, _ = src.concept_rows(MSFT, LATER, period_from=date(2024, 9, 1), period_to=date(2024, 12, 31))
     urls = sec.urls()
-    assert any(u.startswith(_folder(AAPL, AAPL_K24)) for u in urls)
-    assert any(u.startswith(_folder(AAPL, AAPL_Q24)) for u in urls)
-    assert not any(u.startswith(_folder(AAPL, AAPL_K23)) for u in urls)
-    assert not any(u.startswith(_folder(AAPL, AAPL_E24)) for u in urls)  # not a report form
+    assert any(u.startswith(_folder(MSFT, MSFT_Q25)) for u in urls)  # files the period's facts: 404
+    assert any(u.startswith(_folder(MSFT, MSFT_K24)) for u in urls)  # the donor it borrows from
+    assert not any(u.startswith(_folder(MSFT, MSFT_K23)) for u in urls)  # beyond the donor
+    q = [r for r in rows if r["concept"] == "revenue" and r["valid_date"] == date(2024, 9, 30)]
+    assert q[0]["location"] == "inferred"  # the store's answer: the donor predates the period
     n = len(urls)
-    src.concept_rows(AAPL, LATER, period_from=date(2024, 6, 1), period_to=date(2024, 9, 30))
-    assert len(sec.calls) == n  # a window inside the built one reuses it
-    src.concept_rows(AAPL, LATER, period_from=date(2023, 1, 1))
-    assert any(u.startswith(_folder(AAPL, AAPL_K23)) for u in sec.urls()[n:])
+    src.concept_rows(MSFT, LATER, period_from=date(2024, 9, 1), period_to=date(2024, 12, 31))
+    assert len(sec.calls) == n  # fetched once
+
+
+def test_apple_period_walks_to_the_donor_depth(make):
+    sec = FakeSec()
+    make(sec).concept_rows(AAPL, LATER, period_from=date(2024, 1, 1), period_to=date(2024, 12, 31))
+    urls = sec.urls()
+    for accn in (AAPL_K24, AAPL_Q24, AAPL_K23):  # 2024 facts; no positions anywhere: walk back
+        assert any(u.startswith(_folder(AAPL, accn)) for u in urls)
+    assert not any(u.startswith(_folder(AAPL, AAPL_E24)) for u in urls)  # not a report form
+    none = make(FakeSec(), sec_positions_donor_depth=0)
+    none.concept_rows(AAPL, LATER, period_from=date(2024, 1, 1), period_to=date(2024, 12, 31))
+    assert not any(u.startswith(_folder(AAPL, AAPL_K23)) for u in none._sec.urls())
 
 
 def test_default_window_is_the_lookback(make):
@@ -247,9 +258,9 @@ def test_slow_sec_answers_warming_then_serves(make):
     src = make(sec, sec_call_budget_s=1)
     with pytest.raises(Warming) as info:
         src.concept_rows(AAPL, LATER)
-    # submissions fetched; companyfacts held; 3 requests per 10-K/10-Q in the window
-    assert (info.value.done, info.value.total) == (1, 2 + 3 * AAPL_POSITIONS_FILINGS)
-    assert "1/11" in str(info.value)
+    # submissions fetched, companyfacts held: the positions are counted once the facts are read
+    assert (info.value.done, info.value.total) == (1, 2)
+    assert "1/2" in str(info.value)
     sec.gate.set()
     rows, _ = src.concept_rows(AAPL, LATER)
     assert _annual_revenue(rows, date(2024, 9, 28))[0]["value"] == AAPL_REVENUE_FY2024
@@ -281,13 +292,69 @@ def test_result_does_not_depend_on_what_was_built_before(make):
     period = {"period_from": date(2023, 1, 1), "period_to": date(2023, 12, 31)}
     fresh = make().concept_rows(MSFT, LATER, **period)
     src = make()
-    src.concept_rows(MSFT, LATER)  # an unrelated call builds the wide window (FY2024 positions)
+    src.concept_rows(MSFT, LATER)  # an unrelated call fetches more positions first
     after = src.concept_rows(MSFT, LATER, **period)
-    assert [sorted(map(repr, part)) for part in after] == [sorted(map(repr, part)) for part in fresh]
+    assert _canon(after) == _canon(fresh)
     fy23 = _annual_revenue(after[0], date(2023, 6, 30))[0]
-    assert (fy23["location"], fy23["on_statement"]) == ("unknown", False)
-    wide = _annual_revenue(src.concept_rows(MSFT, LATER)[0], date(2023, 6, 30))[0]
-    assert wide["location"] == "statement"  # the FY2024 10-K's positions, in its own window
+    # its latest vintage comes from the FY2024 10-K, outside the period: the store's answer
+    assert (fy23["location"], fy23["on_statement"], fy23["filing_ref"]) == ("statement", True, MSFT_K24)
+
+
+def _canon(result):
+    return [sorted(map(repr, part)) for part in result]
+
+
+def _all_positions(cik, as_of):
+    """The store's selection: every vintage known at as_of and every filing's positions."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    from company_corpus.concepts.selection import run_selection
+    from company_corpus.config import Config
+    from company_corpus.live.issuer import issuer_tables
+
+    t = issuer_tables(
+        cik,
+        FakeSec(),
+        config=Config(contact=""),
+        now=NOW,
+        positions_from=None,
+        positions_to=None,
+        facts_max_age_s=None,
+        submissions_max_age_s=None,
+    )
+
+    def known(table):
+        return table.filter(
+            pc.less_equal(table["known_at"], pa.scalar(as_of, table.schema.field("known_at").type))
+        )
+
+    return run_selection(known(t.fundamentals), known(t.filing_statements))
+
+
+@pytest.mark.parametrize("cik", [AAPL, MSFT])
+@pytest.mark.parametrize(
+    ("period_from", "period_to"),
+    [
+        (None, None),
+        (date(2023, 1, 1), date(2023, 12, 31)),
+        (date(2024, 1, 1), date(2024, 12, 31)),
+        (date(2024, 9, 1), date(2024, 12, 31)),
+        (date(2024, 6, 1), None),
+        (None, date(2023, 12, 31)),
+    ],
+)
+@pytest.mark.parametrize("as_of", [LATER, datetime(2024, 8, 1, tzinfo=UTC)])
+def test_parity_with_a_selection_on_all_positions(make, cik, period_from, period_to, as_of):
+    src = make()
+    rows, _ = src.concept_rows(cik, as_of, period_from=period_from, period_to=period_to)
+    w = src._window(period_from, period_to)
+
+    def in_period(r):
+        return r["valid_date"] >= w.start and (w.end is None or r["valid_date"] <= w.end)
+
+    live = sorted(map(repr, filter(in_period, rows)))
+    store = sorted(map(repr, filter(in_period, _all_positions(cik, as_of))))
+    assert live == store and (live or as_of != LATER)
 
 
 def test_ttl_expiry_while_a_build_runs_waits_on_it(make, clock):
@@ -316,8 +383,8 @@ def test_budget_elapsing_in_a_multi_company_read(make):
     flt = {"entity_value": [AAPL, MSFT]}
     with pytest.raises(Warming) as info:
         _read(src, filters=flt)
-    # Apple finished; Microsoft: submissions done, companyfacts held, 2 10-Ks in the window
-    assert (info.value.done, info.value.total) == (1, 2 + 3 * 2)
+    # Apple finished; Microsoft: submissions done, companyfacts held
+    assert (info.value.done, info.value.total) == (1, 2)
     sec.gate.set()
     rows = _read(src, filters=flt)
     assert {r["entity_value"] for r in rows} == {AAPL, MSFT}

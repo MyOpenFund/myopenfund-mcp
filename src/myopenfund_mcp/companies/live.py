@@ -14,11 +14,18 @@ Fetching: one issuer's tables are built in a worker thread (at most
 one) and kept in memory for ``MOF_CACHE_TTL_COMPANYFACTS_H`` (at most ``MOF_SEC_MEMO_COMPANIES``
 issuers, the oldest built dropped first). A caller waits up to ``MOF_SEC_CALL_BUDGET_S``, then
 gets :class:`Warming` with the requests done and expected while the build goes on; a later call
-gets the finished tables. Statement positions are fetched for the 10-K/10-Q/20-F/40-F filings
-whose report date lies in a window: the caller's period, or ``MOF_SEC_POSITIONS_LOOKBACK_Y``
-years before its end (before now when it has none). Tables built for a window serve any window
-inside it (a wider one rebuilds over both), but a result never depends on what was built before:
-the selection reads only the positions of the filings in the window asked for.
+gets the finished tables.
+
+Statement positions (ruling R23: the store's numbers, not an approximation): ``concept_rows`` needs
+the positions of every filing that filed a fact (any vintage known at ``as_of``) dated
+(``valid_date``) in the period asked for -- the caller's, or ``MOF_SEC_POSITIONS_LOOKBACK_Y`` years
+before its end (before now when it has none) -- and, for each of those filings without positions,
+the filing the selection borrows from: the latest report filing (10-K/10-Q/20-F/40-F) known no
+later, that has positions, looked for among the ``MOF_SEC_POSITIONS_DONOR_DEPTH`` latest. Only
+those filings' positions are fetched (once per issuer, added to its tables) and only they are read
+by the selection, so a result is a function of the arguments and equals the selection on every
+position for the facts of the period. Known limit: a filing whose donor lies deeper than the depth
+reads ``unknown`` where the store reads ``inferred``.
 
 Errors: a 404 on the companyfacts file, or on the main submissions file (a CIK unknown to SEC) ->
 :class:`NoFacts` (remembered like tables; each caller gets its own instance); a 404 on any other
@@ -28,21 +35,23 @@ a bare ``ValueError``, or a wrong-shape JSON a ``TypeError``/``KeyError``/``Attr
 selection that fails on it -> :class:`LiveDataError`, a backend fault, never the caller's. A build
 that fails is remembered for ``MOF_SEC_FAILURE_TTL_S``: callers meanwhile get its error (even one
 that came after their budget, while they were answered :class:`Warming`), not a new build. After
-:meth:`LiveSource.close` every call raises :class:`LiveClosed`, and a running build stops at its next
-request. Argument errors use the store adapter's types (:class:`StoreBadArgument`,
+:meth:`LiveSource.close`, ``entities``, ``read``, ``concept_rows``, ``filings`` and
+``latest_filing`` raise :class:`LiveClosed` (``summaries`` and the catalogs fetch nothing and still
+answer), and a running build stops at its next request. Argument errors use the store adapter's types (:class:`StoreBadArgument`,
 :class:`StoreUnknownDataset`), checked before any request. The SEC contact is never logged here:
 no message names it.
 """
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 
 from ..config import Q4_RULES, Settings
@@ -90,34 +99,25 @@ class LiveClosed(RuntimeError):
 
 @dataclass(frozen=True)
 class _Window:
-    """Report dates whose filings get statement positions: ``[start, end]``, ``end`` None = open."""
+    """Fact dates (``valid_date``) of a period: ``[start, end]``, ``end`` None = open."""
 
     start: date
     end: date | None
 
-    def covers(self, other: _Window) -> bool:
-        return self.start <= other.start and (
-            self.end is None or (other.end is not None and other.end <= self.end)
-        )
-
-    def union(self, other: _Window) -> _Window:
-        end = None if self.end is None or other.end is None else max(self.end, other.end)
-        return _Window(min(self.start, other.start), end)
-
-
-_EVERY_WINDOW = _Window(date.min, None)
-
 
 class _Counting:
-    """A SecGet counting the requests of one build. Bodies read while ``recording`` are kept for
-    the build (the submissions, read once to size the work and again by ``issuer_tables``)."""
+    """A SecGet counting the requests of one build. Bodies read while ``recording`` are kept
+    (companyfacts and submissions: the positions rounds rebuild the tables from them). Requests
+    under a ``blocked`` filing folder answer 404 without reaching SEC (positions of filings not
+    asked for)."""
 
-    def __init__(self, sec, closed: threading.Event):
+    def __init__(self, sec, closed: threading.Event, kept: dict[str, bytes] | None = None):
         self._sec = sec
         self._closed = closed
-        self._kept: dict[str, bytes] = {}
         self._lock = threading.Lock()
+        self.kept: dict[str, bytes] = dict(kept or {})
         self.recording = True
+        self.blocked: tuple[str, ...] = ()
         self.done = 0
         self.total = FIRST_REQUESTS
         self.requested: list[str] = []  # URLs actually requested, in order
@@ -129,9 +129,11 @@ class _Counting:
         if self._closed.is_set():  # close() stops the build at its next request
             raise LiveClosed
         with self._lock:
-            kept = self._kept.get(url)
+            kept = self.kept.get(url)
         if kept is not None:
             return kept
+        if any(url.startswith(folder) for folder in self.blocked):
+            raise SecNotFound(url)
         with self._lock:
             self.requested.append(url)
         try:
@@ -147,23 +149,27 @@ class _Counting:
             raise LiveClosed
         if self.recording:
             with self._lock:
-                self._kept[url] = body
+                self.kept[url] = body
         return body
 
 
 @dataclass
 class _Job:
-    window: _Window
+    need: tuple[datetime, _Window] | None  # concept_rows' (as_of, period); None = tables only
     counting: _Counting
     future: Future | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Entry:
-    window: _Window
+    """One issuer, replaced (never changed) by each round of its build."""
+
     at: float
-    tables: object | None = None  # company_corpus.live.IssuerTables
+    tables: object | None = None  # company_corpus.live.IssuerTables, positions of no filing
     archive: object | None = None  # the submissions the tables were built from
+    kept: dict = field(default_factory=dict)  # companyfacts and submissions bodies
+    statements: object | None = None  # filing_statements rows fetched so far (pa.Table)
+    fetched: frozenset = frozenset()  # accessions whose positions were asked for, found or not
     no_facts: bool = False
 
 
@@ -186,6 +192,28 @@ def _years_before(day: date, years: int) -> date:
         return day.replace(year=day.year - years)
     except ValueError:  # 29 February
         return day.replace(year=day.year - years, day=28)
+
+
+def _known(ref) -> datetime | None:
+    """When a filing became known, as the store dates it: its acceptance (UTC)."""
+    return ref.accepted
+
+
+def _issuer_tables(src, cik, counting, now, lo, hi, *, forms):
+    """company-corpus's issuer_tables with this source's settings."""
+    from company_corpus.live.issuer import issuer_tables
+
+    return issuer_tables(
+        cik,
+        counting,
+        config=src._config,
+        now=now,
+        positions_from=lo,
+        positions_to=hi,
+        facts_max_age_s=src._facts_ttl_s,
+        submissions_max_age_s=src._submissions_ttl_s,
+        positions_forms=forms,
+    )
 
 
 def _is_cik(value) -> bool:
@@ -288,54 +316,139 @@ class LiveSource:
         )
         return _Window(start, end)
 
-    def _build(self, cik: str, job: _Job):
-        """Worker thread: fetch and build one issuer's tables, record the entry (or the failure),
-        end the job."""
-        from company_corpus.live.filings import fetch_submissions, list_filings
-        from company_corpus.live.issuer import POSITIONS_FORMS, issuer_tables
+    def _store(self, cik: str, entry: _Entry) -> None:
+        with self._lock:
+            self._keep(self._entries, cik, entry)
+            self._failures.pop(cik, None)
+
+    def _needed(self, entry: _Entry, as_of: datetime, window: _Window) -> tuple[set, set]:
+        """``(used, missing)``: the accessions whose positions the selection of ``window`` at
+        ``as_of`` reads, and those of them (or of the donor walk) not fetched yet."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        from company_corpus.live.filings import list_filings
+        from company_corpus.live.issuer import POSITIONS_FORMS
+
+        f = entry.tables.fundamentals
+        known_type = f.schema.field("known_at").type
+        mask = pc.and_(
+            pc.less_equal(f["known_at"], pa.scalar(as_of, type=known_type)),
+            pc.greater_equal(
+                f["valid_date"], pa.scalar(window.start, type=f.schema.field("valid_date").type)
+            ),
+        )
+        if window.end is not None:
+            end = pa.scalar(window.end, type=f.schema.field("valid_date").type)
+            mask = pc.and_(mask, pc.less_equal(f["valid_date"], end))
+        facts = f.filter(mask).select(["filing_ref", "known_at"]).to_pylist()
+        filed: dict[str, datetime] = {}
+        for r in facts:  # a filing's facts share its known_at; the earliest if they did not
+            if r["filing_ref"] is not None:
+                at = filed.get(r["filing_ref"])
+                filed[r["filing_ref"]] = r["known_at"] if at is None else min(at, r["known_at"])
+        used, missing = set(filed), set(filed) - entry.fetched
+        if missing:
+            return used, missing
+        located = set()
+        if entry.statements is not None and entry.statements.num_rows:
+            st = entry.statements
+            st = st.filter(
+                pc.less_equal(st["known_at"], pa.scalar(as_of, type=st.schema.field("known_at").type))
+            )
+            located = set(st["filing_ref"].to_pylist())
+        with _data_faults():
+            reports = list_filings(entry.archive, forms=POSITIONS_FORMS, period_from=None, period_to=None)
+        depth = self._settings.sec_positions_donor_depth
+        for accession, at in filed.items():
+            if accession in located:
+                continue
+            # the selection's ASOF borrow: the latest located filing known no later than this one
+            earlier = [
+                r for r in reports if r.accession != accession and _known(r) is not None and _known(r) <= at
+            ][:depth]
+            for r in earlier:
+                if r.accession not in entry.fetched:
+                    missing.add(r.accession)
+                    break
+                if r.accession in located:
+                    used.add(r.accession)
+                    break
+        return used, missing
+
+    def _base(self, cik: str, counting: _Counting) -> _Entry:
+        """Companyfacts and submissions -> the issuer's tables without positions."""
+        from company_corpus.live.filings import fetch_submissions
         from company_corpus.live.sec import SecNotFound
 
-        counting, w = job.counting, job.window
+        now = self._now()
         first = None
         try:
-            now = self._now()
-            try:
-                with _data_faults():
-                    archive = fetch_submissions(cik, counting, max_age_s=self._submissions_ttl_s, now=now)
-                    self._remember_archive(cik, archive)
-                    window_filings = list_filings(
-                        archive, forms=POSITIONS_FORMS, period_from=w.start, period_to=w.end
-                    )
-                    counting.total = 1 + counting.done + REQUESTS_PER_FILING * len(window_filings)
-                    counting.recording = False
-                    first = len(counting.requested)  # issuer_tables requests companyfacts first
-                    tables = issuer_tables(
-                        cik,
-                        counting,
-                        config=self._config,
-                        now=now,
-                        positions_from=w.start,
-                        positions_to=w.end,
-                        facts_max_age_s=self._facts_ttl_s,
-                        submissions_max_age_s=self._submissions_ttl_s,
-                        positions_forms=POSITIONS_FORMS,
-                    )
-            except SecNotFound:
-                # Only the main submissions file (the build's first request: the CIK is unknown to
-                # SEC) or the companyfacts file means "no facts"; positions 404s never get here.
-                companyfacts = (
-                    first is not None and len(counting.requested) > first and counting.requested[first]
-                )
-                if counting.missing not in (counting.requested[0], companyfacts):
-                    raise LiveDataError("an SEC submissions page is missing (404)") from None
-                with self._lock:
-                    self._keep(self._entries, cik, _Entry(_EVERY_WINDOW, self._clock(), no_facts=True))
-                    self._failures.pop(cik, None)
-                raise NoFacts(cik) from None
+            with _data_faults():
+                archive = fetch_submissions(cik, counting, max_age_s=self._submissions_ttl_s, now=now)
+                self._remember_archive(cik, archive)
+                counting.total = 1 + counting.done
+                first = len(counting.requested)  # issuer_tables requests companyfacts first
+                tables = _issuer_tables(self, cik, counting, now, None, None, forms=())
+        except SecNotFound:
+            # Only the main submissions file (the build's first request: the CIK is unknown to
+            # SEC) or the companyfacts file means "no facts".
+            companyfacts = first is not None and len(counting.requested) > first and counting.requested[first]
+            if counting.missing not in (counting.requested[0], companyfacts):
+                raise LiveDataError("an SEC submissions page is missing (404)") from None
+            self._store(cik, _Entry(self._clock(), no_facts=True))
+            raise NoFacts(cik) from None
+        counting.recording = False
+        entry = _Entry(self._clock(), tables=tables, archive=archive, kept=dict(counting.kept))
+        self._store(cik, entry)
+        return entry
+
+    def _positions(self, cik: str, entry: _Entry, accessions: set, counting: _Counting) -> _Entry:
+        """Fetch the positions of ``accessions`` (others blocked) and add them to the entry."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        from company_corpus.live.filings import list_filings
+        from company_corpus.live.issuer import POSITIONS_FORMS
+
+        with _data_faults():
+            reports = list_filings(entry.archive, forms=POSITIONS_FORMS, period_from=None, period_to=None)
+        wanted = [r for r in reports if r.accession in accessions and r.report_date is not None]
+        statements = entry.statements
+        if wanted:
+            lo, hi = min(r.report_date for r in wanted), max(r.report_date for r in wanted)
+            with _data_faults():
+                span = list_filings(entry.archive, forms=POSITIONS_FORMS, period_from=lo, period_to=hi)
+            counting.blocked = tuple(r.url.rstrip("/") + "/" for r in span if r.accession not in accessions)
+            counting.total = counting.done + REQUESTS_PER_FILING * len(wanted)
+            with _data_faults():
+                t = _issuer_tables(self, cik, counting, self._now(), lo, hi, forms=POSITIONS_FORMS)
+            new = t.filing_statements
+            new = new.filter(pc.is_in(new["filing_ref"], value_set=pa.array(sorted(accessions), pa.string())))
+            statements = new if statements is None else pa.concat_tables([statements, new])
+        entry = replace(entry, statements=statements, fetched=entry.fetched | frozenset(accessions))
+        self._store(cik, entry)
+        return entry
+
+    def _build(self, cik: str, job: _Job):
+        """Worker thread: the issuer's tables, then the positions ``job.need`` reads (one round
+        for the period's filings, then one per donor step), each round stored; end the job."""
+        counting = job.counting
+        try:
             with self._lock:
-                self._keep(self._entries, cik, _Entry(w, self._clock(), tables=tables, archive=archive))
-                self._failures.pop(cik, None)
-            return tables
+                entry = self._entries.get(cik)
+            if entry is None or entry.no_facts or not self._fresh(entry.at, self._facts_ttl_s):
+                entry = self._base(cik, counting)
+            else:
+                counting.kept.update(entry.kept)
+                counting.recording = False
+                counting.total = counting.done
+            if job.need is not None:
+                # the period's filings, then at most one donor step per round
+                for _ in range(self._settings.sec_positions_donor_depth + 1):
+                    _, missing = self._needed(entry, *job.need)
+                    if not missing:
+                        break
+                    entry = self._positions(cik, entry, missing, counting)
+            return entry
         except NoFacts:
             raise
         except BaseException as exc:
@@ -348,41 +461,51 @@ class LiveSource:
                 if self._jobs.get(cik) is job:
                     del self._jobs[cik]
 
-    def _start(self, cik: str, window: _Window) -> _Job:
-        """Under the lock: a build of ``cik`` over ``window``."""
-        job = _Job(window, _Counting(self._sec, self._closed))
+    def _start(self, cik: str, need) -> _Job:
+        """Under the lock: a build of ``cik`` for ``need``."""
+        job = _Job(need, _Counting(self._sec, self._closed))
         self._jobs[cik] = job
         # set before the lock is released: the build's own clean-up takes the lock first
         job.future = self._pool.submit(self._build, cik, job)
         return job
 
-    def _tables(self, ciks: Collection[str], window: _Window) -> dict[str, _Entry]:
-        """Each CIK's entry (tables over at least ``window``), within the call budget."""
+    def _failure(self, cik: str) -> BaseException | None:
+        """Under the lock: a fresh copy of the CIK's remembered failure (expired ones pruned)."""
+        for k in [k for k, (at, _) in self._failures.items() if not self._fresh(at, self._failure_ttl_s)]:
+            del self._failures[k]
+        failed = self._failures.get(cik)
+        return None if failed is None else copy.copy(failed[1]).with_traceback(None)
+
+    def _ready(self, entry: _Entry | None, need) -> bool:
+        if entry is None or entry.no_facts or not self._fresh(entry.at, self._facts_ttl_s):
+            return False
+        return need is None or not self._needed(entry, *need)[1]
+
+    def _tables(self, ciks: Collection[str], need) -> dict[str, _Entry]:
+        """Each CIK's entry, with the positions ``need`` reads, within the call budget."""
         deadline = self._clock() + self._settings.sec_call_budget_s
         out: dict[str, _Entry] = {}
         while True:
             waiting: list[_Job] = []
-            with self._lock:
-                self._check_open()
-                for cik in ciks:
-                    if cik in out:
-                        continue
+            for cik in ciks:
+                if cik in out:
+                    continue
+                with self._lock:
+                    self._check_open()
                     entry = self._entries.get(cik)
-                    if entry is not None and not self._fresh(entry.at, self._facts_ttl_s):
-                        entry = None
-                    if entry is not None and entry.window.covers(window):
-                        if entry.no_facts:
-                            raise NoFacts(cik)
-                        out[cik] = entry
-                        continue
+                if entry is not None and entry.no_facts and self._fresh(entry.at, self._facts_ttl_s):
+                    raise NoFacts(cik)
+                if self._ready(entry, need):
+                    out[cik] = entry
+                    continue
+                with self._lock:
                     job = self._jobs.get(cik)
                     if job is None:
-                        failed = self._failures.get(cik)
-                        if failed is not None and self._fresh(failed[0], self._failure_ttl_s):
-                            raise failed[1]  # nobody may have seen it: it came after their budget
-                        wanted = window if entry is None else entry.window.union(window)
-                        job = self._start(cik, wanted)
-                    waiting.append(job)
+                        failure = self._failure(cik)
+                        if failure is not None:  # nobody may have seen it: it came after their budget
+                            raise failure
+                        job = self._start(cik, need)
+                waiting.append(job)
             if not waiting:
                 return out
             remaining = deadline - self._clock()
@@ -401,8 +524,8 @@ class LiveSource:
                 if isinstance(exc, NoFacts):
                     raise NoFacts(exc.cik)  # each caller its own instance
                 if exc is not None:
-                    raise exc
-            # finished: the loop reads the entries (or rebuilds over a wider window)
+                    raise copy.copy(exc).with_traceback(None)
+            # finished: the loop reads the entries (or starts the build another need asks for)
 
     # --- as-of reading ---------------------------------------------------------------------------
     def _asof(self, table, contract, as_of: datetime, filters: dict, vintages: bool):
@@ -491,7 +614,7 @@ class LiveSource:
             return []
         import pyarrow as pa
 
-        built = self._tables(ciks, self._window(None, None))
+        built = self._tables(ciks, None)
         parts = [
             self._asof(getattr(built[c].tables, contract.name), contract, as_of, checked, vintages)
             for c in ciks
@@ -513,31 +636,24 @@ class LiveSource:
         period_to: date | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """``(selection_rows, vintages)`` as ``CompaniesStore.concept_rows`` gives them, from the
-        live tables; the period bounds the filings whose statement positions are fetched and read
-        (only those: tables built earlier over a wider window give the same result)."""
+        live tables. The period (facts dated in it) decides which filings' statement positions are
+        fetched and read: those filings and their borrow donors only, whatever was fetched before."""
         from company_corpus.concepts.selection import run_selection
-        from company_corpus.live.filings import list_filings
-        from company_corpus.live.issuer import POSITIONS_FORMS
 
         if not _is_cik(cik):
             raise StoreBadArgument("cik must be a 10-digit string")
         as_of = _aware(as_of, self._now)
-        window = self._window(period_from, period_to)
-        entry = self._tables([cik], window)[cik]
-        t = entry.tables
-        fundamentals = self._contracts["fundamentals"]
-        facts = self._asof(t.fundamentals, fundamentals, as_of, {}, vintages=True)
+        need = (as_of, self._window(period_from, period_to))
+        entry = self._tables([cik], need)[cik]
+        used, _ = self._needed(entry, *need)
+        facts = self._asof(
+            entry.tables.fundamentals, self._contracts["fundamentals"], as_of, {}, vintages=True
+        )
         if facts.num_rows == 0:
             return [], []
-        with _data_faults():
-            in_window = [
-                f.accession
-                for f in list_filings(
-                    entry.archive, forms=POSITIONS_FORMS, period_from=window.start, period_to=window.end
-                )
-            ]
+        statements = entry.statements if entry.statements is not None else entry.tables.filing_statements
         positions = self._asof(
-            t.filing_statements, self._statements, as_of, {"filing_ref": in_window}, vintages=False
+            statements, self._statements, as_of, {"filing_ref": sorted(used)}, vintages=False
         )
         try:
             selected = run_selection(facts, positions)
