@@ -178,9 +178,9 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
             raise ConfigError(MISSING_LIVE_EXTRA)
         owned.append(companies_live)
     if companies_store is not None or companies_live is not None:
+        from .companies.build import build_router
         from .companies.common import dict_to_utc
         from .companies.datasets import build_datasets_toolset
-        from .companies.build import build_router
         from .companies.tools import build_companies_toolset
 
         try:
