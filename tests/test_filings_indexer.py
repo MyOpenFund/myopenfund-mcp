@@ -347,7 +347,7 @@ def test_read_window_and_errors(tmp_path):
         with pytest.raises(DocumentNotFetched):
             indexer.read("sec-never-fetched")
         with pytest.raises(ValueError, match="offset"):
-            indexer.read(doc_id, chunk_id="5", offset=3)  # window mode
+            indexer.read(doc_id, chunk_id="5", around=1, offset=3)  # window mode
         with pytest.raises(ValueError, match="past the end"):
             indexer.read(doc_id, chunk_id="5", offset=10_000, around=None)
     finally:
@@ -463,9 +463,8 @@ def test_default_factory_reports_the_model_download_once(tmp_path, monkeypatch):
     monkeypatch.setattr(indexer_module, "load_tokenizer", fake_tokenizer)
     indexer = FilingsIndexer(settings(tmp_path, rag_onnx_threads=2), sec=object(), document_loader=load)
     try:
-        assert indexer.enqueue([]).model_download is True  # nothing in <cache>/models yet
-        assert indexer.enqueue([]).model_download is False  # reported once, before any load
-        indexer.enqueue([ref()])
+        assert indexer.enqueue([]).model_download is False  # nothing queued: nothing reported
+        assert indexer.enqueue([ref()]).model_download is True  # nothing in <cache>/models yet
         wait_until(lambda: state_of(indexer, ref().doc_id).state == "ready")
         assert indexer.enqueue([ref("0000789019-23-000001")]).model_download is False  # loaded now
         models = str(Path(tmp_path, "cache", "models"))
@@ -592,7 +591,7 @@ def test_crash_between_index_add_and_status_write_is_repaired(tmp_path, item7, m
     assert stored_count(indexer) == total
 
 
-def test_ready_document_missing_from_the_index_is_partial_on_open(tmp_path):
+def test_ready_document_missing_from_the_index_is_partial_when_touched(tmp_path):
     a = make(tmp_path, GatedEmbedder(batch_size=8))
     a.enqueue([ref()])
     wait_until(lambda: state_of(a, DOC).state == "ready")
@@ -601,7 +600,8 @@ def test_ready_document_missing_from_the_index_is_partial_on_open(tmp_path):
         index.delete(DOC)
     b = make(tmp_path, GatedEmbedder(batch_size=8))
     try:
-        assert state_of(b, DOC).state == "partial"
+        assert state_of(b, DOC).state == "ready"  # not checked at open (lazy)
+        assert b.read(DOC)["state"] == "partial"  # first touch: the index lacks its chunks
         b.enqueue([ref()])
         wait_until(lambda: state_of(b, DOC).state == "ready")
         total_chunks = state_of(b, DOC).chunks_total
@@ -751,3 +751,109 @@ def test_the_sec_contact_never_reaches_the_log(tmp_path, monkeypatch, caplog):
         assert all(record.exc_info is None for record in caplog.records)
     finally:
         indexer.close()
+
+
+def test_open_counts_no_document(tmp_path, monkeypatch):
+    """N1: reconciliation is lazy; opening the index never counts a document's chunks."""
+    a = make(tmp_path, GatedEmbedder(batch_size=8))
+    a.enqueue([ref(), ref("0000789019-23-000001")])
+    wait_until(lambda: [s.state for s in a.status()] == ["ready", "ready"])
+    a.close()
+    counted = []
+    real = LocalIndex.count
+    monkeypatch.setattr(
+        LocalIndex, "count", lambda self, doc_id: counted.append(doc_id) or real(self, doc_id)
+    )
+    b = make(tmp_path, GatedEmbedder(batch_size=8))
+    try:
+        assert len(b.status()) == 2
+        assert counted == []
+        b.search("revenue", doc_ids=[DOC], limit=2)
+        b.search("revenue", doc_ids=[DOC], limit=2)
+        assert counted == [DOC]  # once, when first touched
+    finally:
+        b.close()
+
+
+def test_fill_never_exceeds_the_budget_with_the_next_fields(tmp_path):
+    """N2: exact fits with a long next chunk id, over every budget from tiny to roomy."""
+    rows = [(1000 + n, "Item 7", f"word{n} " * 30) for n in range(3)]
+    base = {
+        "doc_id": DOC,
+        "section": None,
+        "chunks": [],
+        "more": False,
+        "next_chunk_id": None,
+        "next_offset": 0,
+    }
+    for budget in range(result_chars(base) + 100, 1_200):
+        indexer = FilingsIndexer(Settings(cache_dir=str(tmp_path), max_result_chars=budget), sec=object())
+        result = {**base, "chunks": []}
+        indexer._fill(result, iter(rows), 0)
+        assert result_chars(result) <= budget, budget
+        returned = "".join(c["text"] for c in result["chunks"])
+        if result["more"]:
+            number = int(result["next_chunk_id"])
+            texts = {r[0]: r[2] for r in rows}
+            assert 0 <= result["next_offset"] < len(texts[number])
+        else:
+            assert returned == "".join(r[2] for r in rows)
+
+
+def test_chunk_id_without_around_reads_forward(tmp_path):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=8))
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "ready")
+        total = state_of(indexer, DOC).chunks_total
+        page = indexer.read(DOC, chunk_id="3")
+        assert [c["chunk_id"] for c in page["chunks"]] == [str(n) for n in range(3, total)]
+    finally:
+        indexer.close()
+
+
+def test_model_load_creates_a_private_cache_folder(tmp_path):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=8), cache="off")
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "ready")
+        assert (tmp_path / "cache").stat().st_mode & 0o777 == 0o700
+    finally:
+        indexer.close()
+
+
+EXIT_SCRIPT = """
+import os, sys, threading, time
+sys.path.insert(0, {tests!r})
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+import test_filings_indexer as t
+from myopenfund_mcp.filings.indexer import FilingsIndexer
+embedder = t.GatedEmbedder(allowed=1, batch_size=2)  # the second batch blocks forever
+indexer = FilingsIndexer(
+    t.settings(__import__("pathlib").Path({tmp!r}), cache="off", index_close_timeout_s=1),
+    sec=object(), embedder_factory=lambda: embedder, tokenizer_factory=t.WordTokenizer,
+    document_loader=t.load,
+)
+indexer.enqueue([t.ref()])
+deadline = time.monotonic() + 30
+while embedder.passage_calls < 2:
+    assert time.monotonic() < deadline
+    time.sleep(0.01)
+print(indexer.root, flush=True)
+sys.exit(0)  # atexit: close (bounded), then the temporary root is removed
+"""
+
+
+def test_cache_off_exit_mid_batch_removes_the_temporary_root(tmp_path):
+    """N7: a process with MOF_CACHE=off exits while a worker is inside a batch."""
+    import subprocess
+    import sys
+
+    script = EXIT_SCRIPT.format(tests=str(Path(__file__).parent), tmp=str(tmp_path))
+    done = subprocess.run(
+        [sys.executable, "-c", script], check=False, capture_output=True, text=True, timeout=120
+    )
+    assert done.returncode == 0, done.stderr
+    root = Path(done.stdout.strip().splitlines()[-1])
+    assert root.name.startswith("myopenfund-mcp-filings-")
+    assert not root.exists()

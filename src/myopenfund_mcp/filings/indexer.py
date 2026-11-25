@@ -384,6 +384,7 @@ class FilingsIndexer:
         self._embedder: Embedder | None = None
         self._tokenizer: Any = None
         self._download_reported = False
+        self._reconciled: set[str] = set()  # documents checked against the index in this process
         self._index: LocalIndex | None = None
         self._db: sqlite3.Connection | None = None
         self._queue: queue.Queue[str | None] = queue.Queue()
@@ -447,24 +448,13 @@ class FilingsIndexer:
                 columns = {row[1] for row in db.execute("PRAGMA table_info(documents)")}
                 if "fingerprint" not in columns:  # a status file of an earlier build
                     db.execute("ALTER TABLE documents ADD COLUMN fingerprint TEXT")
-                # We hold the index lock: no other process is indexing. What was in flight is partial,
-                # and so is a ready document whose chunks are not all in the index.
+                # We hold the index lock: no other process is indexing. What was in flight is partial.
+                # (A ready document whose chunks are not all in the index is found lazily: _reconcile.)
                 db.execute(
                     f"UPDATE documents SET state = 'partial', updated_at = ? WHERE collection = ? "
                     f"AND state IN ({', '.join('?' * len(_IN_FLIGHT))})",
                     (_now(), self.collection, *_IN_FLIGHT),
                 )
-                ready = db.execute(
-                    "SELECT doc_id, chunks_total FROM documents WHERE collection = ? AND state = 'ready'",
-                    (self.collection,),
-                ).fetchall()
-                for doc_id, total in ready:
-                    if index.count(doc_id) != total:
-                        db.execute(
-                            "UPDATE documents SET state = 'partial', updated_at = ? WHERE collection = ? "
-                            "AND doc_id = ?",
-                            (_now(), self.collection, doc_id),
-                        )
             except Exception:
                 if db is not None:
                     db.close()
@@ -492,6 +482,9 @@ class FilingsIndexer:
         with self._model_lock:
             if self._embedder is None:
                 models = str(self.models_dir)
+                # The persistent cache folder, private as the HTTP cache wants it (also with MOF_CACHE=off,
+                # so that a later MOF_CACHE=on start does not refuse a folder made with the umask).
+                Path(self._settings.cache_path()).mkdir(mode=0o700, parents=True, exist_ok=True)
                 if self._embedder_factory is not None:
                     embedder = self._embedder_factory()
                 else:
@@ -514,13 +507,30 @@ class FilingsIndexer:
             return self._embedder, self._tokenizer
 
     def _model_download_needed(self) -> bool:
-        """True once per process: on the first call made while the model is not loaded and its files
-        are not in `models/` (the default factory only)."""
+        """Whether the model is not loaded, not yet reported, and its files are not in `models/` (the
+        default factory only). `enqueue` reports it once, on the first call that queues a document."""
         with self._lock:
             if self._download_reported or self._embedder is not None or self._embedder_factory is not None:
                 return False
-            self._download_reported = True
-            return not model_files_cached(self.models_dir, self._spec.name)
+        return not model_files_cached(self.models_dir, self._spec.name)
+
+    def _reconcile(self, doc_ids: Iterable[str]) -> None:
+        """A `ready` document whose chunk count in the local index is not its total becomes `partial`.
+        Checked once per document and process, when it is first touched (never at open: a count
+        scans the FTS table)."""
+        with self._lock:
+            pending = [doc_id for doc_id in dict.fromkeys(doc_ids) if doc_id not in self._reconciled]
+            index = self._index
+        if not pending or index is None:
+            return
+        for row in self._rows(pending):
+            status = _status(row)
+            if status.state == "ready" and index.count(status.doc_id) != status.chunks_total:
+                with self._lock:
+                    if status.doc_id not in self._active:
+                        self._update(status.doc_id, state="partial")
+        with self._lock:
+            self._reconciled.update(pending)
 
     # --- the status database -------------------------------------------------------------------
 
@@ -606,9 +616,11 @@ class FilingsIndexer:
         title it was first indexed with."""
         self._open()
         result = EnqueueResult()
-        result.model_download = self._model_download_needed()
+        download = self._model_download_needed()
         self._start_workers()
         names = names or {}
+        self._reconcile(_default_doc_id(filing) for filing in refs)
+        queued = False
         for filing in refs:
             doc_id = _default_doc_id(filing)
             filed = filing.filed.isoformat() if filing.filed else None
@@ -643,9 +655,14 @@ class FilingsIndexer:
                 self._refs[doc_id] = filing
                 self._active.add(doc_id)
                 self._queue.put(doc_id)
+                queued = True
                 status = self._get(doc_id)
                 assert status is not None
                 result.append(status)
+        if queued and download:
+            with self._lock:
+                result.model_download = not self._download_reported
+                self._download_reported = True
         return result
 
     def status(self, doc_ids: Collection[str] | None = None) -> StatusResult:
@@ -664,7 +681,7 @@ class FilingsIndexer:
         period_from: dt.date | None = None,
         period_to: dt.date | None = None,
         limit: int = 10,
-    ) -> Self:
+    ) -> SearchResult:
         """Hybrid search (dense + BM25, RRF; eigenmind selection when MOF_SEARCH_EIGENMIND) over the
         chunks indexed so far of the requested documents: `(hits, not_ready)`, the statuses of the
         requested documents that are not `ready`, and `.unknown`, those never enqueued.
@@ -675,6 +692,9 @@ class FilingsIndexer:
         self._open()
         wanted = None if forms is None else {f.upper() for f in forms} | {f"{f.upper()}/A" for f in forms}
         all_rows = self._rows(doc_ids)
+        if any(row[6] == "ready" and row[0] not in self._reconciled for row in all_rows):
+            self._reconcile(row[0] for row in all_rows if row[6] == "ready")
+            all_rows = self._rows(doc_ids)
         rows = []
         for row in all_rows:
             period = row[10] or row[4]
@@ -719,22 +739,25 @@ class FilingsIndexer:
         *,
         section: str | None = None,
         chunk_id: str | int | None = None,
-        around: int | None = 1,
+        around: int | None = None,
         offset: int = 0,
     ) -> dict[str, Any]:
         """The stored chunks of `doc_id`, in order, as a result whose JSON (counted as the tools count
         it) stays within MOF_MCP_MAX_RESULT_CHARS. What is read:
 
-        - `section`: that section, from its start (or from `chunk_id` when given) to its end;
-        - `chunk_id` with `around` an integer: `around` stored chunks on each side of it;
-        - `chunk_id` with `around=None`: from it to the end of the document;
+        - `section`: that section, from its start (or from `chunk_id` when given) to its end
+          (`around` is ignored);
+        - `chunk_id` alone (`around` None, the default): from it to the end of the document;
+        - `chunk_id` with `around` an integer: a window of `around` stored chunks on each side of it;
         - neither: the document from its first chunk.
         `offset` (with `chunk_id`, outside the window mode) skips that many characters of the first
         chunk's text (the remainder of a chunk cut by the budget). The result's `more` says whether
         the read stopped before the end of what was asked; `next_chunk_id` / `next_offset` then give
-        where to go on: `read(doc_id, section=<same>, chunk_id=next_chunk_id, offset=next_offset,
-        around=None)`. A chunk larger than what is left of the budget when it comes first is cut
-        (`text_cut: true`) and its remainder comes next."""
+        where to go on, always with the same call shape: `read(doc_id, section=<same>,
+        chunk_id=next_chunk_id, offset=next_offset)`. A window cut by the budget continues that way
+        too, so the continuation reads on to the end of the document, not of the window. A chunk
+        larger than what is left of the budget when it comes first is cut (`text_cut: true`) and its
+        remainder comes next."""
         if type(offset) is not int or offset < 0:
             raise ValueError(f"offset must be an integer >= 0, got {offset!r}")
         if around is not None and (type(around) is not int or around < 0):
@@ -749,6 +772,7 @@ class FilingsIndexer:
         if offset and (number is None or window):
             raise ValueError("offset needs chunk_id and a forward read (section, or around=None)")
         self._open()
+        self._reconcile([doc_id])
         status = self._get(doc_id)
         if status is None:
             raise DocumentNotFetched(f"document {doc_id!r} was never fetched")
@@ -813,11 +837,12 @@ class FilingsIndexer:
         return result
 
     def _fill(self, result: dict[str, Any], rows: Iterable[tuple], offset: int) -> None:
-        """Append chunks of `rows` to `result` while its size (as the tools count it) stays within the
-        budget; set `more` / `next_chunk_id` / `next_offset` to the first text not returned."""
+        """Append chunks of `rows` to `result` while its size (as the tools count it), `more` and
+        `next_*` included, stays within the budget; `next_*` point at the first text not returned."""
         budget = self._settings.max_result_chars
         chunks: list[dict[str, Any]] = result["chunks"]
         size = result_chars(result)
+        pending: dict[str, Any] | None = None  # the first entry that did not fit
         first = True
         for number, name, text in rows:
             skip, first = (offset if first else 0), False
@@ -829,30 +854,37 @@ class FilingsIndexer:
                 chunks.append(entry)
                 size += cost
                 continue
-            result.update(more=True, next_chunk_id=str(number), next_offset=skip)
-            if not chunks:
-                # This chunk alone is over the budget: its text is cut, the remainder comes next.
-                whole = entry["text"]
-
-                def fits(
-                    length: int, entry: dict[str, Any] = entry, whole: str = whole, skip: int = skip
-                ) -> bool:
-                    piece = {**entry, "text": whole[:length], "text_cut": True}
-                    return result_chars({**result, "chunks": [piece], "next_offset": skip + length}) <= budget
-
-                low, high = 0, len(whole)
-                while low < high:
-                    middle = (low + high + 1) // 2
-                    low, high = (middle, high) if fits(middle) else (low, middle - 1)
-                if low == 0:
-                    raise ValueError(f"MOF_MCP_MAX_RESULT_CHARS ({budget}) leaves no room for any chunk text")
-                chunks.append({**entry, "text": whole[:low], "text_cut": True})
-                result["next_offset"] = skip + low
+            pending = entry
             break
-        # `more` and `next_*` changed size: give back trailing chunks until the result fits.
+        if pending is None:
+            return
+        self._point_at(result, pending)
+        # `more` and `next_*` changed the size: give back trailing chunks while more than one is left.
         while result_chars(result) > budget and len(chunks) > 1:
-            last = chunks.pop()
-            result.update(more=True, next_chunk_id=last["chunk_id"], next_offset=last.get("offset", 0))
+            self._point_at(result, chunks.pop())
+        if not chunks or result_chars(result) > budget:
+            # The first chunk does not fit whole: its text is cut, the remainder comes next.
+            entry = chunks.pop() if chunks else pending
+            whole, skip = entry["text"], entry.get("offset", 0)
+
+            def fits(length: int) -> bool:
+                piece = {**entry, "text": whole[:length], "text_cut": True}
+                trial = {**result, "chunks": [piece], "more": True}
+                trial.update(next_chunk_id=entry["chunk_id"], next_offset=skip + length)
+                return result_chars(trial) <= budget
+
+            low, high = 0, len(whole) - 1  # a remainder of at least one character comes next
+            while low < high:
+                middle = (low + high + 1) // 2
+                low, high = (middle, high) if fits(middle) else (low, middle - 1)
+            if low == 0:
+                raise ValueError(f"MOF_MCP_MAX_RESULT_CHARS ({budget}) leaves no room for any chunk text")
+            chunks.append({**entry, "text": whole[:low], "text_cut": True})
+            result.update(more=True, next_chunk_id=entry["chunk_id"], next_offset=skip + low)
+
+    @staticmethod
+    def _point_at(result: dict[str, Any], entry: dict[str, Any]) -> None:
+        result.update(more=True, next_chunk_id=entry["chunk_id"], next_offset=entry.get("offset", 0))
 
     def close(self) -> None:
         """Stop the workers after their current step (at most MOF_INDEX_CLOSE_TIMEOUT_S) and release
