@@ -297,6 +297,21 @@ def test_slow_sec_answers_warming_then_serves(make):
     assert sec.urls().count(COMPANYFACTS_URL.format(cik=AAPL)) == 1  # the same build, finished
 
 
+def test_a_caller_budget_shortens_the_wait_never_lengthens_it(make):
+    sec = FakeSec(hold="companyfacts")
+    src = make(sec, sec_call_budget_s=1)
+    t0 = time.monotonic()
+    with pytest.raises(Warming):
+        src.concept_rows(AAPL, LATER, budget_s=0)  # the router spent the budget: progress at once
+    with pytest.raises(Warming):
+        src.read("fundamentals", as_of=LATER, filters={"entity_value": [AAPL]}, columns=None, limit=None,
+                 budget_s=30)  # capped at MOF_SEC_CALL_BUDGET_S
+    assert time.monotonic() - t0 < 5
+    with pytest.raises(StoreBadArgument):
+        src.concept_rows(AAPL, LATER, budget_s="soon")
+    sec.gate.set()
+
+
 def test_concurrent_callers_share_one_build(make):
     sec = FakeSec(hold="companyfacts")
     src = make(sec)
@@ -667,7 +682,7 @@ def test_latest_filing_and_filings_read_the_submissions_only(make):
     assert src.latest_filing(AAPL).accession == AAPL_E24
     assert src.latest_filing(AAPL, forms=src.report_forms).accession == AAPL_E24  # an 8-K is a report form
     assert src.latest_filing(AAPL, forms=src.positions_forms).accession == AAPL_K24
-    tenk =src.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
+    tenk = src.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
     assert [f.accession for f in tenk] == [AAPL_K24, AAPL_K23]
     dated = src.filings(AAPL, forms=None, period_from=date(2024, 1, 1), period_to=date(2024, 7, 1))
     assert [f.accession for f in dated] == [AAPL_Q24]

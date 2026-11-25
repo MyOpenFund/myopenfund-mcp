@@ -89,57 +89,66 @@ def _timeout(seconds: float) -> Exception:
 @contextmanager
 def time_budget(settings, seconds: float | None = None):
     """One time budget (`seconds`, default `companies_query_timeout_s`) for everything inside: a tool
-    wraps all its store calls in it, so N companies cannot take N budgets. Its expiry is `[timeout]`."""
+    wraps all its store calls in it, so N companies cannot take N budgets. Its expiry is `[timeout]`.
+    Yields the cancel scope: a tool may move its deadline once it knows which sources a call needs."""
     seconds = settings.companies_query_timeout_s if seconds is None else seconds
+    start, scope = anyio.current_time(), None
     try:
-        with anyio.fail_after(seconds):
-            yield
+        with anyio.fail_after(seconds) as scope:
+            yield scope
     except TimeoutError:
-        raise _timeout(seconds) from None
+        raise _timeout(round(scope.deadline - start, 1)) from None
 
 
 def call_budget_s(settings, *, live: bool) -> float:
-    """A call's time budget: `companies_query_timeout_s`, plus `sec_call_budget_s` when it may reach SEC
-    (the live source answers `[warming]` after that budget, so the call must outlast it)."""
+    """A call's largest time budget: `companies_query_timeout_s`, plus `sec_call_budget_s` when it may
+    reach SEC (the live source answers `[warming]` after that budget, so the call must outlast it)."""
     return settings.companies_query_timeout_s + (settings.sec_call_budget_s if live else 0)
 
 
 async def store_call(fn, /, *, settings, timeout_s: float | None = None, **kwargs):
     """Run a blocking store (or router, or live source) method off the event loop within the time
-    budget (and within any enclosing `time_budget`); map its errors to codes.
-
-    Backend failures never forward their message (it may hold a DSN; an SEC error never holds the
-    contact, but its text is not forwarded either): the class only is logged.
-    """
+    budget (and within any enclosing `time_budget`); map its errors to codes (:func:`coded`)."""
     try:
         with time_budget(settings, timeout_s):  # nested in a tool's own budget, the earlier deadline wins
             return await anyio.to_thread.run_sync(partial(fn, **kwargs), abandon_on_cancel=True)
     except ToolError:
         raise
-    except Warming as exc:
-        raise WarmingError(exc.done, exc.total) from None
-    except NoFacts as exc:
-        raise tool_error(NO_FACTS, f"SEC has no XBRL financial facts for CIK {exc.cik} (it files no "
-                                   "financial statements in XBRL, e.g. a fund or a foreign private issuer "
-                                   "before XBRL)") from None
-    except LiveNotConfigured as exc:
-        raise tool_error(SEC_CONTACT_MISSING, f"CIK {exc.cik} must be read from SEC ({exc.reason}) and SEC "
-                                              "access is not configured: set MOF_SEC_CONTACT (e.g. an email "
-                                              "address)") from None
-    except (LiveDataError, LiveClosed) as exc:
+    except Exception as exc:  # noqa: BLE001 -- every other error gets its code
+        raise coded(exc) from None
+
+
+def coded(exc: BaseException) -> ToolError:
+    """The `[code]` ToolError of a store, router or live-source error.
+
+    Backend failures never forward their message (it may hold a DSN; an SEC error never holds the
+    contact, but its text is not forwarded either): the class only is logged.
+    """
+    if isinstance(exc, ToolError):
+        return exc
+    if isinstance(exc, Warming):
+        return WarmingError(exc.done, exc.total)
+    if isinstance(exc, NoFacts):
+        return tool_error(NO_FACTS, f"SEC has no XBRL financial facts for CIK {exc.cik} (it files no "
+                                    "financial statements in XBRL, e.g. a fund or a foreign private issuer "
+                                    "before XBRL)")
+    if isinstance(exc, LiveNotConfigured):
+        return tool_error(SEC_CONTACT_MISSING, f"CIK {exc.cik} must be read from SEC ({exc.reason}) and SEC "
+                                               "access is not configured: set MOF_SEC_CONTACT (e.g. an email "
+                                               "address)")
+    if isinstance(exc, (LiveDataError, LiveClosed)):
         log.warning("live SEC call failed (%s)", type(exc).__name__)
-        raise tool_error(BACKEND_UNAVAILABLE, LIVE_BACKEND_MESSAGE) from None
-    except StoreUnknownDataset as exc:
-        raise tool_error(UNKNOWN_DATASET, f"{exc}; see datasets_list") from None
-    except StoreBadArgument as exc:
+        return tool_error(BACKEND_UNAVAILABLE, LIVE_BACKEND_MESSAGE)
+    if isinstance(exc, StoreUnknownDataset):
+        return tool_error(UNKNOWN_DATASET, f"{exc}; see datasets_list")
+    if isinstance(exc, StoreBadArgument):
         msg = str(exc)
         if msg.startswith("unknown column"):
-            raise tool_error(UNKNOWN_COLUMN, f"{msg}; see datasets_describe") from None
-        raise tool_error(INVALID_ARGUMENT, msg) from None
-    except Exception as exc:  # noqa: BLE001 -- StoreBackendError and anything else: fixed message
-        code = sec_error_code(exc)
-        if code is not None:
-            log.warning("SEC call failed (%s)", type(exc).__name__)
-            raise tool_error(code, SEC_MESSAGES[code]) from None
-        log.warning("store call failed (%s)", type(exc).__name__)
-        raise tool_error(BACKEND_UNAVAILABLE, BACKEND_MESSAGE) from None
+            return tool_error(UNKNOWN_COLUMN, f"{msg}; see datasets_describe")
+        return tool_error(INVALID_ARGUMENT, msg)
+    code = sec_error_code(exc)
+    if code is not None:
+        log.warning("SEC call failed (%s)", type(exc).__name__)
+        return tool_error(code, SEC_MESSAGES[code])
+    log.warning("store call failed (%s)", type(exc).__name__)  # StoreBackendError and anything else
+    return tool_error(BACKEND_UNAVAILABLE, BACKEND_MESSAGE)

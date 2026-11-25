@@ -57,6 +57,7 @@ no message names it.
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -563,9 +564,18 @@ class LiveSource:
             return False
         return need is None or not self._needed(entry, *need)[1]
 
-    def _tables(self, ciks: Collection[str], need) -> dict[str, _Entry]:
+    def _budget(self, budget_s: float | None) -> float:
+        """A caller's wait: ``MOF_SEC_CALL_BUDGET_S``, or less when the caller already spent part of
+        it (the source router's freshness check counts in the same budget)."""
+        if budget_s is None:
+            return self._settings.sec_call_budget_s
+        if isinstance(budget_s, bool) or not isinstance(budget_s, (int, float)) or math.isnan(budget_s):
+            raise StoreBadArgument("budget_s must be a number of seconds")
+        return max(0.0, min(float(budget_s), self._settings.sec_call_budget_s))
+
+    def _tables(self, ciks: Collection[str], need, budget_s: float | None = None) -> dict[str, _Entry]:
         """Each CIK's entry, with the positions ``need`` reads, within the call budget."""
-        deadline = self._clock() + self._settings.sec_call_budget_s
+        deadline = self._clock() + self._budget(budget_s)
         out: dict[str, _Entry] = {}
         while True:
             waiting: list[_Job] = []
@@ -667,10 +677,12 @@ class LiveSource:
         columns: list[str] | None,
         limit: int | None,
         vintages: bool = False,
+        budget_s: float | None = None,
     ) -> list[dict]:
         """``CompaniesStore.read`` on the live tables of the CIKs named by the ``entity_value``
         filter (required: a live read is per issuer): rows knowable at ``as_of``, sorted by
-        natural key then ``known_at``; ``limit`` and ``columns`` apply after the sort."""
+        natural key then ``known_at``; ``limit`` and ``columns`` apply after the sort.
+        ``budget_s``: this call's wait before :class:`Warming` (at most ``MOF_SEC_CALL_BUDGET_S``)."""
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
             raise StoreBadArgument("limit must be a non-negative int")
         if not isinstance(vintages, bool):
@@ -694,7 +706,7 @@ class LiveSource:
             return []
         import pyarrow as pa
 
-        built = self._tables(ciks, None)
+        built = self._tables(ciks, None, budget_s)
         parts = [
             self._asof(getattr(built[c].tables, contract.name), contract, as_of, checked, vintages)
             for c in ciks
@@ -714,17 +726,19 @@ class LiveSource:
         *,
         period_from: date | None = None,
         period_to: date | None = None,
+        budget_s: float | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """``(selection_rows, vintages)`` as ``CompaniesStore.concept_rows`` gives them, from the
         live tables. The period (facts dated in it) decides which filings' statement positions are
-        fetched and read: those filings and their borrow donors only, whatever was fetched before."""
+        fetched and read: those filings and their borrow donors only, whatever was fetched before.
+        ``budget_s`` as in :meth:`read`."""
         from company_corpus.concepts.selection import run_selection
 
         if not _is_cik(cik):
             raise StoreBadArgument("cik must be a 10-digit string")
         as_of = _aware(as_of, self._now)
         need = (as_of, self._window(period_from, period_to))
-        entry = self._tables([cik], need)[cik]
+        entry = self._tables([cik], need, budget_s)[cik]
         used, _ = self._needed(entry, *need)
         facts = self._asof(
             entry.tables.fundamentals, self._contracts["fundamentals"], as_of, {}, vintages=True

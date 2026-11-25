@@ -37,12 +37,13 @@ from .common import (
     READ_ONLY,
     WarmingError,
     call_budget_s,
+    coded,
     parse_as_of,
     rows_to_utc,
     store_call,
     time_budget,
 )
-from .router import Route, SourceRouter
+from .router import LIVE, STORE, STORE_UNAVAILABLE, Route, SourceRouter
 
 Frequency = Literal["annual", "semiannual", "quarterly", "instant"]
 #: as filed in the store; ytd9 = the 9-month year-to-date, which only derives an unreported Q4
@@ -108,6 +109,33 @@ async def _per_company(hits: list[dict], fn) -> list:
     return results
 
 
+class _Budget:
+    """One call's time budget, in the cancel scope of its `time_budget`.
+
+    It starts at `companies_query_timeout_s`, plus `sec_call_budget_s` when SEC may be reached. Once
+    routing says no company goes live it narrows to the store budget plus the routing time (the SEC
+    freshness check); a company that goes live (or falls back to SEC) restores the full budget. A
+    live read waits `sec_call_budget_s` counted from the start of the call (routing included), so a
+    cold call answers `[warming]` before the call budget ends in `[timeout]`."""
+
+    def __init__(self, settings: Settings, scope, *, live_enabled: bool):
+        self._settings, self._scope, self._live_enabled = settings, scope, live_enabled
+        self._t0 = anyio.current_time()
+
+    def routed(self, routes: dict[str, Route], routing_s: float) -> None:
+        if any(r.source == LIVE for r in routes.values()):
+            self.go_live()
+        elif self._live_enabled:
+            self._scope.deadline = self._t0 + self._settings.companies_query_timeout_s + routing_s
+
+    def go_live(self) -> None:
+        s = self._settings
+        self._scope.deadline = self._t0 + s.companies_query_timeout_s + s.sec_call_budget_s
+
+    def live_wait(self) -> float:
+        return max(0.0, self._t0 + self._settings.sec_call_budget_s - anyio.current_time())
+
+
 def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_enabled: bool) -> FastMCP:
     co = FastMCP("companies", mask_error_details=True)
     read = tier_check("read", auth_enabled=auth_enabled)
@@ -120,6 +148,17 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
 
     async def call(fn, /, **kwargs):
         return await store_call(fn, settings=settings, timeout_s=budget_s, **kwargs)
+
+    async def plan(hits: list[dict], when: dt.datetime, budget: _Budget) -> dict[str, Route]:
+        t = anyio.current_time()
+        routes = await call(router.plan, ciks=[h["cik"] for h in hits], as_of=when)
+        budget.routed(routes, anyio.current_time() - t)
+        return routes
+
+    async def on_live(h: dict, route: Route, budget: _Budget, method: str, **kwargs):
+        """One company's read from SEC (or the error naming what is missing)."""
+        return await call(router.call, company=h["cik"], route=route, method=method,
+                          budget_s=budget.live_wait(), **kwargs)
 
     @cache
     def catalogs() -> tuple[dict[str, str], frozenset[str]]:
@@ -142,12 +181,16 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         return chunk, (encode_cursor(end) if end < len(rows) and end <= MAX_OFFSET else None)
 
     async def lookup(companies: list[str]) -> list[dict]:
-        """One entity per distinct company (in the order given); unknown or ambiguous is an error."""
-        idx = res.index(await call(router.entities))
+        """One entity per distinct company (in the order given); unknown or ambiguous is an error (the
+        SEC resolver's own error when it failed and the store alone cannot resolve the query)."""
+        rows, sec_failure = await call(router.resolver_rows)
+        idx = res.index(rows)
         out: dict[str, dict] = {}
         for q in companies:
             hits = res.resolve(idx, q)
             if not hits:
+                if sec_failure is not None:
+                    raise coded(sec_failure)
                 raise tool_error(UNKNOWN_COMPANY, f"no company matches {q!r}; {unknown_hint}")
             if len(hits) > 1:
                 names = ", ".join(f"{h['current_name']} (CIK {h['cik']})" for h in hits[:10])
@@ -168,8 +211,10 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         former names oldest first with the date each was first seen (`since`)."""
         page = clamp_limit(limit, settings)
         with time_budget(settings, budget_s):
-            idx = res.index(await call(router.entities))
-        hits = res.resolve(idx, query)
+            rows, sec_failure = await call(router.resolver_rows)
+        hits = res.resolve(res.index(rows), query)
+        if not hits and sec_failure is not None:
+            raise coded(sec_failure)
         return cap_result({"candidates": hits[:page], "total": len(hits)}, settings,
                           hint="ask for a smaller limit or a more precise query")
 
@@ -202,18 +247,38 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         if frequency:
             flt["frequency"] = [frequency]
 
-        async def one(h):
-            return await call(router.call, company=h["cik"], method="read", dataset="fundamentals",
-                              as_of=when, filters={**flt, "entity_value": [h["cik"]]}, columns=None,
-                              limit=None)
+        read = {"dataset": "fundamentals", "as_of": when, "columns": None, "limit": None}
 
-        with time_budget(settings, budget_s):
+        with time_budget(settings, budget_s) as scope:
+            budget = _Budget(settings, scope, live_enabled=router.live_enabled)
             hits = await lookup(companies)
-            found = await _per_company(hits, one)
+            routes = await plan(hits, when, budget)
+            # the store's companies in ONE read, as before routing; then each live company
+            held = [h["cik"] for h in hits if routes[h["cik"]].source == STORE]
+            by_cik: dict[str, list[dict]] = {}
+            if held:
+                got = await call(router.try_store, method="read", filters={**flt, "entity_value": held},
+                                 **read)
+                if got is None:  # the store failed: SEC answers those companies for this call
+                    routes.update(dict.fromkeys(held, Route(LIVE, STORE_UNAVAILABLE)))
+                    budget.go_live()
+                else:
+                    for r in got:
+                        by_cik.setdefault(r["entity_value"], []).append(r)
+            live_hits = [h for h in hits if routes[h["cik"]].source == LIVE]
+
+            async def one(h):
+                route, part = await on_live(h, routes[h["cik"]], budget, "read",
+                                            filters={**flt, "entity_value": [h["cik"]]}, **read)
+                routes[h["cik"]] = route
+                return part
+
+            for h, part in zip(live_hits, await _per_company(live_hits, one), strict=True):
+                by_cik[h["cik"]] = part
         rows = [{"cik": h["cik"], "name": h["current_name"],
-                 **{k: v for k, v in r.items() if k != "batch_id"}, **_origin(route)}
-                for h, (route, part) in zip(hits, found, strict=True)
-                for r in part if _in_range(r["valid_date"], period_from, period_to)]
+                 **{k: v for k, v in r.items() if k != "batch_id"}, **_origin(routes[h["cik"]])}
+                for h in hits for r in by_cik.get(h["cik"], [])
+                if _in_range(r["valid_date"], period_from, period_to)]
         rows.sort(key=lambda r: (r["cik"], _newest_first(r["valid_date"]), r["original_tag"], r["frequency"]))
         chunk, nxt = page_of(rows, page, offset)
         return cap_result({"as_of": when.isoformat(), "returned": len(chunk), "total": len(rows),
@@ -272,10 +337,17 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                 return r["valid_date"] in period_ends
             return keep(r["valid_date"], r["frequency"])
 
-        async def one(h):
-            route, (sel, vintages) = await call(router.call, company=h["cik"], method="concept_rows",
-                                                cik=h["cik"], as_of=when, period_from=period_from,
-                                                period_to=period_to)
+        async def one(h, routes, budget):
+            route, got = routes[h["cik"]], None
+            if route.source == STORE:
+                got = await call(router.try_store, method="concept_rows", cik=h["cik"], as_of=when)
+                if got is None:  # the store failed: SEC answers this company for this call
+                    route = Route(LIVE, STORE_UNAVAILABLE)
+                    budget.go_live()
+            if got is None:
+                route, got = await on_live(h, route, budget, "concept_rows", cik=h["cik"], as_of=when,
+                                           period_from=period_from, period_to=period_to)
+            sel, vintages = got
             summaries = []
             if wanted and sel:
                 summaries = await call(router.source(route).summaries, cik=h["cik"], name=h["current_name"],
@@ -283,9 +355,11 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
             return route, sel, summaries
 
         rows, version = [], None
-        with time_budget(settings, budget_s):
+        with time_budget(settings, budget_s) as scope:
+            budget = _Budget(settings, scope, live_enabled=router.live_enabled)
             hits = await lookup(companies)
-            found = await _per_company(hits, one)
+            routes = await plan(hits, when, budget)
+            found = await _per_company(hits, lambda h: one(h, routes, budget))
             for h, (route, sel, summaries) in zip(hits, found, strict=True):
                 cik, name, origin = h["cik"], h["current_name"], _origin(route)
                 # ends of this company's included duration periods (any concept, before the concept filter)

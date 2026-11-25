@@ -140,11 +140,12 @@ async def test_fundamentals_concepts_and_metrics(store):
     assert rev["known_at"] == "2025-10-31T20:00:00+00:00"
     assert set(rev) == {"cik", "name", "period_end", "frequency", "kind", "key", "label", "value", "unit",
                         "original_tag", "filing_ref", "source_doc_id", "known_at", "location", "conflict",
-                        "source"}
+                        "source", "reason"}
     nm = next(r for r in res["rows"] if r["key"] == "net_margin")
     assert set(nm) == {"cik", "name", "period_end", "frequency", "kind", "key", "label", "value", "unit",
-                       "ttm", "sector_relevant", "source"}
-    assert rev["source"] == nm["source"] == "store" and "reason" not in rev  # no contact: store, unchecked
+                       "ttm", "sector_relevant", "source", "reason"}
+    # no contact: the store answers, its freshness unchecked (R27)
+    assert (rev["source"], rev["reason"]) == (nm["source"], nm["reason"]) == ("store", "freshness_unchecked")
     assert nm["ttm"] is False and nm["unit"] == "%" and abs(nm["value"] - 23.97) < 0.01
     assert next(r for r in res["rows"] if r["key"] == "net_margin_ttm")["ttm"] is True
     # the dictionary version company-corpus 06c619d ships
@@ -672,7 +673,145 @@ async def test_a_company_needing_sec_without_contact_is_sec_contact_missing():
 
     router = SourceRouter(FakeStore(ciks=()), None, "auto")
     with pytest.raises(ToolError) as err:
-        await store_call(router.call, settings=Settings(), company=APPLE, method="concept_rows", cik=APPLE,
-                         as_of=parse_as_of(None))
+        await store_call(router.call, settings=Settings(), company=APPLE, route=router.route(APPLE),
+                         method="concept_rows", cik=APPLE, as_of=parse_as_of(None))
     msg = str(err.value)
     assert msg.startswith("[sec_contact_missing]") and "MOF_SEC_CONTACT" in msg and APPLE in msg
+
+
+async def test_rows_say_freshness_unchecked_when_sec_fails_during_the_check():
+    from company_corpus.live.sec import SecUnavailable
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    res = await _routed_call(FakeStore(), FakeLive(fail={"filings": SecUnavailable("x")}), "companies_facts",
+                             {"companies": [APPLE]})
+    assert [(r["source"], r["reason"], r["value"]) for r in res["rows"]] == [("store", "freshness_unchecked", 100)]
+
+
+async def test_store_companies_are_read_in_one_store_read():
+    from source_fakes import APPLE, APPLE_REFS, JPM, MSFT, FakeLive, FakeStore
+
+    store = FakeStore(ciks=(APPLE, JPM))
+    store.filings[JPM] = list(store.filings[APPLE])
+    store.positions[JPM] = set(store.positions[APPLE])
+    live = FakeLive(refs={APPLE: list(APPLE_REFS), JPM: list(APPLE_REFS)})
+    res = await _routed_call(store, live, "companies_facts", {"companies": [APPLE, JPM, MSFT]})
+    assert {(r["cik"], r["source"]) for r in res["rows"]} == {(APPLE, "store"), (JPM, "store"), (MSFT, "sec_live")}
+    assert store.calls.count("read:fundamentals") == 1
+    assert live.calls.count("read:fundamentals") == 1
+    assert store.calls.count("freshness") <= 2 and store.calls.count("datasets") == 1  # not per company
+
+
+async def test_a_pure_store_call_keeps_the_store_budget():
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    store = FakeStore()
+    real = store.read
+
+    def slow(dataset, **kw):
+        if dataset == "fundamentals":
+            time.sleep(1.5)
+        return real(dataset, **kw)
+
+    store.read, settled = _tracked(slow)
+    t0 = time.monotonic()
+    msg = await _routed_error(store, FakeLive(), "companies_facts", {"companies": [APPLE]},
+                              companies_query_timeout_s=1, sec_call_budget_s=30)
+    assert msg.startswith("[timeout]") and time.monotonic() - t0 < 1.45
+    await settled()
+
+
+async def test_routing_time_counts_in_the_live_wait():
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    live = FakeLive()
+    real = live.filings
+
+    def slow_check(cik, **kw):
+        time.sleep(0.5)
+        return real(cik, **kw)
+
+    live.filings = slow_check
+    store = FakeStore(filings={})  # behind: Apple goes live after a 0.5 s freshness check
+    res = await _routed_call(store, live, "companies_fundamentals", {"companies": [APPLE]}, sec_call_budget_s=2)
+    assert [(r["source"], r["reason"]) for r in res["rows"]] == [("sec_live", "store_behind")]
+    assert live.budgets and live.budgets[0] <= 1.55
+
+
+async def test_a_resolver_sec_failure_is_reported_when_the_store_cannot_resolve():
+    from company_corpus.live.sec import SecUnavailable
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    live = FakeLive(fail={"entities": SecUnavailable("x")})
+    msg = await _routed_error(FakeStore(), live, "companies_facts", {"companies": ["MSFT"]})
+    assert msg.startswith("[sec_unavailable]")
+    msg = await _routed_error(FakeStore(), live, "companies_resolve", {"query": "microsoft"})
+    assert msg.startswith("[sec_unavailable]")
+    ok = await _routed_call(FakeStore(), live, "companies_resolve", {"query": "AAPL"})  # the store resolves it
+    assert [c["cik"] for c in ok["candidates"]] == [APPLE]
+
+
+async def test_a_store_company_and_a_live_company_sharing_a_name_are_ambiguous():
+    from source_fakes import APPLE, FakeLive, FakeStore, entity
+
+    other = "0000000777"
+    live = FakeLive(known=[entity(other, name="Apple Inc.", ticker="APPL.X")])
+    res = await _routed_call(FakeStore(), live, "companies_resolve", {"query": "apple inc"})
+    assert {c["cik"] for c in res["candidates"]} == {APPLE, other}
+    msg = await _routed_error(FakeStore(), live, "companies_facts", {"companies": ["apple inc"]})
+    assert msg.startswith("[ambiguous_company]") and APPLE in msg and other in msg
+
+
+async def test_a_new_live_ticker_of_a_store_company_resolves_to_it():
+    from source_fakes import APPLE, FakeLive, FakeStore, entity
+
+    live = FakeLive(known=[entity(APPLE, name="Apple Inc. (new name at SEC)", ticker="APLE.NEW")])
+    res = await _routed_call(FakeStore(), live, "companies_resolve", {"query": "APLE.NEW"})
+    assert [(c["cik"], c["current_name"]) for c in res["candidates"]] == [(APPLE, "Apple Inc.")]
+
+
+def test_sources_built_before_a_refusal_are_closed(tmp_path, monkeypatch):
+    import myopenfund_mcp.companies.store as store_mod
+    from myopenfund_mcp.config import ConfigError
+
+    made = []
+
+    class Recording(store_mod.CompaniesStore):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    monkeypatch.setattr(store_mod, "CompaniesStore", Recording)
+    with pytest.raises(ConfigError):  # the store is built, then the live source's mode check refuses
+        build_server(Settings(companies_catalog="x", companies_data_root=str(tmp_path), companies_source="sec"))
+    assert made and made[0].closed
+
+
+async def test_shutdown_closes_the_live_source_before_the_store(tmp_path, monkeypatch):
+    import myopenfund_mcp.companies.live as live_mod
+    import myopenfund_mcp.companies.store as store_mod
+
+    order = []
+
+    class Store(store_mod.CompaniesStore):
+        def close(self):
+            order.append("store")
+            super().close()
+
+    class Live(live_mod.LiveSource):
+        def close(self):
+            order.append("live")
+            super().close()
+
+    monkeypatch.setattr(store_mod, "CompaniesStore", Store)
+    monkeypatch.setattr(live_mod, "LiveSource", Live)
+    server = build_server(Settings(companies_catalog="x", companies_data_root=str(tmp_path), sec_contact=SENTINEL,
+                                   cache_dir=str(tmp_path / "c")))
+    async with Client(server):
+        pass
+    assert order == ["live", "store"]

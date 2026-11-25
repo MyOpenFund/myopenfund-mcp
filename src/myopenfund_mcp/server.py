@@ -53,10 +53,30 @@ def _cache_dir(settings: Settings, sec) -> str | None:
         return None
 
 
+def _close(owned: list) -> None:
+    """Close the sources a server built, newest first (the live source before the store)."""
+    for source in reversed(owned):
+        try:
+            source.close()
+        except Exception as exc:  # noqa: BLE001 -- the others still close; the class only is logged
+            log.warning("closing %s failed (%s)", type(source).__name__, type(exc).__name__)
+
+
 def build_server(settings: Settings, *, vault_reader=None, companies_store=None, companies_live=None,
                  rag_backend=None) -> FastMCP:
     """``companies_store`` / ``companies_live``: injected sources (tests); the server closes only the
-    ones it builds itself, at shutdown."""
+    ones it builds itself: at shutdown, or at once when a later step refuses to start."""
+    owned: list = []
+    try:
+        return _build_server(settings, owned, vault_reader=vault_reader, companies_store=companies_store,
+                             companies_live=companies_live, rag_backend=rag_backend)
+    except BaseException:
+        _close(owned)
+        raise
+
+
+def _build_server(settings: Settings, owned: list, *, vault_reader, companies_store, companies_live,
+                  rag_backend) -> FastMCP:
     auth_enabled = settings.transport == "http"
     if auth_enabled and not settings.tokens:
         raise ConfigError(
@@ -65,18 +85,12 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
     auth = HashedTokenVerifier(parse_tokens(settings.tokens)) if auth_enabled else None
     # mask_error_details: an unexpected exception (driver error, DSN in a message) reaches the
     # client as a generic error; our ToolError / ResourceError keep their `[code] message`.
-    owned: list = []  # sources this server built: closed at shutdown
-
     @asynccontextmanager
-    async def lifespan(_server):
+    async def lifespan(_server):  # `owned`: the sources this server built, closed at shutdown
         try:
             yield {}
         finally:
-            for source in owned:
-                try:
-                    source.close()
-                except Exception as exc:  # noqa: BLE001 -- shutdown goes on; the class only is logged
-                    log.warning("shutdown: closing %s failed (%s)", type(source).__name__, type(exc).__name__)
+            _close(owned)
 
     root = FastMCP("myopenfund", instructions=INSTRUCTIONS, version=__version__, auth=auth,
                    middleware=[AuditMiddleware()], mask_error_details=True, lifespan=lifespan)
@@ -137,8 +151,7 @@ def build_server(settings: Settings, *, vault_reader=None, companies_store=None,
         from .companies.tools import build_companies_toolset
 
         try:
-            router = SourceRouter(companies_store, companies_live, settings.companies_source,
-                                  route_ttl_s=settings.cache_ttl_submissions_h * 3600)
+            router = SourceRouter(companies_store, companies_live, settings.companies_source)
         except ValueError as exc:  # a source the mode needs is missing (from_env refuses it earlier)
             raise ConfigError(str(exc)) from None
         if companies_store is not None:  # without a store, datasets_* are not mounted

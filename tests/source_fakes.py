@@ -16,6 +16,7 @@ NAMES = {APPLE: ("Apple Inc.", "AAPL"), MSFT: ("MICROSOFT CORP", "MSFT"), JPM: (
 K24, E24, K23 = "0000320193-24-000123", "0000320193-24-000130", "0000320193-23-000106"
 ACCEPTED_K24 = dt.datetime(2024, 11, 1, 20, 6, 22, tzinfo=UTC)
 ACCEPTED_E24 = dt.datetime(2024, 11, 5, 21, 0, tzinfo=UTC)
+ACCEPTED_K23 = dt.datetime(2023, 11, 3, 20, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -27,15 +28,19 @@ class Ref:
     form: str = "10-K"
 
 
-def entity(cik: str) -> dict:
-    name, ticker = NAMES[cik]
+#: Apple's filings at SEC, newest first: an 8-K after the FY2024 10-K
+APPLE_REFS = [Ref(E24, ACCEPTED_E24, "8-K"), Ref(K24, ACCEPTED_K24), Ref(K23, ACCEPTED_K23)]
+
+
+def entity(cik: str, name: str | None = None, ticker: str | None = None) -> dict:
+    default_name, default_ticker = NAMES.get(cik, (None, None))
     return {
         "subject_scheme": "cik",
         "subject_value": cik,
         "entity_id": f"e-{cik}",
-        "name": name,
+        "name": name or default_name,
         "id_scheme": "ticker",
-        "id_value": ticker,
+        "id_value": ticker or default_ticker,
         "country": "US",
         "valid_date": "2020-01-01",
     }
@@ -102,33 +107,46 @@ class _Recording:
 
 
 class FakeStore(_Recording):
-    """``ciks``: the companies held. ``filings``: cik -> [(accession, known_at)]. ``positions``: cik ->
-    accessions with filing_statements rows. ``value``: the revenue the store holds."""
+    """``ciks``: the companies held. ``filings``: cik -> [(accession, known_at)] (None = the
+    ``filings`` dataset is not published). ``positions``: cik -> accessions with filing_statements
+    rows. ``value``: the revenue the store holds. ``batches``: the publication count."""
 
-    def __init__(self, ciks=(APPLE,), *, filings=None, positions=None, value=100, fail=None):
+    def __init__(self, ciks=(APPLE,), *, filings=..., positions=None, value=100, fail=None):
         super().__init__(fail)
         self.ciks = list(ciks)
-        self.filings = {APPLE: [(K24, ACCEPTED_K24), (E24, ACCEPTED_E24)]} if filings is None else filings
-        self.positions = {APPLE: {K24}} if positions is None else positions
+        self.filings = (
+            {APPLE: [(K23, ACCEPTED_K23), (K24, ACCEPTED_K24), (E24, ACCEPTED_E24)]}
+            if filings is ...
+            else filings
+        )
+        self.positions = {APPLE: {K24, K23}} if positions is None else positions
         self.value = value
+        self.batches = 1
 
     def freshness(self) -> dict:
         self._enter("freshness")
-        return {"last_published": ACCEPTED_E24, "batches": 1}
+        return {"last_published": ACCEPTED_E24, "batches": self.batches}
+
+    def datasets(self) -> list[dict]:
+        self._enter("datasets")
+        names = ["entity_observations", "fundamentals", "filing_statements"]
+        return [{"name": n} for n in names + (["filings"] if self.filings is not None else [])]
 
     def entities(self) -> list[dict]:
         self._enter("entities")
         return [entity(c) for c in self.ciks]
 
     def read(self, dataset, *, as_of, filters, columns, limit, vintages=False) -> list[dict]:
-        cik = (filters or {}).get("entity_value", [None])[0]
-        self._enter(f"read:{dataset}", cik)
+        ciks = (filters or {}).get("entity_value", [None])
+        self._enter(f"read:{dataset}", ciks[0] if len(ciks) == 1 else None)
         if dataset == "filings":
-            return [{"filing_ref": a, "known_at": k} for a, k in self.filings.get(cik, [])]
+            return [
+                {"filing_ref": a, "known_at": k} for c in ciks for a, k in (self.filings or {}).get(c, [])
+            ]
         if dataset == "filing_statements":
             wanted = set(filters.get("filing_ref", []))
-            return [{"filing_ref": a} for a in sorted(self.positions.get(cik, set()) & wanted)][:limit]
-        return [fact(cik, self.value)] if cik in self.ciks else []
+            return [{"filing_ref": a} for a in sorted(self.positions.get(ciks[0], set()) & wanted)][:limit]
+        return [fact(c, self.value) for c in ciks if c in self.ciks]
 
     def concept_rows(self, cik, as_of):  # the store's signature as the existing tests patch it
         self._enter("concept_rows", cik)
@@ -136,41 +154,43 @@ class FakeStore(_Recording):
 
 
 class FakeLive(_Recording):
-    """``latest``: cik -> (newest report-form filing, newest positions-form filing). ``value``: the
-    revenue SEC gives."""
+    """``refs``: cik -> its filings at SEC (``Ref``, any order). ``known``: extra resolver rows.
+    ``value``: the revenue SEC gives. ``budgets``: the ``budget_s`` each read received."""
 
     report_forms = ("10-K", "10-Q", "8-K")
-    positions_forms = ("10-K", "10-Q")
+    positions_forms = ("10-K", "10-Q", "20-F", "40-F")
 
-    def __init__(self, *, latest=None, value=200, fail=None):
+    def __init__(self, *, refs=None, known=(), value=200, fail=None):
         super().__init__(fail)
-        self.latest = (
-            {APPLE: (Ref(E24, ACCEPTED_E24, "8-K"), Ref(K24, ACCEPTED_K24))} if latest is None else latest
-        )
+        self.refs = {APPLE: list(APPLE_REFS)} if refs is None else refs
+        self.known = list(known)
         self.value = value
         self.periods: list[tuple] = []
+        self.budgets: list[float | None] = []
 
     def entities(self) -> list[dict]:
         self._enter("entities")
-        return [entity(c) for c in NAMES]
-
-    def latest_filing(self, cik, *, forms=None):
-        self._enter("latest_filing", cik)
-        refs = self.latest.get(cik)
-        if refs is None:
-            return None
-        return refs[1] if tuple(forms or ()) == self.positions_forms else refs[0]
+        return [entity(c) for c in NAMES] + [dict(r) for r in self.known]
 
     def filings(self, cik, *, forms, period_from, period_to) -> list:
         self._enter("filings", cik)
-        return []
+        wanted = {f.upper() for f in forms} if forms is not None else None
+        return [
+            r for r in self.refs.get(cik, []) if wanted is None or r.form.upper().removesuffix("/A") in wanted
+        ]
 
-    def read(self, dataset, *, as_of, filters, columns, limit, vintages=False) -> list[dict]:
+    def latest_filing(self, cik, *, forms=None):
+        found = self.filings(cik, forms=forms, period_from=None, period_to=None)
+        return max(found, key=lambda r: r.accepted) if found else None
+
+    def read(self, dataset, *, as_of, filters, columns, limit, vintages=False, budget_s=None) -> list[dict]:
         cik = filters["entity_value"][0]
         self._enter(f"read:{dataset}", cik)
-        return [fact(cik, self.value)]
+        self.budgets.append(budget_s)
+        return [fact(c, self.value) for c in filters["entity_value"]]
 
-    def concept_rows(self, cik, as_of, *, period_from=None, period_to=None):
+    def concept_rows(self, cik, as_of, *, period_from=None, period_to=None, budget_s=None):
         self._enter("concept_rows", cik)
         self.periods.append((period_from, period_to))
+        self.budgets.append(budget_s)
         return [concept_row(cik, self.value)], []
