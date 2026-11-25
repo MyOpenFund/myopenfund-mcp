@@ -475,8 +475,10 @@ class LiveSource:
     def _positions(self, cik: str, entry: _Entry, accessions: set, counting: _Counting) -> _Entry:
         """Fetch the positions of ``accessions`` and add them to the entry: company-corpus's
         ``filing_positions`` per filing, then the producer's ``statement_rows``, as
-        ``issuer_tables`` does for a window (a filing whose files are unreachable or gone has no
-        positions). Nothing else of the issuer is fetched or computed again."""
+        ``issuer_tables`` does for a window, except that an unreachable SEC (``SecUnavailable``)
+        fails the build instead of leaving the filing blind; a filing whose positions files are
+        gone or malformed has no positions. Nothing else of the issuer is fetched or computed
+        again."""
         import pyarrow as pa
         from company_corpus.live.filings import list_filings
         from company_corpus.live.issuer import POSITIONS_FORMS
@@ -495,7 +497,7 @@ class LiveSource:
             try:
                 with _data_faults():
                     found.extend(filing_positions(ref, counting))
-            except SecNotFound:  # no positions files: a blind filing (SecUnavailable propagates)
+            except SecNotFound:  # guard: filing_positions already maps 404s to []; SecUnavailable propagates
                 continue
         if found:
             found.sort(key=lambda r: (r["accn"], r["statement"], r["tag"]))  # issuer_tables' order
