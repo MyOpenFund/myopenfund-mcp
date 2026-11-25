@@ -825,6 +825,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_CACHE_TTL_COMPANYFACTS_H` | `24` | Hours a cached company-facts file is reused (1-8760). |
 | `MOF_FILINGS_MAX_DOCS` | `40` | Filings downloaded and indexed by one call (1-1000). |
 | `MOF_INDEX_WORKERS` | `1` | Filings indexed in parallel (1-32). |
+| `MOF_INDEX_CLOSE_TIMEOUT_S` | `10` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600. Past it the index is released; the document is resumed (`partial`) next time. |
 | `MOF_RAG_ONNX_PROVIDER` | `cpu` | ONNX execution provider of the local embedding: `cpu` or `coreml`. |
 | `MOF_SEARCH_RRF_K` | `60` | Constant k of the reciprocal-rank fusion of a filings search (1-1000). |
 | `MOF_SEARCH_CANDIDATES` | `50` | Passages each retriever hands to the fusion (1-1000). |

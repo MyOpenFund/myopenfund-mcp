@@ -281,6 +281,9 @@ class Settings:
     cache_ttl_companyfacts_h: int = 24  # MOF_CACHE_TTL_COMPANYFACTS_H: hours a company-facts file is reused
     filings_max_docs: int = 40  # MOF_FILINGS_MAX_DOCS: filings downloaded and indexed by one call
     index_workers: int = 1  # MOF_INDEX_WORKERS: filings indexed in parallel
+    # MOF_INDEX_CLOSE_TIMEOUT_S: seconds closing the filings indexer waits for its workers' current step
+    # (a batch, a fetch, a model load); past it the index is released and the workers die with the process
+    index_close_timeout_s: int = 10
     rag_onnx_provider: str = "cpu"  # MOF_RAG_ONNX_PROVIDER: cpu | coreml
     search_rrf_k: int = 60  # MOF_SEARCH_RRF_K: constant k of the reciprocal-rank fusion of a search
     search_candidates: int = 50  # MOF_SEARCH_CANDIDATES: passages each retriever hands to the fusion
@@ -362,6 +365,7 @@ class Settings:
             cache_ttl_companyfacts_h=_int(env, "MOF_CACHE_TTL_COMPANYFACTS_H", 24, maximum=8760),
             filings_max_docs=_int(env, "MOF_FILINGS_MAX_DOCS", 40, maximum=1000),
             index_workers=_int(env, "MOF_INDEX_WORKERS", 1, maximum=32),
+            index_close_timeout_s=_int(env, "MOF_INDEX_CLOSE_TIMEOUT_S", 10, minimum=0, maximum=3600),
             rag_onnx_provider=_get(env, "MOF_RAG_ONNX_PROVIDER") or "cpu",
             search_rrf_k=_int(env, "MOF_SEARCH_RRF_K", 60, maximum=1000),
             search_candidates=_int(env, "MOF_SEARCH_CANDIDATES", 50, maximum=1000),

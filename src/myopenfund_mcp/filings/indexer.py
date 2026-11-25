@@ -5,17 +5,18 @@ through the SEC client and its disk cache, and converted to Markdown by company-
 `indexing` (chunked, embedded, added) -> `ready`; or `failed` (with a one-line error), or `partial`
 (see "Restart"). `enqueue` returns at once; daemon worker threads (`MOF_INDEX_WORKERS`) do the work.
 
-**Where things live** (under `Settings.cache_path()`; never evicted by the HTTP cache):
-- `models/`: the embedding model files (a Hugging Face cache layout; 1.1 GB once);
-- `index/<collection>/`: rag-engine's `LocalIndex` (Qdrant local mode + SQLite FTS5). The collection
-  name (`rag_engine.local.collection_name`) holds the model, its pinned revision, the chunker
-  version (`v2-t<MOF_CHUNK_MAX_TOKENS>-o<MOF_CHUNK_OVERLAP_TOKENS>`) and the ONNX provider, so
-  vectors of two setups are never mixed;
-- `index/status.sqlite3`: this module's record, keyed by collection: one row per document (state,
-  chunks done/total, error, metadata) and one row per stored chunk (number, section, text), which
-  `read` serves and a resume reads.
-With `MOF_CACHE=off` both folders are in a temporary folder removed at exit (the model is then
-downloaded again by every process).
+**Where things live** (never evicted by the HTTP cache):
+- `<cache_path()>/models/`: the embedding model files (a Hugging Face cache layout; 1.1 GB once).
+  Software, not data: they stay in the persistent cache folder even with `MOF_CACHE=off`;
+- `<root>/index/<collection>/`: rag-engine's `LocalIndex` (Qdrant local mode + SQLite FTS5). The
+  collection name (`rag_engine.local.collection_name`) holds the model, its pinned revision, the
+  chunker version (`v2-t<MOF_CHUNK_MAX_TOKENS>-o<MOF_CHUNK_OVERLAP_TOKENS>`) and the ONNX provider,
+  so vectors of two setups are never mixed;
+- `<root>/index/status.sqlite3`: this module's record, keyed by collection: one row per document
+  (state, chunks done/total, error, metadata, title, fingerprint of its cut) and one row per stored
+  chunk (number, section, text), which `read` serves and a resume reads.
+`<root>` is `cache_path()`, or with `MOF_CACHE=off` a temporary folder removed at exit (after the
+indexer is closed, so no worker writes into a removed folder).
 
 **Chunks.** The Markdown is cut at the boundaries of its Item sections (`FilingDocument.sections`;
 the text before, between and after them has no section), and each piece is chunked with
@@ -26,32 +27,39 @@ section, and its `section` payload is the name of the section it starts in, exac
 run in document order; they are the `first_index` positions given to `LocalIndex.add`, so the point
 ids do not depend on the order chunks are embedded in. Payload of each chunk: `doc_id`, `doc_type`
 (the form), `date` (filed, `YYYY-MM-DD`), `title` (`<company> <form> <filed>`), `source_code` (the
-CIK), `section`, `chunker_version`, `accession`, `url`.
+CIK), `section`, `chunker_version`, `accession`, `url`. A document without any chunk is `failed`.
 
 **Order.** The chunks of the form's priority sections (`company_corpus.live.documents.
 priority_sections`: Item 7 of a 10-K) are embedded and added first, then the others in document
 order, in batches of the embedder's batch size, each batch within one section. A search serves what
 is added so far: the MD&A of a document is searchable before the document is `ready`.
 
-**Model.** Loaded in a worker when the first document is taken, never at start-up (and by `search`
-when documents indexed by an earlier process are searched first). The first `enqueue` result has
-`model_download=True` when the pinned model files are not yet in `models/`.
+**Model.** Loaded in a worker when the first document is taken, never at start-up; a `search` of
+documents indexed by an earlier process, made before any `enqueue`, loads it (and waits for a load in
+progress). Once loaded, searches never wait on it. The first `enqueue` result of the process has
+`model_download=True` when the pinned model files are not yet in `models/` (reported once).
 
 **Restart.** A document left `queued`, `fetching` or `indexing` by a process that stopped is shown as
-`partial` (never `ready`) by the next process that opens the index. Enqueuing it again resumes it:
-the document is chunked again (deterministic: the Markdown comes from the immutable disk cache), the
-chunk numbers already stored are skipped, and it ends `ready` with the same chunk count. Should the
-new chunking give another count, the document is removed and indexed again from scratch.
+`partial` (never `ready`) by the next process that opens the index; so is a `ready` one whose chunk
+count in the local index is not its total. Enqueuing it again resumes it: the document is chunked
+again with the title stored at its first indexing (the Markdown comes from the immutable disk cache)
+and the cut is compared with the stored fingerprint (SHA-256 of the chunker version, the title and
+every chunk's section, text and context). Same cut, and the local index holds exactly the stored
+chunks: the stored chunk numbers are skipped. Otherwise (another cut, or chunks added to the index
+whose record was not written) the document's points and chunks are removed and it is indexed again.
 
 **One process per cache folder.** Qdrant local mode locks its folder. The index is opened by the
 first call that needs it; when another process holds it, every method raises `IndexUnavailable`
 (naming the lock), and a later call tries again. Nothing else of the server depends on it.
 
 **Errors.** A document that fails is marked `failed` with `<ExceptionType>: <first line of the
-message>` (the SEC contact is never written) and the worker continues with the next one.
+message>` (the SEC contact is never written) and the worker continues with the next one. Log lines
+carry exception type names only.
 
-`close()` stops the workers after their current step (a batch, a fetch or the model load) and
-releases the index. A document cut that way is `partial` for the next process.
+`close()` stops the workers after their current step (the model load, the fetch, the chunking or a
+batch), waiting at most `MOF_INDEX_CLOSE_TIMEOUT_S`, then releases the index; a worker still busy
+then (a model download) finds the index closed and ends with the process. A document cut that way
+is `partial` for the next process. Calls after `close()` raise `IndexUnavailable`.
 """
 
 from __future__ import annotations
@@ -59,16 +67,18 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import logging
 import queue
 import sqlite3
 import tempfile
 import threading
-from collections.abc import Callable, Collection, Mapping, Sequence
+import time
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from company_corpus.live.documents import FilingDocument, filing_document, priority_sections
 from company_corpus.live.filings import FilingRef
@@ -82,6 +92,7 @@ from rag_engine.select import select_diverse
 from rag_engine.store import IndexLocked
 
 from ..config import Settings
+from ..paging import result_chars
 
 __all__ = [
     "STATES",
@@ -90,7 +101,9 @@ __all__ = [
     "EnqueueResult",
     "FilingsIndexer",
     "IndexUnavailable",
+    "SearchResult",
     "SectionNotFound",
+    "StatusResult",
     "chunk_id",
     "chunk_options",
     "chunker_version",
@@ -121,6 +134,10 @@ class SectionNotFound(LookupError):
     """`read(section=...)` of a section the document's stored chunks do not have."""
 
 
+class _Stopped(Exception):
+    """The indexer is closing: the worker leaves the document as it is (partial for the next process)."""
+
+
 @dataclass
 class DocStatus:
     doc_id: str
@@ -141,11 +158,42 @@ class DocStatus:
 
 
 class EnqueueResult(list):
-    """The statuses `enqueue` returns (a `list[DocStatus]`), plus `model_download`: True when this
-    call starts the first load of the embedding model and its pinned files are not in the cache yet
-    (1.1 GB to download)."""
+    """The statuses `enqueue` returns (a `list[DocStatus]`), plus `model_download`: True on the first
+    `enqueue` of the process that starts the first load of the embedding model while its pinned files
+    are not in the cache yet (1.1 GB to download); False on every later call."""
 
     model_download: bool = False
+
+
+class StatusResult(list):
+    """The statuses `status` returns (a `list[DocStatus]`), plus `unknown`: the requested doc_ids that
+    were never enqueued, in the order given."""
+
+    unknown: list[str]
+
+    def __init__(self, items: Iterable[DocStatus] = (), unknown: Sequence[str] = ()) -> None:
+        super().__init__(items)
+        self.unknown = list(unknown)
+
+
+class SearchResult(tuple):
+    """`(hits, not_ready)` as `search` returns it, plus `unknown`: the requested doc_ids that were
+    never enqueued, in the order given."""
+
+    unknown: list[str]
+
+    def __new__(cls, hits: list[Hit], not_ready: list[DocStatus], unknown: Sequence[str] = ()) -> Self:
+        result = super().__new__(cls, (hits, not_ready))
+        result.unknown = list(unknown)
+        return result
+
+    @property
+    def hits(self) -> list[Hit]:
+        return self[0]
+
+    @property
+    def not_ready(self) -> list[DocStatus]:
+        return self[1]
 
 
 # --- pure helpers ---------------------------------------------------------------------------------
@@ -255,13 +303,23 @@ def _default_doc_id(filing: FilingRef) -> str:
     return filing.doc_id or f"sec-{filing.cik}-{filing.accession}"
 
 
+def _fingerprint(version: str, title: str, pieces: Sequence[tuple[str | None, Chunk]]) -> str:
+    """SHA-256 of a document's cut: chunker version, title, and every chunk's section, text, context."""
+    digest = hashlib.sha256()
+    for part in (version, title):
+        digest.update(json.dumps(part).encode() + b"\n")
+    for section, chunk in pieces:
+        digest.update(json.dumps([section, chunk.text, chunk.context], ensure_ascii=False).encode() + b"\n")
+    return digest.hexdigest()
+
+
 _SCHEMA = (
     (
         "CREATE TABLE IF NOT EXISTS documents ("
         " collection TEXT NOT NULL, doc_id TEXT NOT NULL, cik TEXT NOT NULL, form TEXT NOT NULL,"
         " accession TEXT NOT NULL, filed TEXT, report_date TEXT, url TEXT NOT NULL, title TEXT NOT NULL,"
         " state TEXT NOT NULL, chunks_done INTEGER NOT NULL DEFAULT 0, chunks_total INTEGER, error TEXT,"
-        " updated_at TEXT NOT NULL, PRIMARY KEY (collection, doc_id))"
+        " updated_at TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY (collection, doc_id))"
     ),
     (
         "CREATE TABLE IF NOT EXISTS chunks ("
@@ -325,11 +383,12 @@ class FilingsIndexer:
         self._model_lock = threading.Lock()
         self._embedder: Embedder | None = None
         self._tokenizer: Any = None
+        self._download_reported = False
         self._index: LocalIndex | None = None
         self._db: sqlite3.Connection | None = None
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._workers: list[threading.Thread] = []
-        self._refs: dict[str, tuple[FilingRef, str]] = {}
+        self._refs: dict[str, FilingRef] = {}
         self._active: set[str] = set()
         self._stop = threading.Event()
         self._closed = False
@@ -338,12 +397,13 @@ class FilingsIndexer:
 
     @property
     def root(self) -> Path:
-        """The folder holding `models/` and `index/` (a temporary one with MOF_CACHE=off)."""
+        """The folder holding `index/` (a temporary one with MOF_CACHE=off)."""
         with self._lock:
             if self._root is None:
                 if self._settings.cache == "off":
                     tmp = tempfile.TemporaryDirectory(prefix="myopenfund-mcp-filings-")
                     atexit.register(tmp.cleanup)
+                    atexit.register(self.close)  # atexit runs last-registered first: close, then remove
                     self._root = Path(tmp.name)
                 else:
                     self._root = Path(self._settings.cache_path())
@@ -351,7 +411,8 @@ class FilingsIndexer:
 
     @property
     def models_dir(self) -> Path:
-        return self.root / "models"
+        """`<cache_path()>/models`, whatever MOF_CACHE says (R36: the model is software, not data)."""
+        return Path(self._settings.cache_path()) / "models"
 
     @property
     def index_dir(self) -> Path:
@@ -375,6 +436,7 @@ class FilingsIndexer:
                     "process (another MCP server or `warm` on the same MOF_CACHE_DIR); stop it, or give "
                     "this one another MOF_CACHE_DIR"
                 ) from exc
+            db = None
             try:
                 db = sqlite3.connect(
                     self.root / "index" / "status.sqlite3", check_same_thread=False, isolation_level=None
@@ -382,13 +444,30 @@ class FilingsIndexer:
                 db.execute("PRAGMA journal_mode=WAL")
                 for statement in _SCHEMA:
                     db.execute(statement)
-                # We hold the index lock: no other process is indexing. What was in flight is partial.
+                columns = {row[1] for row in db.execute("PRAGMA table_info(documents)")}
+                if "fingerprint" not in columns:  # a status file of an earlier build
+                    db.execute("ALTER TABLE documents ADD COLUMN fingerprint TEXT")
+                # We hold the index lock: no other process is indexing. What was in flight is partial,
+                # and so is a ready document whose chunks are not all in the index.
                 db.execute(
                     f"UPDATE documents SET state = 'partial', updated_at = ? WHERE collection = ? "
                     f"AND state IN ({', '.join('?' * len(_IN_FLIGHT))})",
                     (_now(), self.collection, *_IN_FLIGHT),
                 )
+                ready = db.execute(
+                    "SELECT doc_id, chunks_total FROM documents WHERE collection = ? AND state = 'ready'",
+                    (self.collection,),
+                ).fetchall()
+                for doc_id, total in ready:
+                    if index.count(doc_id) != total:
+                        db.execute(
+                            "UPDATE documents SET state = 'partial', updated_at = ? WHERE collection = ? "
+                            "AND doc_id = ?",
+                            (_now(), self.collection, doc_id),
+                        )
             except Exception:
+                if db is not None:
+                    db.close()
                 index.close()
                 raise
             self._index, self._db = index, db
@@ -405,7 +484,11 @@ class FilingsIndexer:
     # --- the model -----------------------------------------------------------------------------
 
     def _model(self) -> tuple[Embedder, Any]:
-        """The embedder and the tokenizer, loaded on first use (one load for every thread)."""
+        """The embedder and the tokenizer, loaded on first use (one load for every thread). Once
+        loaded, no lock is taken: a search never waits for a worker here."""
+        embedder = self._embedder
+        if embedder is not None:
+            return embedder, self._tokenizer
         with self._model_lock:
             if self._embedder is None:
                 models = str(self.models_dir)
@@ -426,52 +509,92 @@ class FilingsIndexer:
                     raise ValueError(
                         f"the embedder gives {embedder.dim}-dimensional vectors, the index expects {self._spec.dim}"
                     )
-                self._embedder, self._tokenizer = embedder, tokenizer
+                self._tokenizer = tokenizer  # before the embedder: the fast path reads the embedder first
+                self._embedder = embedder
             return self._embedder, self._tokenizer
 
     def _model_download_needed(self) -> bool:
-        if self._embedder is not None or self._embedder_factory is not None:
-            return False
-        return not model_files_cached(self.models_dir, self._spec.name)
+        """True once per process: on the first call made while the model is not loaded and its files
+        are not in `models/` (the default factory only)."""
+        with self._lock:
+            if self._download_reported or self._embedder is not None or self._embedder_factory is not None:
+                return False
+            self._download_reported = True
+            return not model_files_cached(self.models_dir, self._spec.name)
 
     # --- the status database -------------------------------------------------------------------
 
-    def _rows(self, doc_ids: Collection[str] | None) -> list[tuple]:
-        assert self._db is not None
+    def _conn(self) -> sqlite3.Connection:
+        """The status database; call with `self._lock` held. Closed -> IndexUnavailable."""
+        if self._db is None:
+            raise IndexUnavailable("the filings index is closed")
+        return self._db
+
+    def _query(self, sql: str, params: Sequence[Any] = ()) -> list[tuple]:
         with self._lock:
-            if doc_ids is None:
-                return self._db.execute(
-                    f"SELECT {_COLUMNS} FROM documents WHERE collection = ? ORDER BY filed DESC, doc_id",
-                    (self.collection,),
-                ).fetchall()
-            return self._db.execute(
-                f"SELECT {_COLUMNS} FROM documents WHERE collection = ? AND doc_id IN "
-                "(SELECT value FROM json_each(?)) ORDER BY filed DESC, doc_id",
-                (self.collection, json.dumps(list(doc_ids))),
-            ).fetchall()
+            return self._conn().execute(sql, params).fetchall()
+
+    def _rows(self, doc_ids: Collection[str] | None) -> list[tuple]:
+        if doc_ids is None:
+            return self._query(
+                f"SELECT {_COLUMNS} FROM documents WHERE collection = ? ORDER BY filed DESC, doc_id",
+                (self.collection,),
+            )
+        return self._query(
+            f"SELECT {_COLUMNS} FROM documents WHERE collection = ? AND doc_id IN "
+            "(SELECT value FROM json_each(?)) ORDER BY filed DESC, doc_id",
+            (self.collection, json.dumps(list(doc_ids))),
+        )
 
     def _get(self, doc_id: str) -> DocStatus | None:
         rows = self._rows([doc_id])
         return _status(rows[0]) if rows else None
 
     def _update(self, doc_id: str, **values: Any) -> None:
-        assert self._db is not None
         values["updated_at"] = _now()
         assignments = ", ".join(f"{name} = ?" for name in values)
-        with self._lock:
-            self._db.execute(
-                f"UPDATE documents SET {assignments} WHERE collection = ? AND doc_id = ?",
-                (*values.values(), self.collection, doc_id),
-            )
+        self._query(
+            f"UPDATE documents SET {assignments} WHERE collection = ? AND doc_id = ?",
+            (*values.values(), self.collection, doc_id),
+        )
 
     def _done(self, doc_id: str) -> set[int]:
-        assert self._db is not None
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT chunk_number FROM chunks WHERE collection = ? AND doc_id = ?",
-                (self.collection, doc_id),
-            ).fetchall()
+        rows = self._query(
+            "SELECT chunk_number FROM chunks WHERE collection = ? AND doc_id = ?", (self.collection, doc_id)
+        )
         return {int(row[0]) for row in rows}
+
+    def _record_batch(
+        self,
+        doc_id: str,
+        batch: Sequence[int],
+        sections: Sequence[str | None],
+        chunks: Sequence[Chunk],
+        done: int,
+    ) -> None:
+        """The chunks of a batch just added to the index, and the new count, in one transaction."""
+        with self._lock:
+            db = self._conn()
+            with db:  # rolled back if a write fails
+                db.execute("BEGIN")
+                db.executemany(
+                    "INSERT OR REPLACE INTO chunks (collection, doc_id, chunk_number, section, text, context)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (self.collection, doc_id, number, sections[number], chunk.text, chunk.context)
+                        for number, chunk in zip(batch, chunks)
+                    ],
+                )
+                db.execute(
+                    "UPDATE documents SET chunks_done = ?, updated_at = ? WHERE collection = ? AND doc_id = ?",
+                    (done, _now(), self.collection, doc_id),
+                )
+
+    def _unknown(self, doc_ids: Collection[str] | None, rows: Sequence[tuple]) -> list[str]:
+        if doc_ids is None:
+            return []
+        known = {row[0] for row in rows}
+        return [doc_id for doc_id in dict.fromkeys(doc_ids) if doc_id not in known]
 
     # --- public API ----------------------------------------------------------------------------
 
@@ -479,7 +602,8 @@ class FilingsIndexer:
         """Queue `refs` for indexing and return their statuses at once. A `ready` document stays
         ready; one already queued or being indexed by this process is left as it is; a `partial` or
         `failed` one is queued again (a partial one resumes). `names` maps a CIK to the company name
-        used in the chunks' `title` (default `CIK <cik>`)."""
+        used in the chunks' `title` (default `CIK <cik>`); a document with stored chunks keeps the
+        title it was first indexed with."""
         self._open()
         result = EnqueueResult()
         result.model_download = self._model_download_needed()
@@ -494,14 +618,14 @@ class FilingsIndexer:
                 if current is not None and (current.state == "ready" or doc_id in self._active):
                     result.append(current)
                     continue
-                assert self._db is not None
-                self._db.execute(
+                self._conn().execute(
                     "INSERT INTO documents (collection, doc_id, cik, form, accession, filed, report_date, url,"
                     " title, state, chunks_done, chunks_total, error, updated_at)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, ?)"
                     " ON CONFLICT (collection, doc_id) DO UPDATE SET cik = excluded.cik, form = excluded.form,"
                     " accession = excluded.accession, filed = excluded.filed,"
-                    " report_date = excluded.report_date, url = excluded.url, title = excluded.title,"
+                    " report_date = excluded.report_date, url = excluded.url,"
+                    " title = CASE WHEN documents.chunks_done > 0 THEN documents.title ELSE excluded.title END,"
                     " state = 'queued', error = NULL, updated_at = excluded.updated_at",
                     (
                         self.collection,
@@ -516,7 +640,7 @@ class FilingsIndexer:
                         _now(),
                     ),
                 )
-                self._refs[doc_id] = (filing, title)
+                self._refs[doc_id] = filing
                 self._active.add(doc_id)
                 self._queue.put(doc_id)
                 status = self._get(doc_id)
@@ -524,11 +648,12 @@ class FilingsIndexer:
                 result.append(status)
         return result
 
-    def status(self, doc_ids: Collection[str] | None = None) -> list[DocStatus]:
-        """The statuses of `doc_ids` (every known document when None), newest filing first; a
-        document never enqueued is left out."""
+    def status(self, doc_ids: Collection[str] | None = None) -> StatusResult:
+        """The statuses of `doc_ids` (every known document when None), newest filing first; the
+        requested documents never enqueued are listed in `.unknown`."""
         self._open()
-        return [_status(row) for row in self._rows(doc_ids)]
+        rows = self._rows(doc_ids)
+        return StatusResult((_status(row) for row in rows), self._unknown(doc_ids, rows))
 
     def search(
         self,
@@ -539,17 +664,19 @@ class FilingsIndexer:
         period_from: dt.date | None = None,
         period_to: dt.date | None = None,
         limit: int = 10,
-    ) -> tuple[list[Hit], list[DocStatus]]:
+    ) -> Self:
         """Hybrid search (dense + BM25, RRF; eigenmind selection when MOF_SEARCH_EIGENMIND) over the
-        chunks indexed so far of the requested documents, and the statuses of those not `ready`.
+        chunks indexed so far of the requested documents: `(hits, not_ready)`, the statuses of the
+        requested documents that are not `ready`, and `.unknown`, those never enqueued.
 
         Documents: `doc_ids` (every known document when None), restricted to `forms` (a form
         includes its `/A` amendments) and to a report period overlapping `period_from`..`period_to`
         (the report date, or the filing date when the filing has none), as `companies_filings`."""
         self._open()
         wanted = None if forms is None else {f.upper() for f in forms} | {f"{f.upper()}/A" for f in forms}
+        all_rows = self._rows(doc_ids)
         rows = []
-        for row in self._rows(doc_ids):
+        for row in all_rows:
             period = row[10] or row[4]
             day = dt.date.fromisoformat(period) if period else None
             if wanted is not None and row[2].upper() not in wanted:
@@ -559,23 +686,32 @@ class FilingsIndexer:
             if period_from and day < period_from or period_to and day > period_to:
                 continue
             rows.append(_status(row))
+        unknown = self._unknown(doc_ids, all_rows)
         not_ready = [status for status in rows if status.state != "ready"]
         searchable = [status.doc_id for status in rows if status.chunks_done > 0]
         if not searchable:
-            return [], not_ready
+            return SearchResult([], not_ready, unknown)
         embedder, _ = self._model()
-        assert self._index is not None
-        hits = hybrid_search(
-            query,
-            index=self._index,
-            embedder=embedder,
-            filters=SearchFilters(doc_ids=searchable),
-            limit=limit,
-            candidates=self._settings.search_candidates,
-            rrf_k=self._settings.search_rrf_k,
-            selector=select_diverse if self._settings.search_eigenmind else None,
-        )
-        return hits, not_ready
+        with self._lock:
+            index = self._index
+            if index is None or self._closed:
+                raise IndexUnavailable("the filings index is closed")
+        try:
+            hits = hybrid_search(
+                query,
+                index=index,
+                embedder=embedder,
+                filters=SearchFilters(doc_ids=searchable),
+                limit=limit,
+                candidates=self._settings.search_candidates,
+                rrf_k=self._settings.search_rrf_k,
+                selector=select_diverse if self._settings.search_eigenmind else None,
+            )
+        except Exception:
+            if self._closed:  # the index was closed under the search
+                raise IndexUnavailable("the filings index is closed") from None
+            raise
+        return SearchResult(hits, not_ready, unknown)
 
     def read(
         self,
@@ -583,82 +719,144 @@ class FilingsIndexer:
         *,
         section: str | None = None,
         chunk_id: str | int | None = None,
-        around: int = 1,
+        around: int | None = 1,
+        offset: int = 0,
     ) -> dict[str, Any]:
-        """The stored chunks of `doc_id`, in order, as a result whose JSON stays within
-        MOF_MCP_MAX_RESULT_CHARS: from the start of `section` to its end, or `around` chunks on each
-        side of `chunk_id`, or from the first chunk. `more`/`next_chunk_id` give where to go on
-        (`read(doc_id, chunk_id=next_chunk_id, around=0)` then reads on from there)."""
-        if section is not None and chunk_id is not None:
-            raise ValueError("give section or chunk_id, not both")
-        if type(around) is not int or around < 0:
-            raise ValueError(f"around must be an integer >= 0, got {around!r}")
-        self._open()
-        status = self._get(doc_id)
-        if status is None:
-            raise DocumentNotFetched(f"document {doc_id!r} was never fetched")
-        assert self._db is not None
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT chunk_number, section, text FROM chunks WHERE collection = ? AND doc_id = ?"
-                " ORDER BY chunk_number",
-                (self.collection, doc_id),
-            ).fetchall()
-        start, stop = 0, len(rows)
-        if section is not None:
-            numbers = [i for i, row in enumerate(rows) if row[1] == section]
-            if not numbers:
-                available = list(dict.fromkeys(row[1] for row in rows if row[1] is not None))
-                raise SectionNotFound(
-                    f"document {doc_id!r} has no stored chunk in section {section!r}; sections: "
-                    f"{', '.join(available) or 'none yet'}"
-                )
-            start = numbers[0]
-            stop = start
-            while stop < len(rows) and rows[stop][1] == section:
-                stop += 1
-        elif chunk_id is not None:
+        """The stored chunks of `doc_id`, in order, as a result whose JSON (counted as the tools count
+        it) stays within MOF_MCP_MAX_RESULT_CHARS. What is read:
+
+        - `section`: that section, from its start (or from `chunk_id` when given) to its end;
+        - `chunk_id` with `around` an integer: `around` stored chunks on each side of it;
+        - `chunk_id` with `around=None`: from it to the end of the document;
+        - neither: the document from its first chunk.
+        `offset` (with `chunk_id`, outside the window mode) skips that many characters of the first
+        chunk's text (the remainder of a chunk cut by the budget). The result's `more` says whether
+        the read stopped before the end of what was asked; `next_chunk_id` / `next_offset` then give
+        where to go on: `read(doc_id, section=<same>, chunk_id=next_chunk_id, offset=next_offset,
+        around=None)`. A chunk larger than what is left of the budget when it comes first is cut
+        (`text_cut: true`) and its remainder comes next."""
+        if type(offset) is not int or offset < 0:
+            raise ValueError(f"offset must be an integer >= 0, got {offset!r}")
+        if around is not None and (type(around) is not int or around < 0):
+            raise ValueError(f"around must be None or an integer >= 0, got {around!r}")
+        number: int | None = None
+        if chunk_id is not None:
             try:
                 number = int(chunk_id)
             except (TypeError, ValueError):
                 raise ValueError(f"chunk_id must be a chunk number, got {chunk_id!r}") from None
-            positions = [i for i, row in enumerate(rows) if row[0] == number]
-            if not positions:
-                raise LookupError(f"document {doc_id!r} has no stored chunk {chunk_id!r}")
-            start, stop = max(0, positions[0] - around), min(len(rows), positions[0] + around + 1)
+        window = number is not None and section is None and around is not None
+        if offset and (number is None or window):
+            raise ValueError("offset needs chunk_id and a forward read (section, or around=None)")
+        self._open()
+        status = self._get(doc_id)
+        if status is None:
+            raise DocumentNotFetched(f"document {doc_id!r} was never fetched")
+        select = "SELECT chunk_number, section, text FROM chunks WHERE collection = ? AND doc_id = ?"
+        key = (self.collection, doc_id)
         result: dict[str, Any] = {
             **status.to_dict(),
             "section": section,
             "chunks": [],
             "more": False,
             "next_chunk_id": None,
+            "next_offset": 0,
         }
-        budget = self._settings.max_result_chars
-        size = len(json.dumps(result))
-        for i in range(start, stop):
-            number, name, text = rows[i]
-            entry = {"chunk_id": str(number), "section": name, "text": text}
-            cost = len(json.dumps(entry)) + 2  # ", " between list items
-            if size + cost > budget:
-                if not result["chunks"]:
-                    # One chunk larger than the whole budget: its text is cut, and said so.
-                    room = max(
-                        0, budget - size - len(json.dumps({**entry, "text": "", "text_cut": True})) - 2
+        with self._lock:
+            db = self._conn()
+            if section is not None:
+                found = db.execute(select + " AND section = ? LIMIT 1", (*key, section)).fetchall()
+                if not found:
+                    available = [
+                        row[0]
+                        for row in db.execute(
+                            "SELECT section FROM chunks WHERE collection = ? AND doc_id = ? AND section IS NOT NULL"
+                            " GROUP BY section ORDER BY min(chunk_number)",
+                            key,
+                        )
+                    ]
+                    raise SectionNotFound(
+                        f"document {doc_id!r} has no stored chunk in section {section!r}; sections: "
+                        f"{', '.join(available) or 'none yet'}"
                     )
-                    entry = {**entry, "text": text[:room], "text_cut": True}
-                    while len(json.dumps(entry)) + 2 + size > budget and entry["text"]:
-                        entry["text"] = entry["text"][:-1]
-                    result["chunks"].append(entry)
-                    i += 1
-                result["more"] = i < len(rows)
-                result["next_chunk_id"] = str(rows[i][0]) if i < len(rows) else None
-                break
-            result["chunks"].append(entry)
-            size += cost
+            if number is not None:
+                anchor = db.execute(select + " AND chunk_number = ?", (*key, number)).fetchall()
+                if not anchor or (section is not None and anchor[0][1] != section):
+                    raise LookupError(
+                        f"document {doc_id!r} has no stored chunk {number}"
+                        + (f" in section {section!r}" if section is not None else "")
+                    )
+                if offset >= len(anchor[0][2]):
+                    raise ValueError(f"offset {offset} is past the end of chunk {number}")
+            if window:
+                assert number is not None and around is not None
+                before = db.execute(
+                    select + " AND chunk_number < ? ORDER BY chunk_number DESC LIMIT ?",
+                    (*key, number, around),
+                ).fetchall()
+                after = db.execute(
+                    select + " AND chunk_number >= ? ORDER BY chunk_number LIMIT ?",
+                    (*key, number, around + 1),
+                ).fetchall()
+                rows: Iterable[tuple] = [*reversed(before), *after]
+            elif section is not None:
+                rows = db.execute(
+                    select + " AND section = ? AND chunk_number >= ? ORDER BY chunk_number",
+                    (*key, section, -1 if number is None else number),
+                )
+            else:
+                rows = db.execute(
+                    select + " AND chunk_number >= ? ORDER BY chunk_number",
+                    (*key, -1 if number is None else number),
+                )
+            self._fill(result, rows, offset)
         return result
 
+    def _fill(self, result: dict[str, Any], rows: Iterable[tuple], offset: int) -> None:
+        """Append chunks of `rows` to `result` while its size (as the tools count it) stays within the
+        budget; set `more` / `next_chunk_id` / `next_offset` to the first text not returned."""
+        budget = self._settings.max_result_chars
+        chunks: list[dict[str, Any]] = result["chunks"]
+        size = result_chars(result)
+        first = True
+        for number, name, text in rows:
+            skip, first = (offset if first else 0), False
+            entry: dict[str, Any] = {"chunk_id": str(number), "section": name, "text": text[skip:]}
+            if skip:
+                entry["offset"] = skip
+            cost = result_chars(entry) + (1 if chunks else 0)  # the comma between list items
+            if size + cost <= budget:
+                chunks.append(entry)
+                size += cost
+                continue
+            result.update(more=True, next_chunk_id=str(number), next_offset=skip)
+            if not chunks:
+                # This chunk alone is over the budget: its text is cut, the remainder comes next.
+                whole = entry["text"]
+
+                def fits(
+                    length: int, entry: dict[str, Any] = entry, whole: str = whole, skip: int = skip
+                ) -> bool:
+                    piece = {**entry, "text": whole[:length], "text_cut": True}
+                    return result_chars({**result, "chunks": [piece], "next_offset": skip + length}) <= budget
+
+                low, high = 0, len(whole)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    low, high = (middle, high) if fits(middle) else (low, middle - 1)
+                if low == 0:
+                    raise ValueError(f"MOF_MCP_MAX_RESULT_CHARS ({budget}) leaves no room for any chunk text")
+                chunks.append({**entry, "text": whole[:low], "text_cut": True})
+                result["next_offset"] = skip + low
+            break
+        # `more` and `next_*` changed size: give back trailing chunks until the result fits.
+        while result_chars(result) > budget and len(chunks) > 1:
+            last = chunks.pop()
+            result.update(more=True, next_chunk_id=last["chunk_id"], next_offset=last.get("offset", 0))
+
     def close(self) -> None:
-        """Stop the workers after their current step and release the index. Twice is harmless."""
+        """Stop the workers after their current step (at most MOF_INDEX_CLOSE_TIMEOUT_S) and release
+        the index. Twice is harmless."""
         with self._lock:
             if self._closed:
                 return
@@ -667,14 +865,24 @@ class FilingsIndexer:
             workers = list(self._workers)
         for _ in workers:
             self._queue.put(None)
+        deadline = time.monotonic() + self._settings.index_close_timeout_s
         for worker in workers:
-            worker.join()
+            worker.join(max(0.0, deadline - time.monotonic()))
+        busy = sum(worker.is_alive() for worker in workers)
+        if busy:
+            log.warning(
+                "%d filings indexing worker(s) still busy after MOF_INDEX_CLOSE_TIMEOUT_S: the index is "
+                "released, their documents are resumed next time",
+                busy,
+            )
         with self._lock:
-            if self._index is not None:
-                self._index.close()
-            if self._db is not None:
-                self._db.close()
-        if self._embedder is not None:
+            index, db = self._index, self._db
+            self._index, self._db = None, None
+            if index is not None:
+                index.close()
+            if db is not None:
+                db.close()
+        if self._embedder is not None and not busy:
             self._embedder.release()
 
     # --- the worker ----------------------------------------------------------------------------
@@ -684,38 +892,61 @@ class FilingsIndexer:
             doc_id = self._queue.get()
             if doc_id is None or self._stop.is_set():
                 return
+            final: tuple[str, str | None] | None = None
             try:
                 self._index_one(doc_id)
+                final = ("ready", None)
+            except _Stopped:
+                pass  # left as it is: partial for the next process
             except Exception as exc:  # noqa: BLE001 - one document fails, the worker goes on
+                # Type names only: a message, or its chained context, may hold the SEC contact.
                 log.warning("filing %s failed: %s", doc_id, type(exc).__name__)
+                final = ("failed", _short_error(exc, self._settings.sec_contact))
+            # The final state and leaving the in-flight set together: enqueue sees both or neither.
+            with self._lock:
                 try:
-                    self._update(doc_id, state="failed", error=_short_error(exc, self._settings.sec_contact))
-                except Exception:  # the database may be closing with the process
-                    log.exception("could not record the failure of filing %s", doc_id)
-            finally:
-                with self._lock:
+                    if final is not None:
+                        self._update(doc_id, state=final[0], error=final[1])
+                except Exception as exc:  # noqa: BLE001 - the index may be closing
+                    log.warning("could not record the state of filing %s: %s", doc_id, type(exc).__name__)
+                finally:
                     self._active.discard(doc_id)
 
+    def _check_stop(self) -> None:
+        if self._stop.is_set():
+            raise _Stopped
+
     def _index_one(self, doc_id: str) -> None:
-        filing, title = self._refs[doc_id]
-        index = self._index
-        assert index is not None
+        filing = self._refs[doc_id]
         self._update(doc_id, state="fetching", error=None)
+        self._check_stop()
         embedder, tokenizer = self._model()
+        self._check_stop()
         document = self._loader(filing, self._sec)
+        self._check_stop()
+        stored = self._query(
+            "SELECT title, fingerprint FROM documents WHERE collection = ? AND doc_id = ?",
+            (self.collection, doc_id),
+        )
+        title, fingerprint = stored[0]
         pieces = document_chunks(document, options=self.options, tokenizer=tokenizer, title=title)
-        current = self._get(doc_id)
+        if not pieces:
+            raise ValueError("no text to index in the primary document")
+        self._check_stop()
+        cut = _fingerprint(self.chunker_version, title, pieces)
+        with self._lock:
+            index = self._index
+            if index is None:
+                raise IndexUnavailable("the filings index is closed")
         done = self._done(doc_id)
-        if current is not None and current.chunks_total is not None and current.chunks_total != len(pieces):
-            # Another cut than the one stored: start this document again.
+        if fingerprint != cut and (done or fingerprint is not None) or index.count(doc_id) != len(done):
+            # Another cut than the stored one, or chunks in the index without their record: again.
             index.delete(doc_id)
-            assert self._db is not None
-            with self._lock:
-                self._db.execute(
-                    "DELETE FROM chunks WHERE collection = ? AND doc_id = ?", (self.collection, doc_id)
-                )
+            self._query("DELETE FROM chunks WHERE collection = ? AND doc_id = ?", (self.collection, doc_id))
             done = set()
-        self._update(doc_id, state="indexing", chunks_total=len(pieces), chunks_done=len(done))
+        self._update(
+            doc_id, state="indexing", chunks_total=len(pieces), chunks_done=len(done), fingerprint=cut
+        )
         sections = [name for name, _ in pieces]
         size = getattr(embedder, "batch_size", ONNX_BATCH_SIZE)
         base = {
@@ -728,25 +959,12 @@ class FilingsIndexer:
             "url": filing.url,
         }
         for batch in _batches(sections, done, set(priority_sections(filing.form)), size):
-            if self._stop.is_set():
-                return  # left `indexing`: the next process shows it `partial`
+            self._check_stop()
+            section = sections[batch[0]]
+            if any(sections[number] != section for number in batch):  # one payload per batch
+                raise RuntimeError("a batch spans two sections")
             chunks = [pieces[number][1] for number in batch]
             vectors = embedder.encode_passage([chunk.embedded_text for chunk in chunks])
-            index.add(doc_id, chunks, vectors, {**base, "section": sections[batch[0]]}, first_index=batch[0])
-            assert self._db is not None
-            with self._lock, self._db:  # one transaction: rolled back if a write fails
-                self._db.execute("BEGIN")
-                self._db.executemany(
-                    "INSERT OR REPLACE INTO chunks (collection, doc_id, chunk_number, section, text, context)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    [
-                        (self.collection, doc_id, number, sections[number], chunk.text, chunk.context)
-                        for number, chunk in zip(batch, chunks)
-                    ],
-                )
-                self._db.execute(
-                    "UPDATE documents SET chunks_done = ?, updated_at = ? WHERE collection = ? AND doc_id = ?",
-                    (len(done | set(batch)), _now(), self.collection, doc_id),
-                )
+            index.add(doc_id, chunks, vectors, {**base, "section": section}, first_index=batch[0])
+            self._record_batch(doc_id, batch, sections, chunks, len(done) + len(batch))
             done.update(batch)
-        self._update(doc_id, state="ready", error=None)

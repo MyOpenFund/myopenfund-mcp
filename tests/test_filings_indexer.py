@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
+import logging
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from myopenfund_mcp.filings.indexer import (
     document_chunks,
     model_files_cached,
 )
+from myopenfund_mcp.paging import result_chars
 
 MARKDOWN = (Path(__file__).parent / "fixtures" / "filings" / "example_10k.md").read_text(encoding="utf-8")
 CIK = "0000789019"
@@ -260,34 +262,94 @@ def test_second_indexer_on_the_same_cache_is_unavailable(tmp_path):
     second.close()
 
 
-def test_read_section_is_bounded_and_starts_at_the_section(tmp_path):
-    embedder = GatedEmbedder(batch_size=4)
-    indexer = make(tmp_path, embedder, max_result_chars=1_000)
+def walk(indexer: FilingsIndexer, doc_id: str, section: str | None = None) -> list[dict]:
+    """Every page of a read, following `next_chunk_id` / `next_offset`."""
+    pages = [indexer.read(doc_id, section=section)]
+    while pages[-1]["more"]:
+        last = pages[-1]
+        pages.append(
+            indexer.read(
+                doc_id,
+                section=section,
+                chunk_id=last["next_chunk_id"],
+                offset=last["next_offset"],
+                around=None,
+            )
+        )
+        assert len(pages) < 500
+    return pages
+
+
+def rebuilt(pages: list[dict]) -> list[tuple[str, str]]:
+    """(chunk_id, whole text) in order, joining the pieces of cut chunks."""
+    out: list[tuple[str, str]] = []
+    for page in pages:
+        for piece in page["chunks"]:
+            if out and out[-1][0] == piece["chunk_id"]:
+                assert piece["offset"] == len(out[-1][1])
+                out[-1] = (piece["chunk_id"], out[-1][1] + piece["text"])
+            else:
+                assert "offset" not in piece
+                out.append((piece["chunk_id"], piece["text"]))
+    return out
+
+
+@pytest.mark.parametrize("max_tokens", [60, 400])
+def test_read_walks_a_section_and_the_document_within_the_budget(tmp_path, max_tokens):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=4), max_result_chars=1_000, chunk_max_tokens=max_tokens)
     doc_id = "sec-0000789019-24-000001"
+    expected = document_chunks(
+        load(ref(), None),
+        options=chunk_options(settings(tmp_path, chunk_max_tokens=max_tokens)),
+        tokenizer=WordTokenizer(),
+        title="MICROSOFT CORP 10-K 2024-07-30",
+    )
     try:
         indexer.enqueue([ref()], names={CIK: "MICROSOFT CORP"})
         wait_until(lambda: state_of(indexer, doc_id).state == "ready")
 
-        page = indexer.read(doc_id, section="Item 7")
-        assert len(json.dumps(page)) <= 1_000
-        assert page["chunks"][0]["text"].startswith("Revenue increased sixteen percent")
-        assert {chunk["section"] for chunk in page["chunks"]} == {"Item 7"}
-        assert page["more"] is True and page["next_chunk_id"] is not None
+        pages = walk(indexer, doc_id, "Item 7")
+        assert all(result_chars(page) <= 1_000 for page in pages)
+        assert pages[0]["chunks"][0]["text"].startswith("Revenue increased sixteen percent")
+        assert {chunk["section"] for page in pages for chunk in page["chunks"]} == {"Item 7"}
+        item7 = [(str(n), chunk.text) for n, (section, chunk) in enumerate(expected) if section == "Item 7"]
+        assert rebuilt(pages) == item7
+        assert pages[-1]["more"] is False and pages[-1]["next_chunk_id"] is None
 
-        following = indexer.read(doc_id, chunk_id=page["next_chunk_id"], around=0)
-        assert following["chunks"][0]["chunk_id"] == page["next_chunk_id"]
+        pages = walk(indexer, doc_id)
+        assert len(pages) > 1 and all(result_chars(page) <= 1_000 for page in pages)
+        assert rebuilt(pages) == [(str(n), chunk.text) for n, (_, chunk) in enumerate(expected)]
+        cut = any(piece.get("text_cut") for page in pages for piece in page["chunks"])
+        assert cut is (max_tokens == 400)  # 400-token chunks are longer than the 1000-character budget
+    finally:
+        indexer.close()
 
-        middle = int(page["chunks"][0]["chunk_id"]) + 1
-        around = indexer.read(doc_id, chunk_id=str(middle), around=1)
-        assert [c["chunk_id"] for c in around["chunks"]][:2] == [str(middle - 1), str(middle)]
-        assert len(json.dumps(around)) <= 1_000
 
+def test_read_window_and_errors(tmp_path):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=4))
+    doc_id = "sec-0000789019-24-000001"
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, doc_id).state == "ready")
+        around = indexer.read(doc_id, chunk_id="5", around=1)
+        assert [c["chunk_id"] for c in around["chunks"]] == ["4", "5", "6"]
+        assert around["more"] is False
+        assert [c["chunk_id"] for c in indexer.read(doc_id, chunk_id=0, around=2)["chunks"]] == [
+            "0",
+            "1",
+            "2",
+        ]
+        first7 = indexer.read(doc_id, section="Item 7")["chunks"][0]["chunk_id"]
+        with pytest.raises(LookupError, match="in section 'Item 7'"):
+            indexer.read(doc_id, section="Item 7", chunk_id=int(first7) - 1)
         with pytest.raises(SectionNotFound, match="Item 7"):
             indexer.read(doc_id, section="Item 99")
         with pytest.raises(DocumentNotFetched):
             indexer.read("sec-never-fetched")
-        with pytest.raises(ValueError):
-            indexer.read(doc_id, section="Item 7", chunk_id="1")
+        with pytest.raises(ValueError, match="offset"):
+            indexer.read(doc_id, chunk_id="5", offset=3)  # window mode
+        with pytest.raises(ValueError, match="past the end"):
+            indexer.read(doc_id, chunk_id="5", offset=10_000, around=None)
     finally:
         indexer.close()
 
@@ -401,8 +463,9 @@ def test_default_factory_reports_the_model_download_once(tmp_path, monkeypatch):
     monkeypatch.setattr(indexer_module, "load_tokenizer", fake_tokenizer)
     indexer = FilingsIndexer(settings(tmp_path, rag_onnx_threads=2), sec=object(), document_loader=load)
     try:
-        first = indexer.enqueue([ref()])
-        assert first.model_download is True  # nothing in <cache>/models yet
+        assert indexer.enqueue([]).model_download is True  # nothing in <cache>/models yet
+        assert indexer.enqueue([]).model_download is False  # reported once, before any load
+        indexer.enqueue([ref()])
         wait_until(lambda: state_of(indexer, ref().doc_id).state == "ready")
         assert indexer.enqueue([ref("0000789019-23-000001")]).model_download is False  # loaded now
         models = str(Path(tmp_path, "cache", "models"))
@@ -440,3 +503,251 @@ def test_closed_indexer_refuses_calls(tmp_path):
     indexer.close()  # twice is harmless
     with pytest.raises(IndexUnavailable, match="closed"):
         indexer.status()
+
+
+DOC = "sec-0000789019-24-000001"
+
+
+def stop_midway(tmp_path: Path, n7: int, *, names=None, loader=load, **overrides) -> None:
+    """Index the Item 7 batches, then close the indexer as a dying process would leave it."""
+    embedder = GatedEmbedder(allowed=-(-n7 // 2), batch_size=2)
+    indexer = make(tmp_path, embedder, loader=loader, **overrides)
+    indexer.enqueue([ref()], names=names)
+    wait_until(lambda: state_of(indexer, DOC).chunks_done == n7)
+    closer = threading.Thread(target=indexer.close)
+    closer.start()
+    wait_until(indexer._stop.is_set)
+    embedder.gate.set()
+    closer.join(30)
+    assert not closer.is_alive()
+
+
+def stored_count(indexer: FilingsIndexer, doc_id: str = DOC) -> int:
+    with LocalIndex(indexer.index_dir, collection=indexer.collection, dim=SPEC.dim) as index:
+        return index.count(doc_id)
+
+
+def test_resume_keeps_the_title_of_the_first_indexing(tmp_path, item7):
+    total, n7 = item7
+    stop_midway(tmp_path, n7, names={CIK: "MICROSOFT CORP"})
+    second = GatedEmbedder(batch_size=8)
+    b = make(tmp_path, second)
+    try:
+        b.enqueue([ref()], names={CIK: "Microsoft Corporation (renamed)"})
+        wait_until(lambda: state_of(b, DOC).state == "ready")
+        hits, _ = b.search("revenue cash debt risk", doc_ids=[DOC], limit=total)
+        assert len(hits) == total
+        assert {hit.payload["title"] for hit in hits} == {"MICROSOFT CORP 10-K 2024-07-30"}
+        assert len(second.passages) < total  # resumed, not recut
+    finally:
+        b.close()
+
+
+def test_resume_recuts_when_the_cut_changed(tmp_path, item7):
+    total, n7 = item7
+    stop_midway(tmp_path, n7)
+    changed = MARKDOWN.replace("Net income | 88,136", "Net income | 88,137")
+
+    def new_loader(filing, sec):
+        return FilingDocument(ref=filing, markdown=changed, sections=find_sections(changed, filing.form))
+
+    second = GatedEmbedder(batch_size=8)
+    b = make(tmp_path, second, loader=new_loader)
+    try:
+        b.enqueue([ref()])
+        wait_until(lambda: state_of(b, DOC).state == "ready")
+        assert len(second.passages) == total  # same count, another cut: indexed again from scratch
+        texts = [c["text"] for c in b.read(DOC, section="Item 8")["chunks"]]
+        assert any("88,137" in text for text in texts) and not any("88,136" in text for text in texts)
+    finally:
+        b.close()
+    assert stored_count(b) == total
+
+
+def test_crash_between_index_add_and_status_write_is_repaired(tmp_path, item7, monkeypatch):
+    total, _ = item7
+    embedder = GatedEmbedder(batch_size=2)
+    indexer = make(tmp_path, embedder)
+    real = indexer._record_batch
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 3:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "_record_batch", flaky)
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "failed")
+        monkeypatch.setattr(indexer, "_record_batch", real)
+        before = len(embedder.passages)
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "ready")
+        assert len(embedder.passages) - before == total  # the index held a batch without its record: redone
+        assert state_of(indexer, DOC).chunks_done == total
+    finally:
+        indexer.close()
+    assert stored_count(indexer) == total
+
+
+def test_ready_document_missing_from_the_index_is_partial_on_open(tmp_path):
+    a = make(tmp_path, GatedEmbedder(batch_size=8))
+    a.enqueue([ref()])
+    wait_until(lambda: state_of(a, DOC).state == "ready")
+    a.close()
+    with LocalIndex(a.index_dir, collection=a.collection, dim=SPEC.dim) as index:
+        index.delete(DOC)
+    b = make(tmp_path, GatedEmbedder(batch_size=8))
+    try:
+        assert state_of(b, DOC).state == "partial"
+        b.enqueue([ref()])
+        wait_until(lambda: state_of(b, DOC).state == "ready")
+        total_chunks = state_of(b, DOC).chunks_total
+    finally:
+        b.close()
+    assert stored_count(b) == total_chunks
+
+
+def test_several_workers_index_documents_in_parallel(tmp_path):
+    refs = [ref(f"0000789019-24-00000{n}") for n in range(1, 5)]
+    indexer = make(tmp_path, GatedEmbedder(batch_size=3), index_workers=3)
+    try:
+        indexer.enqueue(refs)
+        wait_until(lambda: [s.state for s in indexer.status()] == ["ready"] * 4)
+        assert len(indexer._workers) == 3
+        assert all(s.chunks_done == s.chunks_total for s in indexer.status())
+    finally:
+        indexer.close()
+    with LocalIndex(indexer.index_dir, collection=indexer.collection, dim=SPEC.dim) as index:
+        counts = {index.count(r.doc_id) for r in refs}
+    assert len(counts) == 1 and counts.pop() > 0
+
+
+def test_cache_off_keeps_the_model_in_the_persistent_cache(tmp_path):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=8), cache="off")
+    try:
+        assert indexer.models_dir == tmp_path / "cache" / "models"  # R36: software, not data
+        assert not str(indexer.root).startswith(str(tmp_path))
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "ready")
+        assert indexer.index_dir.is_relative_to(indexer.root)
+        assert not (tmp_path / "cache" / "index").exists()
+    finally:
+        indexer.close()
+
+
+def test_close_does_not_wait_past_its_timeout(tmp_path):
+    loading = threading.Event()
+    release = threading.Event()
+
+    def slow_model():  # a model download in progress
+        loading.set()
+        release.wait(30)
+        return GatedEmbedder()
+
+    indexer = FilingsIndexer(
+        settings(tmp_path, index_close_timeout_s=0),
+        sec=object(),
+        embedder_factory=slow_model,
+        tokenizer_factory=WordTokenizer,
+        document_loader=load,
+    )
+    try:
+        indexer.enqueue([ref()])
+        assert loading.wait(10)
+        started = time.monotonic()
+        indexer.close()
+        assert time.monotonic() - started < 2
+        with pytest.raises(IndexUnavailable):
+            indexer.status()
+    finally:
+        release.set()
+    for worker in indexer._workers:
+        worker.join(10)
+        assert not worker.is_alive()
+    b = make(tmp_path)
+    try:
+        assert state_of(b, DOC).state == "partial"  # the worker stopped after the model load
+    finally:
+        b.close()
+
+
+def test_search_does_not_wait_for_a_model_load_once_loaded(tmp_path):
+    embedder = GatedEmbedder(batch_size=8)
+    indexer = make(tmp_path, embedder)
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "ready")
+        with indexer._model_lock:  # a worker would hold it during a load
+            hits, _ = indexer.search("revenue", doc_ids=[DOC], limit=2)
+        assert len(hits) == 2
+    finally:
+        indexer.close()
+
+
+def test_empty_document_fails_with_no_text(tmp_path):
+    def empty(filing, sec):
+        return FilingDocument(ref=filing, markdown="", sections=())
+
+    indexer = make(tmp_path, loader=empty)
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "failed")
+        assert "no text" in state_of(indexer, DOC).error
+    finally:
+        indexer.close()
+
+
+def test_unknown_doc_ids_are_reported(tmp_path):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=8))
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "ready")
+        found = indexer.status(["sec-nope", DOC])
+        assert [s.doc_id for s in found] == [DOC] and found.unknown == ["sec-nope"]
+        result = indexer.search("revenue", doc_ids=[DOC, "sec-nope"], limit=2)
+        hits, not_ready = result
+        assert len(hits) == 2 and not_ready == [] and result.unknown == ["sec-nope"]
+        assert indexer.search("revenue", doc_ids=["sec-nope"], limit=2).unknown == ["sec-nope"]
+    finally:
+        indexer.close()
+
+
+def test_the_sec_contact_never_reaches_the_log(tmp_path, monkeypatch, caplog):
+    def loader(filing, sec):
+        try:
+            raise OSError(f"connection refused for User-Agent {CONTACT}")
+        except OSError as exc:
+            raise RuntimeError("download failed") from exc
+
+    indexer = FilingsIndexer(
+        settings(tmp_path, sec_contact=CONTACT),
+        sec=object(),
+        embedder_factory=lambda: GatedEmbedder(),
+        tokenizer_factory=WordTokenizer,
+        document_loader=loader,
+    )
+    real_update = indexer._update
+    failures = []
+
+    def update(doc_id, **values):
+        if values.get("state") == "failed":
+            failures.append(1)
+            try:
+                raise ValueError(f"cannot write for {CONTACT}")
+            except ValueError as exc:
+                raise sqlite3.OperationalError("database is locked") from exc
+        return real_update(doc_id, **values)
+
+    monkeypatch.setattr(indexer, "_update", update)
+    caplog.set_level(logging.DEBUG, logger="myopenfund_mcp")
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: failures and DOC not in indexer._active)
+        assert "RuntimeError" in caplog.text and "OperationalError" in caplog.text
+        assert CONTACT not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+    finally:
+        indexer.close()
