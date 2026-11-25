@@ -178,7 +178,11 @@ class FakeLive(_Recording):
         self._enter("filings", cik)
         wanted = {f.upper() for f in forms} if forms is not None else None
         return [
-            r for r in self.refs.get(cik, []) if wanted is None or r.form.upper().removesuffix("/A") in wanted
+            r
+            for r in self.refs.get(cik, [])
+            if (wanted is None or r.form.upper() in wanted or r.form.upper().removesuffix("/A") in wanted)
+            and (period_from is None or (getattr(r, "report_date", None) or dt.date.min) >= period_from)
+            and (period_to is None or (getattr(r, "report_date", None) or dt.date.max) <= period_to)
         ]
 
     def latest_filing(self, cik, *, forms=None):

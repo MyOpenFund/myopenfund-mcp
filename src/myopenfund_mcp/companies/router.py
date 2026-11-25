@@ -71,6 +71,8 @@ STORE, LIVE = "store", "sec_live"
 NOT_IN_STORE, STORE_BEHIND, STORE_NO_POSITIONS = "not_in_store", "store_behind", "store_no_positions"
 STORE_UNAVAILABLE, NO_STORE = "store_unavailable", "no_store"
 FRESHNESS_UNCHECKED = "freshness_unchecked"
+#: the store holds the company but publishes no ``filings`` dataset: its filings are read from SEC
+STORE_NO_FILINGS = "store_no_filings"
 #: the caller's mistakes, never a store failure: they propagate, no fallback
 _ARGUMENT_ERRORS = (StoreBadArgument, StoreUnknownDataset)
 #: the live source's methods that take a per-call wait (``budget_s``)
@@ -207,6 +209,10 @@ class SourceRouter:
         with self._lock:
             self._state = state
         return state
+
+    def filings_published(self) -> bool:
+        """Whether the store publishes the ``filings`` dataset (as of its current publication)."""
+        return self.store is not None and self._store_state().filings_published
 
     def _executor(self) -> ThreadPoolExecutor:
         with self._lock:

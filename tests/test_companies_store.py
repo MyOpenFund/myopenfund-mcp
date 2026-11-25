@@ -746,3 +746,27 @@ def test_q4_rules_match_company_corpus():
 
     from myopenfund_mcp.config import Q4_RULES
     assert Q4_RULES == CORPUS_Q4_RULES
+
+
+def test_filings_collected_known_at_falls_back_to_the_end_of_the_filing_day_in_new_york(tmp_path):
+    import datetime as dt
+    from unittest import mock
+
+    from companies_fixture import AAPL, seed
+
+    from myopenfund_mcp.companies.store import CompaniesStore
+
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    row = {"filing_ref": "0000320193-25-000001", "form": "10-K/A", "report_date": None,
+           "valid_date": dt.date(2025, 1, 15), "known_at": dt.datetime(2025, 3, 1, tzinfo=dt.UTC),
+           "known_at_kind": "collected", "source_doc_id": None}
+    try:
+        with mock.patch.object(s, "read", return_value=[row]):
+            [ref] = s.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
+            assert s.filings(AAPL, forms=["10-K"], period_from=dt.date(2020, 1, 1), period_to=None) == []
+    finally:
+        s.close()
+    assert ref.accepted == dt.datetime(2025, 1, 16, 4, 59, 59, tzinfo=dt.UTC)
+    assert ref.url == "https://www.sec.gov/Archives/edgar/data/320193/000032019325000001"
+    assert ref.doc_id

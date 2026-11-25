@@ -43,7 +43,7 @@ from .common import (
     store_call,
     time_budget,
 )
-from .router import LIVE, STORE, STORE_UNAVAILABLE, Route, SourceRouter
+from .router import LIVE, STORE, STORE_NO_FILINGS, STORE_UNAVAILABLE, Route, SourceRouter
 
 Frequency = Literal["annual", "semiannual", "quarterly", "instant"]
 #: as filed in the store; ytd9 = the 9-month year-to-date, which only derives an unreported Q4
@@ -396,5 +396,62 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                            "returned": len(chunk), "total": len(rows), "next_cursor": nxt,
                            "rows": rows_to_utc(chunk)}, settings,
                           hint="ask for fewer concepts or metrics, a frequency or a period range")
+
+    @co.tool(auth=read, annotations=READ_ONLY)
+    async def filings(
+        companies: Annotated[list[CompanyId], Field(description=COMPANIES_DESCRIPTION, min_length=1)],
+        forms: Annotated[list[str] | None, Field(
+            description="Forms, e.g. ['10-K', '10-Q', '8-K']; a base form includes its amendments "
+                        "('10-K' also returns '10-K/A'); omitted = all")] = None,
+        period_from: Annotated[dt.date | None, Field(
+            description="Report period end on or after, YYYY-MM-DD")] = None,
+        period_to: Annotated[dt.date | None, Field(
+            description="Report period end on or before, YYYY-MM-DD")] = None,
+        limit: Annotated[int | None, Field(description="Rows per page; omitted = server default")] = None,
+        cursor: Annotated[str | None, Field(description="next_cursor of the previous page, unchanged",
+                                            max_length=MAX_CURSOR_CHARS)] = None,
+    ) -> dict:
+        """Filings of companies with the exact time each became public on EDGAR. `accepted_utc` is
+        when the filing became public on EDGAR: the event date for share-price studies. Forms like
+        "10-K" include amendments ("10-K/A"). Call companies_resolve first if you only have a name.
+        Rows: newest `accepted_utc` first across the companies; `report_date` is the period the
+        filing reports on, `filed` the filing date; `url` is the filing's EDGAR folder and `doc_id` its
+        document id; datetimes are UTC; `source` says where a company's rows come from (store or
+        sec_live), `reason` why SEC answered when the store could have. `[warming]` = still fetching
+        from SEC: call again."""
+        page, offset = check(companies, period_from, period_to, limit, cursor)
+        wanted = [f.strip().upper() for f in forms] if forms is not None else None
+        if wanted is not None and (not wanted or not all(wanted)):
+            raise tool_error(INVALID_ARGUMENT, "forms must name at least one form, e.g. ['10-K']")
+        when = dt.datetime.now(dt.UTC)
+
+        async def one(h, routes, budget):
+            route = routes[h["cik"]]
+            if route.source == STORE and not await call(router.filings_published):
+                if router.mode == "store":  # no live source to ask: the store has no filings
+                    return route, []
+                route = Route(LIVE, STORE_NO_FILINGS)
+                budget.go_live()
+            return await on_live(h, route, budget, "filings", cik=h["cik"], forms=wanted,
+                                 period_from=period_from, period_to=period_to)
+
+        with time_budget(settings, budget_s) as scope:
+            budget = _Budget(settings, scope, live_enabled=router.live_enabled)
+            hits = await lookup(companies)
+            routes = await plan(hits, when, budget)
+            found = await _per_company(hits, lambda h: one(h, routes, budget))
+        rows = []
+        for h, (route, refs) in zip(hits, found, strict=True):
+            for r in refs:
+                rows.append({"cik": h["cik"], "name": h["current_name"], "form": r.form,
+                             "accession": r.accession, "report_date": r.report_date, "filed": r.filed,
+                             "accepted_utc": r.accepted, "url": r.url, "doc_id": r.doc_id,
+                             **_origin(route)})
+        rows.sort(key=lambda r: (r["accepted_utc"] is None, -(r["accepted_utc"].timestamp()
+                                 if r["accepted_utc"] else 0), r["cik"], r["accession"]))
+        chunk, nxt = page_of(rows, page, offset)
+        return cap_result({"returned": len(chunk), "total": len(rows), "next_cursor": nxt,
+                           "rows": rows_to_utc(chunk)}, settings,
+                          hint="filter forms or a period range, or ask for a smaller limit")
 
     return co

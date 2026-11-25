@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 import re
 import threading
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 from functools import cache
 from pathlib import Path
@@ -422,6 +422,47 @@ class CompaniesStore:
             return [{"filing_ref": r["filing_ref"], "known_at": r["known_at_max"]} for r in t.to_pylist()]
 
         return self._run(go)
+
+    def filings(self, cik: str, *, forms=None, period_from: date | None = None,
+                period_to: date | None = None) -> list:
+        """The issuer's filings in the ``filings`` dataset as company-corpus ``FilingRef`` (the live source's
+        shape), newest accepted first, as known now. ``accepted`` is ``known_at`` when it is the
+        publication time (``published``), else 23:59:59 New York of the filing date (the market-data
+        fallback). ``forms`` and the ``report_date`` window follow ``list_filings`` (a ``/A`` form matches
+        its base form; a filing without a report date is excluded when a bound is set); ``url`` and
+        ``doc_id`` are built as company-corpus builds them. ``[]`` while the dataset is not published."""
+        from collections import Counter
+        from zoneinfo import ZoneInfo
+
+        from company_corpus.live.filings import ARCHIVES, FilingRef, cik_to_path_int, source_doc_id
+
+        rows = self.read("filings", as_of=datetime.now(UTC), limit=None, columns=None,
+                         filters={"entity_scheme": ["cik"], "entity_value": [cik]})
+        wanted = {f.upper() for f in forms} if forms is not None else None
+        refs, seen = [], set()
+        for r in rows:
+            accn, form = r["filing_ref"], r["form"]
+            if accn in seen:
+                continue
+            upper = form.upper()
+            if wanted is not None and upper not in wanted and upper.removesuffix("/A") not in wanted:
+                continue
+            report = r["report_date"]
+            if (period_from or period_to) and report is None:
+                continue
+            if (period_from and report < period_from) or (period_to and report > period_to):
+                continue
+            seen.add(accn)
+            filed, known = r["valid_date"], r["known_at"]
+            accepted = (known.astimezone(UTC) if r["known_at_kind"] == "published" else
+                        datetime.combine(filed, time(23, 59, 59), ZoneInfo("America/New_York")).astimezone(UTC))
+            refs.append(FilingRef(
+                cik=cik, accession=accn, form=form, report_date=report, filed=filed, accepted=accepted,
+                primary_document=None,
+                url=ARCHIVES.format(cik_int=cik_to_path_int(cik), acc_nodash=accn.replace("-", "")),
+                doc_id=r["source_doc_id"] or source_doc_id(cik, form, accn, frozenset(), Counter())))
+        refs.sort(key=lambda f: (f.accepted, f.accession), reverse=True)
+        return refs
 
     def summaries(self, cik: str, name: str, rows: list[dict], vintages: list[dict] | None) -> list:
         """company-corpus period summaries (values, ratios, TTM) of ``concept_rows``' output.

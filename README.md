@@ -677,6 +677,7 @@ them `0700` for its own uid). Configuration:
 | `companies_resolve` | Find companies by name (former names too), ticker, CIK or entity id; returns candidates. |
 | `companies_facts` | Raw reported facts of up to `MOF_COMPANIES_MAX_COMPANIES` companies, as filed, with filing reference and provenance. |
 | `companies_fundamentals` | Standardised concepts and ratios per company and period, with their provenance. |
+| `companies_filings` | A company's filings (`forms`, report-period window) with `accepted_utc`, the time each became public on EDGAR: the event date for share-price studies. From the store's `filings` dataset, else SEC. |
 | `datasets_list` | The datasets the store publishes: name, version, kind, licence, row estimate. |
 | `datasets_describe` | Columns (type, allowed values, doc), natural key and licence of one dataset. |
 | `datasets_read_asof` | Rows of a dataset as known at `as_of`, with structured filters (no free SQL), paged with `next_cursor`. |

@@ -838,3 +838,133 @@ async def test_a_slow_failing_sec_leaves_store_companies_answered_unchecked():
                                  companies_query_timeout_s=1, sec_call_budget_s=1)
         assert {(r["cik"], r["source"], r["reason"]) for r in res["rows"]} == {
             (c, "store", "freshness_unchecked") for c in (APPLE, MSFT, JPM)}
+
+
+# --- filings ------------------------------------------------------------------------------------
+
+def _filing(cik, accn, form, report, filed, accepted):
+    from company_corpus.live.filings import FilingRef
+
+    return FilingRef(cik=cik, accession=accn, form=form, report_date=report, filed=filed, accepted=accepted,
+                     primary_document=None, url=f"https://www.sec.gov/Archives/edgar/data/789019/{accn}",
+                     doc_id=f"doc-{accn}")
+
+
+def _msft_refs():
+    import datetime as dt
+
+    from source_fakes import MSFT
+
+    ny = dt.timezone(dt.timedelta(hours=-4))
+    d = dt.date
+    return {MSFT: [
+        _filing(MSFT, "m-10q-24", "10-Q", d(2024, 9, 30), d(2024, 10, 30), dt.datetime(2024, 10, 30, 16, 5, tzinfo=ny)),
+        _filing(MSFT, "m-10k-24a", "10-K/A", d(2024, 6, 30), d(2024, 8, 15), dt.datetime(2024, 8, 15, 9, 0, tzinfo=ny)),
+        _filing(MSFT, "m-10k-24", "10-K", d(2024, 6, 30), d(2024, 7, 30), dt.datetime(2024, 7, 30, 16, 6, tzinfo=ny)),
+        _filing(MSFT, "m-10k-23", "10-K", d(2023, 6, 30), d(2023, 7, 27), dt.datetime(2023, 7, 27, 16, 0, tzinfo=ny)),
+        _filing(MSFT, "m-10k-22", "10-K", d(2022, 6, 30), d(2022, 7, 28), dt.datetime(2022, 7, 28, 16, 0, tzinfo=ny)),
+        _filing(MSFT, "m-10k-21", "10-K", d(2021, 6, 30), d(2021, 7, 29), dt.datetime(2021, 7, 29, 16, 0, tzinfo=ny)),
+    ]}
+
+
+async def test_filings_microsoft_10k_from_2022_with_amendment_in_utc():
+    from source_fakes import MSFT, FakeLive, FakeStore
+
+    res = await _routed_call(FakeStore(), FakeLive(refs=_msft_refs()), "companies_filings",
+                             {"companies": ["MSFT"], "forms": ["10-K"], "period_from": "2022-01-01"})
+    assert res["total"] == res["returned"] == 4
+    assert [r["accession"] for r in res["rows"]] == ["m-10k-24a", "m-10k-24", "m-10k-23", "m-10k-22"]
+    assert [r["form"] for r in res["rows"]] == ["10-K/A", "10-K", "10-K", "10-K"]  # amendments included
+    first = res["rows"][0]
+    assert first["accepted_utc"] == "2024-08-15T13:00:00+00:00"
+    assert set(first) == {"cik", "name", "form", "accession", "report_date", "filed", "accepted_utc", "url",
+                          "doc_id", "source", "reason"}
+    assert (first["cik"], first["name"], first["report_date"], first["filed"]) == (
+        MSFT, "MICROSOFT CORP", "2024-06-30", "2024-08-15")
+    assert (first["source"], first["reason"]) == ("sec_live", "not_in_store")
+    assert all(r["accepted_utc"].endswith("+00:00") for r in res["rows"])
+
+
+async def test_filings_cursor_pagination():
+    from source_fakes import FakeLive, FakeStore
+
+    store, live = FakeStore(), FakeLive(refs=_msft_refs())
+    async with _routed(store, live) as c:
+        one = (await c.call_tool("companies_filings", {"companies": ["MSFT"], "limit": 4})).data
+        two = (await c.call_tool("companies_filings", {"companies": ["MSFT"], "limit": 4,
+                                                       "cursor": one["next_cursor"]})).data
+    assert one["returned"] == 4 and one["next_cursor"] and one["total"] == 6
+    assert two["returned"] == 2 and two["next_cursor"] is None
+    assert [r["accession"] for r in one["rows"] + two["rows"]] == [
+        "m-10q-24", "m-10k-24a", "m-10k-24", "m-10k-23", "m-10k-22", "m-10k-21"]
+
+
+async def test_filings_period_window_follows_report_date():
+    from source_fakes import FakeLive, FakeStore
+
+    res = await _routed_call(FakeStore(), FakeLive(refs=_msft_refs()), "companies_filings",
+                             {"companies": ["MSFT"], "forms": ["10-K"], "period_from": "2022-01-01",
+                              "period_to": "2023-12-31"})
+    assert [r["accession"] for r in res["rows"]] == ["m-10k-23", "m-10k-22"]
+
+
+async def test_filings_arguments_are_checked_before_any_source():
+    from source_fakes import FakeLive, FakeStore
+
+    store, live = FakeStore(), FakeLive(refs=_msft_refs())
+    for args, code in (({"companies": ["MSFT"], "period_from": "2024-01-01", "period_to": "2023-01-01"},
+                        "invalid_argument"),
+                       ({"companies": ["MSFT"], "forms": [" "]}, "invalid_argument"),
+                       ({"companies": ["MSFT"], "cursor": "garbage"}, "invalid_argument"),
+                       ({"companies": ["MSFT"] * 1000}, "too_many_companies")):
+        msg = await _routed_error(store, live, "companies_filings", args, companies_max_companies=5)
+        assert msg.startswith(f"[{code}]"), msg
+    assert store.calls == [] and live.calls == []
+
+
+async def test_filings_unknown_company_is_coded():
+    from source_fakes import FakeLive, FakeStore
+
+    msg = await _routed_error(FakeStore(), FakeLive(), "companies_filings", {"companies": ["ZZZZ"]})
+    assert msg.startswith("[unknown_company]")
+
+
+async def test_filings_from_the_real_store_route_store_with_utc_acceptance(tmp_path):
+    from companies_fixture import AAPL_8K_2025, AAPL_10K_2024
+
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    try:
+        res = await _call(s, "companies_filings", {"companies": ["AAPL"]})
+        k = await _call(s, "companies_filings", {"companies": ["AAPL"], "forms": ["10-K"],
+                                                  "period_to": "2024-12-31"})
+    finally:
+        s.close()
+    assert [r["accession"] for r in res["rows"]] == [AAPL_8K_2025, AAPL_10K_2025, AAPL_10K_2024]
+    top = res["rows"][0]
+    assert top["accepted_utc"] == "2025-11-03T21:00:00+00:00" and top["filed"] == "2025-11-03"
+    assert top["source"] == "store"
+    assert top["url"] == "https://www.sec.gov/Archives/edgar/data/320193/000032019325000090"
+    assert top["doc_id"] and top["name"] == "Apple Inc."
+    assert [r["accession"] for r in k["rows"]] == [AAPL_10K_2024]
+
+
+async def test_filings_store_without_filings_dataset_is_read_live():
+    from source_fakes import APPLE, FakeLive, FakeStore
+
+    live = FakeLive(refs={APPLE: [_filing(APPLE, "a-1", "10-K", None, None, None)]})
+    res = await _routed_call(FakeStore(filings=None), live, "companies_filings", {"companies": [APPLE]},
+                             companies_source="auto")
+    row = res["rows"][0]
+    assert (row["source"], row["accession"], row["accepted_utc"]) == ("sec_live", "a-1", None)
+    assert row["reason"] in ("store_no_filings", "store_behind")
+
+
+async def test_filings_description_states_the_event_date():
+    from source_fakes import FakeLive, FakeStore
+
+    async with _routed(FakeStore(), FakeLive()) as c:
+        tool = {t.name: t for t in await c.list_tools()}["companies_filings"]
+    for text in ("accepted_utc", "became public on EDGAR", "event date for share-price studies",
+                 '"10-K/A"', "companies_resolve"):
+        assert text in tool.description
