@@ -1,31 +1,53 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "myopenfund-mcp"
-version = "0.1.0"
-description = "One MCP server over the MyOpenFund bricks: official documents and pipeline health today, RAG and company data next."
+dynamic = ["version"]
+description = "One MCP server over the MyOpenFund bricks: official documents, pipeline health, RAG search and company data."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [{ name = "Marc Jeulin" }]
+maintainers = [{ name = "Marc Jeulin" }]
+keywords = ["myopenfund", "mcp", "model-context-protocol", "rag", "open-data", "filings"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Intended Audience :: Developers",
+]
 dependencies = ["fastmcp>=4.1.4,<5"]
 
+# The MyOpenFund siblings come from PyPI, each capped below the next breaking 0.x.
 [project.optional-dependencies]
-vault = ["vault-query @ git+https://github.com/MyOpenFund/vault@d3c44970a0827b2563073a1dc0a82093a63ac496#subdirectory=query"]
+vault = ["myopenfund-vault-query>=0.1.0,<0.2"]
 companies = [
-  "open-data-store[reader] @ git+https://github.com/MyOpenFund/open-data-store@7a86987908c177a3f38e285b828cc03ed40f6f8b",
-  "company-corpus @ git+https://github.com/MyOpenFund/company-corpus@c46db1de920ef58543c6a0f98663539989539ba8",
+  "myopenfund-open-data-store[reader]>=0.1.0,<0.2",
+  "myopenfund-company-corpus>=0.1.0,<0.2",
 ]
 # [onnx]: queries are embedded on the ONNX runtime (CPU), without PyTorch.
-rag = ["rag-engine[onnx] @ git+https://github.com/MyOpenFund/rag-engine@6be21ac393d82d7c5c1a058dcad8204ae15c7289"]
-dev = ["pytest>=8.3", "ruff>=0.6"]
+rag = ["myopenfund-rag-engine[onnx]>=0.1.0,<0.2"]
+dev = ["pytest>=8.3", "ruff>=0.6", "pyyaml>=6"]
+
+[project.urls]
+Homepage = "https://github.com/MyOpenFund/myopenfund-mcp"
+Source = "https://github.com/MyOpenFund/myopenfund-mcp"
+Issues = "https://github.com/MyOpenFund/myopenfund-mcp/issues"
+Organization = "https://github.com/MyOpenFund"
 
 [project.scripts]
 myopenfund-mcp = "myopenfund_mcp.cli:main"
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.hatch.version]
+path = "src/myopenfund_mcp/__init__.py"
+
+# The sdist carries the sources and the tests, not the repository's CI or local MCP client files.
+[tool.hatch.build.targets.sdist]
+exclude = ["/.github", "/.mcp.json"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/myopenfund_mcp"]

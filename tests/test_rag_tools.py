@@ -3,7 +3,6 @@ FakeEmbedder (no model), and a monkeypatched `search` where an outage is needed.
 import asyncio
 import json
 import logging
-import re
 import socket
 import sys
 import threading
@@ -2178,12 +2177,15 @@ def test_the_readme_documents_the_codes_every_reason_and_every_argument():
         assert needle in readme, needle
 
 
-def test_the_readme_pins_rag_engine_to_the_commit_the_server_is_built_on():
+def test_the_readme_names_the_rag_engine_range_the_server_is_built_on():
+    import tomllib
+
     root = Path(__file__).resolve().parent.parent
-    pins = re.findall(r"MyOpenFund/rag-engine@([0-9a-f]{40})", (root / "pyproject.toml").read_text())
-    assert len(pins) == 1
+    extra = tomllib.loads((root / "pyproject.toml").read_text())["project"]["optional-dependencies"]["rag"]
+    (spec,) = [d.split("[")[0] + d.split("]")[1] for d in extra if d.startswith("myopenfund-rag-engine[")]
     readme = (root / "README.md").read_text()
-    assert re.findall(r"MyOpenFund/rag-engine(?:@([0-9a-f]+))?[\"`'\s]", readme) == pins  # one install line, pinned
+    assert readme.count('pip install "myopenfund-rag-engine') == 1  # one install line, the same range
+    assert f'pip install "{spec}"' in readme
 
 
 def test_the_fill_command_says_when_it_is_done_in_the_readme_and_in_the_compose_example():

@@ -3,6 +3,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly: the MyOpenFund siblings resolve from PyPI within their ranges, so a sibling release that
+    # breaks this suite or the extras' smoke install shows up here without waiting for a push.
+    - cron: "41 5 * * 1"
 permissions:
   contents: read
 env:
@@ -40,6 +44,35 @@ jobs:
             build-constraints.txt
       - run: pip install -c constraints.txt --build-constraint build-constraints.txt -e ".[vault,companies,rag,dev]"
       - run: python scripts/check_constraints.py
-      # Reads the git dependencies' build requirements from raw.githubusercontent.com at their pinned commits.
       - run: python scripts/check_constraints.py --build
       - run: python -m pytest -q
+  # The same build, `twine check` and smoke install as release.yml, without the tag check and without
+  # publishing.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Build and check the distribution
+        run: |
+          pip install build==1.6.1 twine==7.0.0
+          python -m build . --outdir dist
+          twine check --strict dist/*
+      - name: Smoke install in a fresh venv
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install "$(ls "$PWD"/dist/*.whl)[vault,companies,rag]"
+          cd "$RUNNER_TEMP"
+          export ORT_DISABLE_TELEMETRY=1
+          "$RUNNER_TEMP/smoke/bin/python" -c "import myopenfund_mcp; print(myopenfund_mcp.__file__)"
+          "$RUNNER_TEMP/smoke/bin/myopenfund-mcp" --help > /dev/null
+          expected="$("$RUNNER_TEMP/smoke/bin/python" -c "import importlib.metadata as m; print(m.version('myopenfund-mcp'))")"
+          shown="$("$RUNNER_TEMP/smoke/bin/python" -c "import myopenfund_mcp; print(myopenfund_mcp.__version__)")"
+          if [ "$shown" != "$expected" ]; then
+            echo "myopenfund_mcp.__version__ is '$shown' but the wheel is $expected"
+            exit 1
+          fi
