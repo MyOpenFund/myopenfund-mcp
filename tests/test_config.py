@@ -292,6 +292,8 @@ def test_no_vault_defaults():
     assert s.cache_dir is None and s.cache_path().endswith("myopenfund-mcp")
     assert (s.cache_ttl_submissions_h, s.cache_ttl_companyfacts_h) == (24, 24)
     assert (s.filings_max_docs, s.index_workers, s.rag_onnx_provider) == (40, 1, "cpu")
+    assert (s.filings_search_default_limit, s.filings_search_max_limit) == (8, 20)
+    assert (s.filings_search_max_docs, s.filings_not_ready_listed) == (40, 10)
     assert (s.search_rrf_k, s.search_candidates, s.search_eigenmind) == (60, 50, False)
     assert s.filings_default_forms == ("10-K",)
     assert (s.chunk_max_tokens, s.chunk_overlap_tokens) == (480, 32)
@@ -360,6 +362,9 @@ def test_contact_is_never_shown_or_echoed():
         {"MOF_CACHE_TTL_COMPANYFACTS_H": "0"}, {"MOF_CACHE_TTL_COMPANYFACTS_H": "8761"},
         {"MOF_CACHE_TTL_SUBMISSIONS_H": "8761"}, {"MOF_FILINGS_MAX_DOCS": "1001"}, {"MOF_INDEX_WORKERS": "33"}, {"MOF_INDEX_CLOSE_TIMEOUT_S": "3601"},
         {"MOF_SEARCH_RRF_K": "1001"}, {"MOF_SEARCH_CANDIDATES": "1001"}, {"MOF_CHUNK_MAX_TOKENS": "8193"},
+        {"MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "0"}, {"MOF_FILINGS_SEARCH_MAX_LIMIT": "1001"},
+        {"MOF_FILINGS_SEARCH_MAX_DOCS": "0"}, {"MOF_FILINGS_NOT_READY_LISTED": "1001"},
+        {"MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "21"},
     ],
 )
 def test_bad_no_vault_values_are_refused(env):

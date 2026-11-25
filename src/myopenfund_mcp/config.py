@@ -280,6 +280,14 @@ class Settings:
     cache_ttl_submissions_h: int = 24  # MOF_CACHE_TTL_SUBMISSIONS_H: hours a filing list is reused
     cache_ttl_companyfacts_h: int = 24  # MOF_CACHE_TTL_COMPANYFACTS_H: hours a company-facts file is reused
     filings_max_docs: int = 40  # MOF_FILINGS_MAX_DOCS: filings downloaded and indexed by one call
+    # MOF_FILINGS_SEARCH_DEFAULT_LIMIT: passages companies_search_filings returns when the caller gives no limit
+    filings_search_default_limit: int = 8
+    # MOF_FILINGS_SEARCH_MAX_LIMIT: largest limit a caller may ask companies_search_filings for
+    filings_search_max_limit: int = 20
+    # MOF_FILINGS_SEARCH_MAX_DOCS: fetched filings a search without `companies` may cover (more: pass companies)
+    filings_search_max_docs: int = 40
+    # MOF_FILINGS_NOT_READY_LISTED: not-yet-ready documents listed in a search result (the rest are counted)
+    filings_not_ready_listed: int = 10
     index_workers: int = 1  # MOF_INDEX_WORKERS: filings indexed in parallel
     # MOF_INDEX_CLOSE_TIMEOUT_S: seconds closing the filings indexer waits for its workers' current step
     # (a batch, a fetch, a model load); past it the index is released and the workers die with the process
@@ -364,6 +372,10 @@ class Settings:
             cache_ttl_submissions_h=_int(env, "MOF_CACHE_TTL_SUBMISSIONS_H", 24, maximum=8760),
             cache_ttl_companyfacts_h=_int(env, "MOF_CACHE_TTL_COMPANYFACTS_H", 24, maximum=8760),
             filings_max_docs=_int(env, "MOF_FILINGS_MAX_DOCS", 40, maximum=1000),
+            filings_search_default_limit=_int(env, "MOF_FILINGS_SEARCH_DEFAULT_LIMIT", 8, maximum=1000),
+            filings_search_max_limit=_int(env, "MOF_FILINGS_SEARCH_MAX_LIMIT", 20, maximum=1000),
+            filings_search_max_docs=_int(env, "MOF_FILINGS_SEARCH_MAX_DOCS", 40, maximum=10000),
+            filings_not_ready_listed=_int(env, "MOF_FILINGS_NOT_READY_LISTED", 10, minimum=0, maximum=1000),
             index_workers=_int(env, "MOF_INDEX_WORKERS", 1, maximum=32),
             index_close_timeout_s=_int(env, "MOF_INDEX_CLOSE_TIMEOUT_S", 10, minimum=0, maximum=3600),
             rag_onnx_provider=_get(env, "MOF_RAG_ONNX_PROVIDER") or "cpu",
@@ -440,6 +452,11 @@ class Settings:
             raise ConfigError(
                 f"MOF_RAG_DEFAULT_LIMIT ({settings.rag_default_limit}) must not exceed "
                 f"MOF_RAG_MAX_LIMIT ({settings.rag_max_limit})"
+            )
+        if settings.filings_search_default_limit > settings.filings_search_max_limit:
+            raise ConfigError(
+                f"MOF_FILINGS_SEARCH_DEFAULT_LIMIT ({settings.filings_search_default_limit}) must not exceed "
+                f"MOF_FILINGS_SEARCH_MAX_LIMIT ({settings.filings_search_max_limit})"
             )
         if not settings.path.startswith("/"):
             raise ConfigError(f"MOF_MCP_PATH must start with '/', got {settings.path!r}")

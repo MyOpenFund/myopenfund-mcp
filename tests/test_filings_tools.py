@@ -113,8 +113,9 @@ class FakeIndexer:
     model_name = "nomic-ai/nomic-embed-text-v1.5"
     chunker_version = "v2-t480-o32"
 
-    def __init__(self, docs=(), *, hits=(), download=False, fail=None, read_result=None):
+    def __init__(self, docs=(), *, hits=(), download=False, fail=None, read_result=None, companies=None):
         self.docs = {d.doc_id: d for d in docs}
+        self.companies = dict(companies or {})  # cik -> (name, tickers), as recorded at enqueue
         self.hits = list(hits)
         self.download = download
         self.fail = dict(fail or {})
@@ -129,14 +130,28 @@ class FakeIndexer:
             raise self.fail[method]
         self.opened = True
 
-    def enqueue(self, refs, *, names=None):
-        self._enter("enqueue", refs=list(refs), names=names)
+    def enqueue(self, refs, *, names=None, tickers=None):
+        self._enter("enqueue", refs=list(refs), names=names, tickers=tickers)
+        for r in refs:
+            self.companies[r.cik] = ((names or {}).get(r.cik), list((tickers or {}).get(r.cik) or []))
         out = EnqueueResult()
         for r in refs:
             self.docs.setdefault(r.doc_id, status(r))
             out.append(self.docs[r.doc_id])
         out.model_download = self.download
         return out
+
+    def fetched_companies(self):
+        self._enter("fetched_companies")
+        ciks = sorted({d.cik for d in self.docs.values()})
+        return [
+            {
+                "cik": c,
+                "name": self.companies.get(c, (None, []))[0],
+                "tickers": self.companies.get(c, (None, []))[1],
+            }
+            for c in ciks
+        ]
 
     def status(self, doc_ids=None):
         self._enter("status", doc_ids=doc_ids)
@@ -425,6 +440,20 @@ async def test_search_before_anything_is_indexed_gives_progress():
     assert "queued 1" in msg and "indexing 1 (0/40 passages)" in msg
 
 
+@pytest.mark.parametrize("states", [("partial", "partial"), ("failed", "failed"), ("partial", "failed")])
+async def test_index_not_ready_without_work_in_flight_says_fetch_again(states):
+    indexer = FakeIndexer([status(MSFT_K24, states[0], 0, 40), status(MSFT_K23, states[1])])
+    msg = await _error(indexer, "companies_search_filings", {"query": "capex"})
+    assert msg.startswith("[index_not_ready]") and "call again in a minute" not in msg
+    assert "call companies_fetch_filings again" in msg and "partial" in msg and "failed" in msg
+
+
+async def test_index_not_ready_with_work_in_flight_says_call_again_and_names_the_rest():
+    indexer = FakeIndexer([status(MSFT_K24, "queued"), status(MSFT_K23, "failed")])
+    msg = await _error(indexer, "companies_search_filings", {"query": "capex"})
+    assert "call again in a minute" in msg and "call companies_fetch_filings again" in msg
+
+
 async def test_search_hits_carry_the_citation_fields_and_the_progress():
     indexer = FakeIndexer(
         [
@@ -468,16 +497,23 @@ async def test_search_without_companies_passes_every_fetched_doc_id():
     assert res["indexed"] == "2/2" and res["hits"][0]["company"] == "Apple Inc."  # from the chunk title
 
 
-async def test_search_limit_uses_the_row_settings():
+async def test_search_limit_uses_its_own_settings():
     indexer = FakeIndexer([status(MSFT_K24, "ready", 5, 5)])
-    await _call(indexer, "companies_search_filings", {"query": "capex"}, default_rows=7)
-    assert [kw["limit"] for m, kw in indexer.calls if m == "search"] == [7]
+    await _call(indexer, "companies_search_filings", {"query": "capex"})
+    await _call(indexer, "companies_search_filings", {"query": "capex"}, filings_search_default_limit=3)
+    assert [kw["limit"] for m, kw in indexer.calls if m == "search"] == [8, 3]
     msg = await _error(
         FakeIndexer([status(MSFT_K24, "ready", 5, 5)]),
         "companies_search_filings",
-        {"query": "capex", "limit": 201},
+        {"query": "capex", "limit": 21},
     )
-    assert msg.startswith("[invalid_argument]") and "200" in msg
+    assert msg.startswith("[limit_exceeded]") and "MOF_FILINGS_SEARCH_MAX_LIMIT" in msg and "20" in msg
+    msg = await _error(
+        FakeIndexer([status(MSFT_K24, "ready", 5, 5)]),
+        "companies_search_filings",
+        {"query": "capex", "limit": 0},
+    )
+    assert msg.startswith("[invalid_argument]")
 
 
 async def test_a_ready_scope_without_hits_is_an_empty_answer():
@@ -698,3 +734,188 @@ async def test_end_to_end_on_the_real_indexer(tmp_path):
             assert info["chunker_version"] == "v2-t60-o8" and info["model"] == indexer.model_name
     finally:
         indexer.close()
+
+
+# --- fix round 1 -------------------------------------------------------------------------------------
+
+
+async def test_search_by_fetched_cik_name_or_ticker_works_with_sec_down():
+    from company_corpus.live.sec import SecUnavailable
+
+    live = FakeLive(fail={"entities": SecUnavailable("down")})
+    docs = [status(MSFT_K24, "ready", 5, 5), status(APPLE_K24, "ready", 3, 3)]
+    companies = {MSFT: ("MICROSOFT CORP", ["MSFT"]), APPLE: ("Apple Inc.", ["AAPL"])}
+    for query in ("789019", MSFT, "msft", "microsoft"):
+        indexer = FakeIndexer(docs, hits=[hit(MSFT_K24, 0), hit(APPLE_K24, 1)], companies=companies)
+        res = await _call(
+            indexer, "companies_search_filings", {"query": "capex", "companies": [query]}, live=live
+        )
+        assert [h["cik"] for h in res["hits"]] == [MSFT], query
+        (search,) = [kw for m, kw in indexer.calls if m == "search"]
+        assert search["doc_ids"] == [MSFT_K24.doc_id]
+    assert "entities" not in live.calls  # never asked SEC
+    # a CIK never fetched: [not_fetched], still without SEC
+    msg = await _error(
+        FakeIndexer(docs, companies=companies),
+        "companies_search_filings",
+        {"query": "capex", "companies": ["0000019617"]},
+        live=live,
+    )
+    assert msg.startswith("[not_fetched]")
+    # a name not fetched falls back to SEC, whose failure is coded
+    msg = await _error(
+        FakeIndexer(docs, companies=companies),
+        "companies_search_filings",
+        {"query": "capex", "companies": ["JPMORGAN"]},
+        live=live,
+    )
+    assert msg.startswith("[sec_unavailable]")
+
+
+async def test_fetch_records_names_and_tickers_for_local_resolution():
+    indexer = FakeIndexer()
+    async with Client(_server(indexer)) as c:
+        await c.call_tool("companies_fetch_filings", {"companies": ["MSFT"]})
+        indexer.docs = {k: status(MSFT_K24, "ready", 1, 1) for k in [MSFT_K24.doc_id]}
+        indexer.hits = [hit(MSFT_K24, 0)]
+        (enq,) = [kw for m, kw in indexer.calls if m == "enqueue"]
+        assert enq["tickers"] == {MSFT: ["MSFT"]} and enq["names"] == {MSFT: "MICROSOFT CORP"}
+        res = (await c.call_tool("companies_search_filings", {"query": "capex", "companies": ["MSFT"]})).data
+    assert res["returned"] == 1
+
+
+async def test_ambiguous_among_fetched_companies():
+    docs = [status(MSFT_K24, "ready", 5, 5), status(APPLE_K24, "ready", 3, 3)]
+    companies = {MSFT: ("MICROSOFT CORP", []), APPLE: ("APPLE CORP", [])}
+    msg = await _error(
+        FakeIndexer(docs, companies=companies),
+        "companies_search_filings",
+        {"query": "capex", "companies": ["corp"]},
+    )
+    assert msg.startswith("[ambiguous_company]") and MSFT in msg and APPLE in msg
+
+
+@pytest.mark.parametrize(
+    ("method", "exc", "tool", "args"),
+    [
+        ("search", KeyError("chunk_number"), "companies_search_filings", {"query": "capex"}),
+        (
+            "enqueue",
+            IndexError("list index out of range"),
+            "companies_fetch_filings",
+            {"companies": ["MSFT"]},
+        ),
+        ("search", LookupError("internal"), "companies_search_filings", {"query": "capex"}),
+    ],
+)
+async def test_internal_lookup_errors_are_masked(method, exc, tool, args, caplog):
+    indexer = FakeIndexer([status(MSFT_K24, "ready", 5, 5)], fail={method: exc})
+    msg = await _error(indexer, tool, args)
+    assert msg.startswith("[backend_unavailable]") and str(exc.args[0]) not in msg
+    assert type(exc).__name__ in caplog.text
+
+
+async def test_search_without_companies_is_bounded():
+    docs = [
+        status(MSFT_K24, "ready", 5, 5),
+        status(MSFT_K23, "ready", 5, 5),
+        status(APPLE_K24, "ready", 3, 3),
+    ]
+    msg = await _error(
+        FakeIndexer(docs), "companies_search_filings", {"query": "capex"}, filings_search_max_docs=2
+    )
+    assert (
+        msg.startswith("[invalid_argument]") and "MOF_FILINGS_SEARCH_MAX_DOCS" in msg and "companies" in msg
+    )
+    # naming the companies is not bounded by it
+    res = await _call(
+        FakeIndexer(docs),
+        "companies_search_filings",
+        {"query": "capex", "companies": [MSFT]},
+        filings_search_max_docs=1,
+    )
+    assert res["indexed"] == "2/2"
+
+
+async def test_not_ready_is_capped_and_counted():
+    refs = [filing(accession=f"0000789019-24-{n:06d}") for n in range(10, 15)]
+    docs = [status(MSFT_K24, "ready", 5, 5)] + [status(r, "indexing", 1, 5) for r in refs]
+    res = await _call(
+        FakeIndexer(docs, hits=[hit(MSFT_K24, 0)]),
+        "companies_search_filings",
+        {"query": "capex"},
+        filings_not_ready_listed=2,
+    )
+    assert res["not_ready_total"] == 5 and len(res["not_ready"]) == 2 and res["indexed"] == "1/6"
+
+
+@pytest.mark.parametrize("tool", ["companies_fetch_filings", "companies_search_filings"])
+async def test_an_empty_companies_list_is_invalid(tool):
+    args = {"companies": []} if tool == "companies_fetch_filings" else {"query": "capex", "companies": []}
+    msg = await _error(FakeIndexer([status(MSFT_K24, "ready", 1, 1)]), tool, args)
+    assert msg.startswith("[invalid_argument]")
+
+
+async def test_closed_and_locked_are_told_apart_by_type():
+    from myopenfund_mcp.filings.indexer import IndexClosed
+
+    msg = await _error(
+        FakeIndexer(fail={"status": IndexClosed("locked? no: closed")}),
+        "companies_search_filings",
+        {"query": "x"},
+    )
+    assert msg.startswith("[index_unavailable]") and "shutting down" in msg
+    msg = await _error(
+        FakeIndexer(fail={"status": IndexUnavailable("closed folder")}),
+        "companies_search_filings",
+        {"query": "x"},
+    )
+    assert "another process" in msg and "shutting down" not in msg
+
+
+async def test_fetch_answers_a_compact_list_when_the_full_one_is_too_large():
+    refs = [filing(accession=f"0000789019-24-{n:06d}") for n in range(12)]
+    live = FakeLive(refs={MSFT: refs})
+    res = await _call(
+        FakeIndexer(), "companies_fetch_filings", {"companies": ["MSFT"]}, live=live, max_result_chars=1500
+    )
+    assert res["total"] == 12 and set(res["documents"][0]) == {"doc_id", "state"}
+    assert res["next"].startswith("the documents are queued")
+    msg = await _error(
+        FakeIndexer(),
+        "companies_fetch_filings",
+        {"companies": ["MSFT"]},
+        live=FakeLive(refs={MSFT: [filing(accession=f"0000789019-24-{n:06d}") for n in range(40)]}),
+        max_result_chars=1000,
+    )
+    assert msg.startswith("[result_too_large]") and "were queued" in msg
+
+
+async def test_a_timeout_while_queuing_says_the_documents_may_be_queued():
+    class Slow(FakeIndexer):
+        def enqueue(self, refs, **kw):
+            time.sleep(1.5)
+            return super().enqueue(refs, **kw)
+
+    msg = await _error(
+        Slow(),
+        "companies_fetch_filings",
+        {"companies": ["MSFT"]},
+        companies_query_timeout_s=1,
+        sec_call_budget_s=0,
+    )
+    assert msg.startswith("[timeout]") and "may have been queued" in msg and "companies_fetch_filings" in msg
+
+
+async def test_each_tool_call_writes_one_audit_line(caplog):
+    caplog.set_level(logging.INFO, logger="myopenfund_mcp.audit")
+    indexer = FakeIndexer(hits=[hit(MSFT_K24, 0)])
+    async with Client(_server(indexer)) as c:
+        await c.call_tool("companies_fetch_filings", {"companies": ["MSFT"]})
+        indexer.docs[MSFT_K24.doc_id] = status(MSFT_K24, "ready", 1, 1)
+        await c.call_tool("companies_search_filings", {"query": "capex secret-query"})
+        await c.call_tool("companies_read_filing", {"doc_id": MSFT_K24.doc_id})
+    lines = [r.getMessage() for r in caplog.records if r.name == "myopenfund_mcp.audit"]
+    for tool in sorted(TOOLS):
+        assert sum(f"tool={tool} " in line and "outcome=ok" in line for line in lines) == 1, (tool, lines)
+    assert not any("secret-query" in line for line in lines)

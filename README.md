@@ -824,6 +824,10 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_CACHE_TTL_SUBMISSIONS_H` | `24` | Hours a cached filing list is reused (1-8760). |
 | `MOF_CACHE_TTL_COMPANYFACTS_H` | `24` | Hours a cached company-facts file is reused (1-8760). |
 | `MOF_FILINGS_MAX_DOCS` | `40` | Filings downloaded and indexed by one call (1-1000). |
+| `MOF_FILINGS_SEARCH_DEFAULT_LIMIT` | `8` | Passages `companies_search_filings` returns when the caller gives no `limit`; at most `MOF_FILINGS_SEARCH_MAX_LIMIT`. |
+| `MOF_FILINGS_SEARCH_MAX_LIMIT` | `20` | Largest `limit` a caller may ask `companies_search_filings` for (1-1000); a larger one is refused with `[limit_exceeded]`. |
+| `MOF_FILINGS_SEARCH_MAX_DOCS` | `40` | Fetched filings a `companies_search_filings` call without `companies` may cover (1-10000); with more fetched, the call is refused with `[invalid_argument]` asking for `companies`. |
+| `MOF_FILINGS_NOT_READY_LISTED` | `10` | Not-yet-ready documents listed in a search result (`not_ready`, 0-1000); `not_ready_total` counts them all. |
 | `MOF_INDEX_WORKERS` | `1` | Filings indexed in parallel (1-32). |
 | `MOF_INDEX_CLOSE_TIMEOUT_S` | `10` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600. Past it the index is released; the document is resumed (`partial`) next time. |
 | `MOF_RAG_ONNX_PROVIDER` | `cpu` | ONNX execution provider of the local embedding: `cpu` or `coreml`. |

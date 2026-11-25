@@ -24,6 +24,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from ..auth import tier_check
+from ..companies import resolve as res
 from ..companies.common import READ_ONLY, call_budget_s, store_call, time_budget
 from ..companies.router import SourceRouter
 from ..companies.tools import (
@@ -37,6 +38,7 @@ from ..companies.tools import (
 )
 from ..config import Settings
 from ..errors import (
+    AMBIGUOUS_COMPANY,
     BACKEND_UNAVAILABLE,
     INDEX_NOT_READY,
     INDEX_UNAVAILABLE,
@@ -44,14 +46,18 @@ from ..errors import (
     LIMIT_EXCEEDED,
     NOT_FETCHED,
     NOT_FOUND,
+    RESULT_TOO_LARGE,
+    TIMEOUT,
+    error_code,
     tool_error,
 )
-from ..paging import cap_result, clamp_limit
+from ..paging import cap_result
 from . import GRAPH_NOT_AVAILABLE
 from .indexer import (
     DocStatus,
     DocumentNotFetched,
     FilingsIndexer,
+    IndexClosed,
     IndexUnavailable,
     SectionNotFound,
     chunk_id,
@@ -73,6 +79,7 @@ INDEX_LOCKED_MESSAGE = (
 )
 INDEX_CLOSED_MESSAGE = "the local filings index is closed (the server is shutting down)"
 INDEX_FAILED_MESSAGE = "the local filings index failed; try again later"
+IN_FLIGHT = ("queued", "fetching", "indexing")
 FORMS_DESCRIPTION = "Forms, e.g. ['10-K', '10-Q']; a base form includes its amendments ('10-K/A')"
 
 
@@ -89,7 +96,7 @@ class LazyIndexer:
     def get(self) -> FilingsIndexer:
         with self._lock:
             if self._closed:
-                raise IndexUnavailable("the filings index is closed")
+                raise IndexClosed("the filings index is closed")
             if self._indexer is None:
                 self._indexer = self._factory()
             return self._indexer
@@ -129,12 +136,12 @@ def filings_info(indexer: FilingsIndexer, settings: Settings) -> dict:
 
 
 def _index_error(exc: BaseException, *, arguments: bool) -> ToolError:
-    """The `[code]` of an indexer error. `arguments`: a ValueError is the caller's (a read's offset,
-    chunk id or window); elsewhere it is a fault."""
+    """The `[code]` of an indexer error. `arguments`: a ValueError or LookupError is the caller's (a
+    read's offset, chunk id or window); elsewhere it is a fault, masked (its class only is logged)."""
     if isinstance(exc, ToolError):
         return exc
     if isinstance(exc, IndexUnavailable):
-        closed = "closed" in str(exc)
+        closed = isinstance(exc, IndexClosed)
         return tool_error(INDEX_UNAVAILABLE, INDEX_CLOSED_MESSAGE if closed else INDEX_LOCKED_MESSAGE)
     if isinstance(exc, DocumentNotFetched):
         return tool_error(
@@ -142,7 +149,7 @@ def _index_error(exc: BaseException, *, arguments: bool) -> ToolError:
             f"{exc}; call {FETCH_TOOL} first (its result lists the doc_id of each "
             "document), or take a doc_id from companies_search_filings",
         )
-    if isinstance(exc, (SectionNotFound, LookupError)):
+    if isinstance(exc, SectionNotFound) or (arguments and type(exc) is LookupError):
         return tool_error(NOT_FOUND, str(exc))  # doc ids, section names and chunk numbers only
     if arguments and isinstance(exc, ValueError):
         return tool_error(INVALID_ARGUMENT, str(exc))
@@ -165,8 +172,43 @@ def _company(hit, names: dict[str, str]) -> str | None:
     return title[: -len(suffix)] if title.endswith(suffix) and len(title) > len(suffix) else None
 
 
+def _local_index(companies: list[dict]) -> dict[str, dict]:
+    """The fetched companies (`FilingsIndexer.fetched_companies`) in the resolver's index shape."""
+    return {
+        c["cik"]: {
+            "cik": c["cik"],
+            "entity_id": None,
+            "names": [{"name": c["name"], "since": None}] if c["name"] else [],
+            "current_name": c["name"],
+            "tickers": list(c["tickers"]),
+            "country": None,
+        }
+        for c in companies
+    }
+
+
+def _check_companies(companies: list[str], settings: Settings) -> None:
+    if not companies:
+        raise tool_error(INVALID_ARGUMENT, "companies must name at least one company (CIK, ticker or name)")
+    check_companies(companies, settings)
+
+
 def _status_row(status: DocStatus, names: dict[str, str]) -> dict:
     return {"company": names.get(status.cik), **status.to_dict()}
+
+
+def _not_ready_message(matched: list[DocStatus]) -> str:
+    """`[index_not_ready]`: call again while work is in flight; else fetch again (nothing will move)."""
+    head = f"nothing is indexed yet among the {len(matched)} fetched filings in scope ({_progress(matched)})"
+    if any(s.state in IN_FLIGHT for s in matched):
+        tail = "; indexing goes on in the background: call again in a minute"
+        if any(s.state in ("partial", "failed") for s in matched):
+            tail += f"; partial or failed documents: call {FETCH_TOOL} again for them"
+        return head + tail
+    return (
+        head + f"; nothing is being indexed for them: call {FETCH_TOOL} again for these companies "
+        "(a partial document, cut by a restart, resumes; a failed one is fetched again), then search again"
+    )
 
 
 def _progress(matched: list[DocStatus]) -> str:
@@ -214,6 +256,31 @@ def build_filings_toolset(
     async def lookup(companies: list[str]) -> list[dict]:
         return await lookup_companies(router, companies, call=call, unknown_hint=unknown_hint)
 
+    async def scope_companies(companies: list[str]) -> dict[str, str | None]:
+        """CIK -> name of the requested companies, resolved first against the fetched companies (no SEC
+        request: a search of fetched documents works with SEC down); SEC's resolver only for the others.
+        A CIK that was never fetched needs no resolver either (the scope is then empty)."""
+        local = _local_index(await run("fetched_companies"))
+        out: dict[str, str | None] = {}
+        missing: list[str] = []
+        for q in companies:
+            hits = res.resolve(local, q)
+            if len(hits) > 1:
+                listed = ", ".join(f"{h['current_name']} (CIK {h['cik']})" for h in hits[:10])
+                raise tool_error(
+                    AMBIGUOUS_COMPANY, f"{q!r} matches {len(hits)} fetched companies: {listed}; pass a CIK"
+                )
+            if hits:
+                out.setdefault(hits[0]["cik"], hits[0]["current_name"])
+            elif q.strip().isdigit():
+                out.setdefault(q.strip().lstrip("0").zfill(10), None)
+            else:
+                missing.append(q)
+        if missing:
+            for h in await lookup(missing):
+                out.setdefault(h["cik"], h["current_name"])
+        return out
+
     fetch_description = (
         "Download companies' SEC filings and index their text on this machine, so that "
         "companies_search_filings can search them: call companies_fetch_filings first, before any "
@@ -222,13 +289,14 @@ def build_filings_toolset(
         "MD&A (Item 7) first, and companies_search_filings finds passages as soon as they are indexed. "
         f"At most {settings.filings_max_docs} documents per call (MOF_FILINGS_MAX_DOCS): narrow `forms` or "
         "the period. `model_download` true = the embedding model (about 1.1 GB) is downloaded once first, "
-        "so the first passages take a few minutes. Fetching a document again is harmless (a ready one "
-        "stays ready; a partial or failed one is resumed)."
+        "so the first passages take a few minutes. A first call for a company may answer `[timeout]` while "
+        "SEC answers slowly: call again (fetching again is harmless: a ready document stays ready, a "
+        "partial or failed one is resumed)."
     )
 
     @fs.tool(auth=act, annotations=ACT, description=fetch_description)
     async def fetch_filings(
-        companies: Annotated[list[CompanyId], Field(description=COMPANIES_DESCRIPTION, min_length=1)],
+        companies: Annotated[list[CompanyId], Field(description=COMPANIES_DESCRIPTION)],
         forms: Annotated[
             list[str] | None,
             Field(description=f"{FORMS_DESCRIPTION}; omitted = {defaults} (MOF_FILINGS_DEFAULT_FORMS)"),
@@ -240,27 +308,43 @@ def build_filings_toolset(
             dt.date | None, Field(description="Report period end on or before, YYYY-MM-DD")
         ] = None,
     ) -> dict:
-        check_companies(companies, settings)
+        _check_companies(companies, settings)
         check_period(period_from, period_to)
         wanted = _forms(forms) or list(settings.filings_default_forms)
-        with time_budget(settings, budget_s):
-            hits = await lookup(companies)
-            found = await per_company(
-                hits,
-                lambda h: call(
-                    router.filings, cik=h["cik"], forms=wanted, period_from=period_from, period_to=period_to
-                ),
-            )
-            names = {h["cik"]: h["current_name"] for h in hits}
-            refs = list({filing_doc_id(r): r for rs in found for r in rs}.values())
-            if len(refs) > settings.filings_max_docs:
-                raise tool_error(
-                    LIMIT_EXCEEDED,
-                    f"{len(refs)} filings match; at most {settings.filings_max_docs} "
-                    "documents per call (MOF_FILINGS_MAX_DOCS): narrow forms or the "
-                    "period (period_from, period_to), or fetch fewer companies at once",
+        queuing = False
+        try:
+            with time_budget(settings, budget_s):
+                hits = await lookup(companies)
+                found = await per_company(
+                    hits,
+                    lambda h: call(
+                        router.filings,
+                        cik=h["cik"],
+                        forms=wanted,
+                        period_from=period_from,
+                        period_to=period_to,
+                    ),
                 )
-            statuses = await run("enqueue", refs, names=names) if refs else []
+                names = {h["cik"]: h["current_name"] for h in hits}
+                tickers = {h["cik"]: h.get("tickers") or [] for h in hits}
+                refs = list({filing_doc_id(r): r for rs in found for r in rs}.values())
+                if len(refs) > settings.filings_max_docs:
+                    raise tool_error(
+                        LIMIT_EXCEEDED,
+                        f"{len(refs)} filings match; at most {settings.filings_max_docs} "
+                        "documents per call (MOF_FILINGS_MAX_DOCS): narrow forms or the "
+                        "period (period_from, period_to), or fetch fewer companies at once",
+                    )
+                queuing = bool(refs)
+                statuses = await run("enqueue", refs, names=names, tickers=tickers) if refs else []
+        except ToolError as exc:
+            if queuing and error_code(exc, "") == TIMEOUT:
+                raise tool_error(
+                    TIMEOUT,
+                    f"the {len(refs)} documents may have been queued before the time budget ran out; call "
+                    f"{FETCH_TOOL} again (harmless) to see their states",
+                ) from None
+            raise
         download = bool(getattr(statuses, "model_download", False))
         out = {
             "forms": wanted,
@@ -273,7 +357,19 @@ def build_filings_toolset(
                 else "no filing of these forms in this period at SEC; try other forms or another period"
             ),
         }
-        return cap_result(out, settings, hint="fetch fewer companies, forms or a shorter period at once")
+        try:
+            return cap_result(out, settings)
+        except ToolError:  # queued already: answer the compact form rather than a bare refusal
+            compact = {**out, "documents": [{"doc_id": s.doc_id, "state": s.state} for s in statuses]}
+            compact["next"] = "the documents are queued; " + out["next"]
+            try:
+                return cap_result(compact, settings)
+            except ToolError:
+                raise tool_error(
+                    RESULT_TOO_LARGE,
+                    f"the {len(statuses)} documents were queued, but their list is larger than "
+                    "MOF_MCP_MAX_RESULT_CHARS; search them with companies_search_filings",
+                ) from None
 
     @fs.tool(auth=read, annotations=READ_ONLY)
     async def search_filings(
@@ -287,7 +383,10 @@ def build_filings_toolset(
         ],
         companies: Annotated[
             list[CompanyId] | None,
-            Field(description="CIKs, tickers or entity_ids; omitted = every fetched filing", min_length=1),
+            Field(
+                description="CIKs, tickers or names of fetched companies; omitted = every fetched filing "
+                "(refused when more are fetched than the server's maximum: then name the companies)"
+            ),
         ] = None,
         forms: Annotated[list[str] | None, Field(description=f"{FORMS_DESCRIPTION}; omitted = all")] = None,
         period_from: Annotated[
@@ -297,7 +396,11 @@ def build_filings_toolset(
             dt.date | None, Field(description="Report period end on or before, YYYY-MM-DD")
         ] = None,
         limit: Annotated[
-            int | None, Field(description="Passages to return; omitted = server default")
+            int | None,
+            Field(
+                description=f"Passages to return; omitted = {settings.filings_search_default_limit}, at most "
+                f"{settings.filings_search_max_limit}"
+            ),
         ] = None,
     ) -> dict:
         """Search the text of filings fetched with companies_fetch_filings: call companies_fetch_filings
@@ -307,26 +410,42 @@ def build_filings_toolset(
         Each hit is a passage: company, cik, form, filed, section (e.g. 'Item 7'), url, doc_id,
         chunk_id, text. Before quoting, read it in context with companies_read_filing(doc_id,
         chunk_id); cite `url` and `filed`. `indexed` = documents fully indexed out of those searched
-        ("n/m"); a document still indexing is searched as far as it goes and listed in `not_ready`.
-        `[index_not_ready]` = nothing searchable yet: call again in a minute."""
+        ("n/m"); a document still indexing is searched as far as it goes and listed in `not_ready`
+        (`not_ready_total` counts them all). `[index_not_ready]` = nothing searchable yet: its message
+        says whether to call again in a minute (indexing in progress) or to call
+        companies_fetch_filings again (nothing in progress: partial or failed documents)."""
         text = query.strip()
         if not text:
             raise tool_error(INVALID_ARGUMENT, "query is empty: say what to find, in English")
-        page = clamp_limit(limit, settings)
+        page = settings.filings_search_default_limit if limit is None else limit
+        if page < 1:
+            raise tool_error(INVALID_ARGUMENT, "limit must be at least 1")
+        if page > settings.filings_search_max_limit:
+            raise tool_error(
+                LIMIT_EXCEEDED,
+                f"limit {page} is above the maximum of {settings.filings_search_max_limit} "
+                "(MOF_FILINGS_SEARCH_MAX_LIMIT)",
+            )
         if companies is not None:
-            check_companies(companies, settings)
+            _check_companies(companies, settings)
         check_period(period_from, period_to)
         wanted = _forms(forms)
-        names: dict[str, str] = {}
+        names: dict[str, str | None] = {}
         with time_budget(settings, budget_s):
             if companies is not None:
-                names = {h["cik"]: h["current_name"] for h in await lookup(companies)}
+                names = await scope_companies(companies)
             known = await run("status")
             scope = [s.doc_id for s in known if companies is None or s.cik in names]
             if not scope:
                 whose = "for these companies" if companies is not None else "yet"
                 raise tool_error(
                     NOT_FETCHED, f"no filing was fetched {whose}; call {FETCH_TOOL} first, then search again"
+                )
+            if companies is None and len(scope) > settings.filings_search_max_docs:
+                raise tool_error(
+                    INVALID_ARGUMENT,
+                    f"{len(scope)} filings are fetched; a search without `companies` covers at most "
+                    f"{settings.filings_search_max_docs} (MOF_FILINGS_SEARCH_MAX_DOCS): pass `companies`",
                 )
             found = await run(
                 "search",
@@ -346,17 +465,7 @@ def build_filings_toolset(
             )
         ready = sum(s.state == "ready" for s in matched)
         if not found.hits and ready == 0:
-            raise tool_error(
-                INDEX_NOT_READY,
-                f"nothing is indexed yet among the {len(matched)} fetched filings "
-                f"in scope ({_progress(matched)}); indexing goes on in the "
-                "background: call again in a minute"
-                + (
-                    f"; failed documents: fetch them again with {FETCH_TOOL}"
-                    if any(s.state == "failed" for s in matched)
-                    else ""
-                ),
-            )
+            raise tool_error(INDEX_NOT_READY, _not_ready_message(matched))
         hits = [
             {
                 "company": _company(h, names),
@@ -374,7 +483,10 @@ def build_filings_toolset(
         out = {
             "query": text,
             "indexed": f"{ready}/{len(matched)}",
-            "not_ready": [_status_row(s, names) for s in found.not_ready],
+            "not_ready_total": len(found.not_ready),
+            "not_ready": [
+                _status_row(s, names) for s in found.not_ready[: settings.filings_not_ready_listed]
+            ],
             "returned": len(hits),
             "hits": hits,
         }

@@ -875,3 +875,47 @@ def test_cache_off_exit_mid_batch_removes_the_temporary_root(tmp_path):
     root = Path(done.stdout.strip().splitlines()[-1])
     assert root.name.startswith("myopenfund-mcp-filings-")
     assert not root.exists()
+
+
+def test_fetched_companies_keep_names_and_tickers(tmp_path):
+    indexer = make(tmp_path, GatedEmbedder(batch_size=8))
+    try:
+        assert indexer.fetched_companies() == []
+        indexer.enqueue([ref()], names={CIK: "MICROSOFT CORP"}, tickers={CIK: ["MSFT"]})
+        indexer.enqueue([ref("0000789019-23-000001")])  # no names given: the recorded ones stay
+        assert indexer.fetched_companies() == [{"cik": CIK, "name": "MICROSOFT CORP", "tickers": ["MSFT"]}]
+    finally:
+        indexer.close()
+
+
+def test_reconciliation_keeps_each_document_checked_as_it_goes(tmp_path, monkeypatch):
+    a = make(tmp_path, GatedEmbedder(batch_size=8))
+    a.enqueue([ref(), ref("0000789019-23-000001")])
+    wait_until(lambda: [s.state for s in a.status()] == ["ready", "ready"])
+    a.close()
+    real, seen = LocalIndex.count, []
+
+    def count(self, doc_id):
+        seen.append(doc_id)
+        if len(seen) == 2:
+            raise RuntimeError("abandoned midway")
+        return real(self, doc_id)
+
+    monkeypatch.setattr(LocalIndex, "count", count)
+    b = make(tmp_path, GatedEmbedder(batch_size=8))
+    try:
+        b.status()  # opens
+        with pytest.raises(RuntimeError):
+            b._reconcile([DOC, "sec-0000789019-23-000001"])
+        assert seen[0] in b._reconciled and seen[1] not in b._reconciled
+    finally:
+        b.close()
+
+
+def test_closed_is_its_own_type(tmp_path):
+    from myopenfund_mcp.filings.indexer import IndexClosed
+
+    indexer = make(tmp_path)
+    indexer.close()
+    with pytest.raises(IndexClosed):
+        indexer.status()

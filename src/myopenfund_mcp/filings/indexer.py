@@ -100,6 +100,7 @@ __all__ = [
     "DocumentNotFetched",
     "EnqueueResult",
     "FilingsIndexer",
+    "IndexClosed",
     "IndexUnavailable",
     "SearchResult",
     "SectionNotFound",
@@ -125,6 +126,10 @@ _V2 = ChunkingOptions.v2()
 
 class IndexUnavailable(RuntimeError):
     """The local filings index cannot be used: another process holds it, or the indexer is closed."""
+
+
+class IndexClosed(IndexUnavailable):
+    """The indexer is closed (the server is shutting down)."""
 
 
 class DocumentNotFetched(LookupError):
@@ -333,6 +338,10 @@ _SCHEMA = (
         " updated_at TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY (collection, doc_id))"
     ),
     (
+        "CREATE TABLE IF NOT EXISTS companies ("
+        " cik TEXT PRIMARY KEY, name TEXT, tickers TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL)"
+    ),
+    (
         "CREATE TABLE IF NOT EXISTS chunks ("
         " collection TEXT NOT NULL, doc_id TEXT NOT NULL, chunk_number INTEGER NOT NULL, section TEXT,"
         " text TEXT NOT NULL, context TEXT, PRIMARY KEY (collection, doc_id, chunk_number))"
@@ -446,7 +455,7 @@ class FilingsIndexer:
     def _open(self) -> None:
         with self._lock:
             if self._closed:
-                raise IndexUnavailable("the filings index is closed")
+                raise IndexClosed("the filings index is closed")
             if self._index is not None:
                 return
             # Private to the user, as the HTTP cache creates it (when the index comes first).
@@ -539,7 +548,8 @@ class FilingsIndexer:
     def _reconcile(self, doc_ids: Iterable[str]) -> None:
         """A `ready` document whose chunk count in the local index is not its total becomes `partial`.
         Checked once per document and process, when it is first touched (never at open: a count
-        scans the FTS table)."""
+        scans the FTS table). Each document is marked checked as soon as it is, so the work of a call
+        abandoned midway is kept."""
         with self._lock:
             pending = [doc_id for doc_id in dict.fromkeys(doc_ids) if doc_id not in self._reconciled]
             index = self._index
@@ -551,15 +561,17 @@ class FilingsIndexer:
                 with self._lock:
                     if status.doc_id not in self._active:
                         self._update(status.doc_id, state="partial")
+            with self._lock:
+                self._reconciled.add(status.doc_id)
         with self._lock:
-            self._reconciled.update(pending)
+            self._reconciled.update(pending)  # never enqueued: nothing to check
 
     # --- the status database -------------------------------------------------------------------
 
     def _conn(self) -> sqlite3.Connection:
         """The status database; call with `self._lock` held. Closed -> IndexUnavailable."""
         if self._db is None:
-            raise IndexUnavailable("the filings index is closed")
+            raise IndexClosed("the filings index is closed")
         return self._db
 
     def _query(self, sql: str, params: Sequence[Any] = ()) -> list[tuple]:
@@ -630,13 +642,21 @@ class FilingsIndexer:
 
     # --- public API ----------------------------------------------------------------------------
 
-    def enqueue(self, refs: Sequence[FilingRef], *, names: Mapping[str, str] | None = None) -> EnqueueResult:
+    def enqueue(
+        self,
+        refs: Sequence[FilingRef],
+        *,
+        names: Mapping[str, str] | None = None,
+        tickers: Mapping[str, Sequence[str]] | None = None,
+    ) -> EnqueueResult:
         """Queue `refs` for indexing and return their statuses at once. A `ready` document stays
         ready; one already queued or being indexed by this process is left as it is; a `partial` or
         `failed` one is queued again (a partial one resumes). `names` maps a CIK to the company name
         used in the chunks' `title` (default `CIK <cik>`); a document with stored chunks keeps the
-        title it was first indexed with."""
+        title it was first indexed with. `names` and `tickers` (CIK -> tickers) are also recorded per
+        company, for `fetched_companies`."""
         self._open()
+        self._record_companies(refs, names or {}, tickers or {})
         result = EnqueueResult()
         download = self._model_download_needed()
         self._start_workers()
@@ -686,6 +706,33 @@ class FilingsIndexer:
                 result.model_download = not self._download_reported
                 self._download_reported = True
         return result
+
+    def _record_companies(
+        self, refs: Sequence[FilingRef], names: Mapping[str, str], tickers: Mapping[str, Sequence[str]]
+    ) -> None:
+        rows = [
+            (cik, names.get(cik), json.dumps(list(tickers.get(cik) or [])), _now())
+            for cik in dict.fromkeys(filing.cik for filing in refs)
+        ]
+        with self._lock:
+            self._conn().executemany(
+                "INSERT INTO companies (cik, name, tickers, updated_at) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (cik) DO UPDATE SET name = coalesce(excluded.name, companies.name),"
+                " tickers = CASE WHEN excluded.tickers = '[]' THEN companies.tickers ELSE excluded.tickers END,"
+                " updated_at = excluded.updated_at",
+                rows,
+            )
+
+    def fetched_companies(self) -> list[dict[str, Any]]:
+        """The companies with at least one enqueued document of this collection: `cik`, `name` (as
+        given at enqueue, None if never given) and `tickers`, by CIK. No SEC request, no index count."""
+        self._open()
+        rows = self._query(
+            "SELECT d.cik, c.name, c.tickers FROM (SELECT DISTINCT cik FROM documents WHERE collection = ?) d"
+            " LEFT JOIN companies c ON c.cik = d.cik ORDER BY d.cik",
+            (self.collection,),
+        )
+        return [{"cik": cik, "name": name, "tickers": json.loads(tick or "[]")} for cik, name, tick in rows]
 
     def status(self, doc_ids: Collection[str] | None = None) -> StatusResult:
         """The statuses of `doc_ids` (every known document when None), newest filing first; the
@@ -742,7 +789,7 @@ class FilingsIndexer:
         with self._lock:
             index = self._index
             if index is None or self._closed:
-                raise IndexUnavailable("the filings index is closed")
+                raise IndexClosed("the filings index is closed")
         try:
             hits = hybrid_search(
                 query,
@@ -756,7 +803,7 @@ class FilingsIndexer:
             )
         except Exception:
             if self._closed:  # the index was closed under the search
-                raise IndexUnavailable("the filings index is closed") from None
+                raise IndexClosed("the filings index is closed") from None
             raise
         return SearchResult(hits, not_ready, unknown, rows)
 
@@ -996,7 +1043,7 @@ class FilingsIndexer:
         with self._lock:
             index = self._index
             if index is None:
-                raise IndexUnavailable("the filings index is closed")
+                raise IndexClosed("the filings index is closed")
         done = self._done(doc_id)
         if fingerprint != cut and (done or fingerprint is not None) or index.count(doc_id) != len(done):
             # Another cut than the stored one, or chunks in the index without their record: again.
