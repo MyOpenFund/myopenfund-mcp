@@ -139,14 +139,16 @@ class FakeStore(_Recording):
     def read(self, dataset, *, as_of, filters, columns, limit, vintages=False) -> list[dict]:
         ciks = (filters or {}).get("entity_value", [None])
         self._enter(f"read:{dataset}", ciks[0] if len(ciks) == 1 else None)
-        if dataset == "filings":
-            return [
-                {"filing_ref": a, "known_at": k} for c in ciks for a, k in (self.filings or {}).get(c, [])
-            ]
         if dataset == "filing_statements":
             wanted = set(filters.get("filing_ref", []))
             return [{"filing_ref": a} for a in sorted(self.positions.get(ciks[0], set()) & wanted)][:limit]
         return [fact(c, self.value) for c in ciks if c in self.ciks]
+
+    def known_filings(self, cik, *, dataset="filings") -> list[dict]:
+        self._enter(f"known_filings:{dataset}", cik)
+        if dataset == "filings":
+            return [{"filing_ref": a, "known_at": k} for a, k in (self.filings or {}).get(cik, [])]
+        return [{"filing_ref": K24, "known_at": ACCEPTED_K24}] if cik in self.ciks else []
 
     def concept_rows(self, cik, as_of):  # the store's signature as the existing tests patch it
         self._enter("concept_rows", cik)

@@ -815,3 +815,26 @@ async def test_shutdown_closes_the_live_source_before_the_store(tmp_path, monkey
     async with Client(server):
         pass
     assert order == ["live", "store"]
+
+
+async def test_a_slow_failing_sec_leaves_store_companies_answered_unchecked():
+    """Three store companies, SEC failing after 0.8 s, 1 s + 1 s budgets: store rows, never [timeout]."""
+    from company_corpus.live.sec import SecUnavailable
+    from source_fakes import APPLE, APPLE_REFS, JPM, MSFT, FakeLive, FakeStore
+
+    store = FakeStore(ciks=(APPLE, MSFT, JPM))
+    for c in (MSFT, JPM):
+        store.filings[c] = list(store.filings[APPLE])
+        store.positions[c] = set(store.positions[APPLE])
+    live = FakeLive(refs={c: list(APPLE_REFS) for c in (APPLE, MSFT, JPM)})
+
+    def failing(cik, **kw):
+        time.sleep(0.8)
+        raise SecUnavailable("x")
+
+    live.filings = failing
+    for tool in ("companies_facts", "companies_fundamentals"):
+        res = await _routed_call(store, live, tool, {"companies": [APPLE, MSFT, JPM]},
+                                 companies_query_timeout_s=1, sec_call_budget_s=1)
+        assert {(r["cik"], r["source"], r["reason"]) for r in res["rows"]} == {
+            (c, "store", "freshness_unchecked") for c in (APPLE, MSFT, JPM)}

@@ -19,16 +19,27 @@ Readings of the spec's rule (rulings R26, R29, R30):
   20-F, 40-F; an 8-K never has any). A filing SEC lists without an acceptance time cannot be placed
   against ``as_of`` and is not compared.
 - The store holds a filing when its accession is among the store's filings of the company, or the
-  store's newest such filing is known no earlier than that filing's acceptance.
+  store's newest such filing is known no earlier than that filing's acceptance. The store's filings
+  and positions are read as known now (one row per filing, aggregated by the store), not at
+  ``as_of``: SEC's side is the one cut at ``as_of``.
+- When SEC lists no filing accepted at or before ``as_of`` (an ``as_of`` before the first filing, a
+  CIK SEC does not know, filings without an acceptance time), there is nothing newer to compare:
+  the store answers for a company it holds.
 - A store without a published ``filings`` dataset (logged once, at warning level): its filings are
   read from ``fundamentals`` (the ``filing_ref`` and ``known_at`` of its facts), which see only
   filings with XBRL facts, so the comparison then uses SEC's latest filing carrying positions (an
   8-K without facts would otherwise put every company behind).
 
 When the freshness check cannot run (``auto`` with a store and no ``MOF_SEC_CONTACT``, or SEC failing
-during the check) a company in the store is served from it with ``reason: freshness_unchecked``
-(ruling R27). A company that must be read live while no SEC contact is configured raises
-:class:`LiveNotConfigured` (``[sec_contact_missing]``).
+or slow during the check) a company in the store is served from it with ``reason:
+freshness_unchecked`` (ruling R27). The check asks SEC for the filing lists of a call's store
+companies at once (at most ``MOF_COMPANIES_MAX_CONCURRENCY`` requests running) and waits at most
+``MOF_SEC_FRESHNESS_BUDGET_S``: the companies not checked by then are unchecked (the requests still
+running end in the background and fill the live source's memo for the next call). An SEC failure
+(unreachable, refused, no contact, closed) stops the check at once: the companies not answered
+yet are not asked, and no check is made for ``MOF_SEC_FAILURE_TTL_S``. A company whose own SEC
+answer cannot be read is unchecked alone. A company that must be read live while no SEC contact
+is configured raises :class:`LiveNotConfigured` (``[sec_contact_missing]``).
 
 Memory: nothing is remembered as a route. SEC's filing list per company is the live source's
 submissions memo (stamped when the submissions were fetched, kept ``MOF_CACHE_TTL_SUBMISSIONS_H``);
@@ -45,10 +56,12 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
+from .live import LiveClosed, sec_error_code
 from .store import StoreBadArgument, StoreUnknownDataset
 
 log = logging.getLogger("myopenfund_mcp.companies")
@@ -101,7 +114,10 @@ class _StoreState:
 class SourceRouter:
     """The store's / live source's method set, dispatched per CIK, plus :meth:`plan`.
 
-    ``clock`` (monotonic seconds) and ``now`` (aware datetime) are injectable for tests."""
+    ``freshness_budget_s`` (``MOF_SEC_FRESHNESS_BUDGET_S``), ``failure_ttl_s``
+    (``MOF_SEC_FAILURE_TTL_S``), ``check_workers`` (``MOF_COMPANIES_MAX_CONCURRENCY``): the freshness
+    check's bounds. ``clock`` (monotonic seconds) and ``now`` (aware datetime) are injectable for
+    tests. :meth:`close` stops the router's own check threads; the sources are closed by their owner."""
 
     def __init__(
         self,
@@ -109,6 +125,9 @@ class SourceRouter:
         live,
         mode: str,
         *,
+        freshness_budget_s: float = 5,
+        failure_ttl_s: float = 60,
+        check_workers: int = 2,
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] | None = None,
     ):
@@ -126,6 +145,12 @@ class SourceRouter:
         self._lock = threading.Lock()
         self._state: _StoreState | None = None
         self._warned_no_filings = False
+        self._freshness_budget_s = freshness_budget_s
+        self._failure_ttl_s = failure_ttl_s
+        self._check_workers = max(1, check_workers)
+        self._sec_down_until: float | None = None
+        self._pool: ThreadPoolExecutor | None = None
+        self._closed = False
 
     def __repr__(self) -> str:
         return (
@@ -155,7 +180,9 @@ class SourceRouter:
                 raise
             log.warning("companies: store failed, answering from SEC (%s)", type(exc).__name__)
             return dict.fromkeys(ciks, Route(LIVE, STORE_UNAVAILABLE))
-        return {cik: self._decide(cik, as_of, state) for cik in ciks}
+        held = [c for c in ciks if c in state.ciks] if self.live is not None else []
+        listed = self._sec_filings(held)
+        return {cik: self._decide(cik, as_of, state, listed.get(cik)) for cik in ciks}
 
     def route(self, cik: str, as_of: datetime | None = None) -> Route:
         return self.plan([cik], as_of)[cik]
@@ -169,8 +196,10 @@ class SourceRouter:
         ciks = frozenset(r.get("subject_value") for r in self.store.entities())
         published = {d.get("name") for d in self.store.datasets()}
         state = _StoreState(batches, ciks, "filings" in published)
-        if not state.filings_published and not self._warned_no_filings:
-            self._warned_no_filings = True
+        with self._lock:
+            warn = not state.filings_published and not self._warned_no_filings
+            self._warned_no_filings = self._warned_no_filings or warn
+        if warn:
             log.warning(
                 "companies: the store has no published 'filings' dataset; its filings are read "
                 "from 'fundamentals' to route companies"
@@ -179,17 +208,55 @@ class SourceRouter:
             self._state = state
         return state
 
-    def _decide(self, cik: str, as_of: datetime, state: _StoreState) -> Route:
+    def _executor(self) -> ThreadPoolExecutor:
+        with self._lock:
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(
+                    max_workers=self._check_workers, thread_name_prefix="mof-route"
+                )
+            return self._pool
+
+    def _sec_filings(self, ciks: list[str]) -> dict[str, list | None]:
+        """SEC's report-form filings of each CIK; None = not checked (SEC failed, slow, or down)."""
+        out: dict[str, list | None] = dict.fromkeys(ciks)
+        with self._lock:
+            down = self._sec_down_until is not None and self._clock() < self._sec_down_until
+            closed = self._closed
+        if not ciks or down or closed:
+            return out
+        pool = self._executor()
+        futures = {
+            pool.submit(
+                self.live.filings, c, forms=self.live.report_forms, period_from=None, period_to=None
+            ): c
+            for c in ciks
+        }
+        try:
+            for fut in as_completed(futures, timeout=self._freshness_budget_s):
+                exc = fut.exception()
+                if exc is None:
+                    out[futures[fut]] = fut.result()
+                    continue
+                log.warning(
+                    "companies: SEC freshness check failed, answering from the store (%s)", type(exc).__name__
+                )
+                if sec_error_code(exc) is not None or isinstance(exc, LiveClosed):  # SEC itself
+                    with self._lock:
+                        self._sec_down_until = self._clock() + self._failure_ttl_s
+                    break
+        except TimeoutError:
+            log.warning(
+                "companies: SEC freshness check unfinished after %s s, answering from the store",
+                self._freshness_budget_s,
+            )
+        for fut in futures:
+            fut.cancel()  # the companies not asked yet are not asked
+        return out
+
+    def _decide(self, cik: str, as_of: datetime, state: _StoreState, refs: list | None) -> Route:
         if cik not in state.ciks:
             return Route(LIVE, NOT_IN_STORE)
-        if self.live is None:
-            return Route(STORE, FRESHNESS_UNCHECKED)
-        try:
-            refs = self.live.filings(cik, forms=self.live.report_forms, period_from=None, period_to=None)
-        except Exception as exc:  # noqa: BLE001 -- SEC cannot tell: the store answers, unchecked
-            log.warning(
-                "companies: SEC freshness check failed, answering from the store (%s)", type(exc).__name__
-            )
+        if refs is None:  # no contact, or SEC could not tell in time
             return Route(STORE, FRESHNESS_UNCHECKED)
         known = sorted(
             (r for r in refs if r.accepted is not None and r.accepted <= as_of),
@@ -197,7 +264,10 @@ class SourceRouter:
             reverse=True,
         )
         positioned = [r for r in known if _base(r.form) in self.live.positions_forms]
-        latest = known[0] if state.filings_published else (positioned[0] if positioned else None)
+        if state.filings_published:
+            latest = known[0] if known else None
+        else:
+            latest = positioned[0] if positioned else None
         try:
             if latest is not None and not self._holds(cik, latest, state):
                 return Route(LIVE, STORE_BEHIND)
@@ -214,11 +284,8 @@ class SourceRouter:
         with self._lock:
             held = state.filings.get(cik)
         if held is None:
-            key = {"entity_scheme": ["cik"], "entity_value": [cik]}
             dataset = "filings" if state.filings_published else "fundamentals"
-            rows = self.store.read(
-                dataset, as_of=self._now(), filters=key, columns=["filing_ref", "known_at"], limit=None
-            )
+            rows = self.store.known_filings(cik, dataset=dataset)  # one row per filing, as known now
             accessions = frozenset(r["filing_ref"] for r in rows if r["filing_ref"])
             newest = max((r["known_at"] for r in rows if r["known_at"] is not None), default=None)
             held = (accessions, newest)
@@ -386,7 +453,10 @@ class SourceRouter:
         return [] if self.live is None else self.live.filings(cik, **kwargs)
 
     def close(self) -> None:
-        """The live source first (its builds stop), then the store."""
-        for src in (self.live, self.store):
-            if src is not None:
-                src.close()
+        """Stop the freshness-check threads (queued checks are dropped); the sources are closed by
+        their owner (the server: the live source before the store)."""
+        with self._lock:
+            self._closed = True
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)

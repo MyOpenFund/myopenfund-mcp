@@ -113,8 +113,8 @@ class _Budget:
     """One call's time budget, in the cancel scope of its `time_budget`.
 
     It starts at `companies_query_timeout_s`, plus `sec_call_budget_s` when SEC may be reached. Once
-    routing says no company goes live it narrows to the store budget plus the routing time (the SEC
-    freshness check); a company that goes live (or falls back to SEC) restores the full budget. A
+    routing says no company goes live it narrows to the store budget plus the routing time, at most
+    `sec_freshness_budget_s` (the SEC freshness check's own bound); a company that goes live (or falls back to SEC) restores the full budget. A
     live read waits `sec_call_budget_s` counted from the start of the call (routing included), so a
     cold call answers `[warming]` before the call budget ends in `[timeout]`."""
 
@@ -152,7 +152,9 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
     async def plan(hits: list[dict], when: dt.datetime, budget: _Budget) -> dict[str, Route]:
         t = anyio.current_time()
         routes = await call(router.plan, ciks=[h["cik"] for h in hits], as_of=when)
-        budget.routed(routes, anyio.current_time() - t)
+        # credit the SEC check only (bounded by MOF_SEC_FRESHNESS_BUDGET_S): a slow store read during
+        # routing must not stretch a pure-store call past its budget
+        budget.routed(routes, min(anyio.current_time() - t, settings.sec_freshness_budget_s))
         return routes
 
     async def on_live(h: dict, route: Route, budget: _Budget, method: str, **kwargs):

@@ -403,6 +403,26 @@ class CompaniesStore:
 
         return self._run(go)
 
+    def known_filings(self, cik: str, *, dataset: str = "filings") -> list[dict]:
+        """``[{"filing_ref", "known_at"}]``: each filing of the issuer in ``dataset`` (``filings``, or
+        ``fundamentals`` when the store has no ``filings``: the filings its facts came from) with its
+        latest ``known_at``, as known now; aggregated in Arrow (one row per filing, never one per
+        fact). ``[]`` while the dataset is not published."""
+        if dataset not in ("filings", "fundamentals"):
+            raise StoreBadArgument("known_filings reads 'filings' or 'fundamentals'")
+        if not isinstance(cik, str) or not cik:
+            raise StoreBadArgument("cik must be a non-empty string")
+
+        def go(s):
+            if not self._is_published(s, dataset):
+                return []
+            t = s.read_asof(dataset, filters={"entity_scheme": ["cik"], "entity_value": [cik]},
+                            columns=["filing_ref", "known_at"])
+            t = t.filter(t["filing_ref"].is_valid()).group_by("filing_ref").aggregate([("known_at", "max")])
+            return [{"filing_ref": r["filing_ref"], "known_at": r["known_at_max"]} for r in t.to_pylist()]
+
+        return self._run(go)
+
     def summaries(self, cik: str, name: str, rows: list[dict], vintages: list[dict] | None) -> list:
         """company-corpus period summaries (values, ratios, TTM) of ``concept_rows``' output.
 

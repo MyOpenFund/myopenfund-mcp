@@ -259,6 +259,9 @@ class Settings:
     # MOF_SEC_FAILURE_TTL_S: seconds a failed fetch of a company is remembered: calls meanwhile get its
     # error at once instead of starting the fetch again
     sec_failure_ttl_s: int = 60
+    # MOF_SEC_FRESHNESS_BUDGET_S: seconds a call gives the auto-mode check of the store against SEC (the
+    # companies whose SEC filing list did not come by then are answered by the store, freshness_unchecked)
+    sec_freshness_budget_s: int = 5
     # MOF_COMPANIES_SOURCE: auto (the store when MOF_COMPANIES_CATALOG is set, SEC when MOF_SEC_CONTACT is,
     # neither = no companies toolset) | store | sec
     companies_source: str = "auto"
@@ -348,6 +351,7 @@ class Settings:
             sec_positions_donor_depth=_int(env, "MOF_SEC_POSITIONS_DONOR_DEPTH", 4, minimum=0, maximum=40),
             sec_ttm_lookback_m=_int(env, "MOF_SEC_TTM_LOOKBACK_M", 20, minimum=0, maximum=120),
             sec_failure_ttl_s=_int(env, "MOF_SEC_FAILURE_TTL_S", 60, maximum=3600),
+            sec_freshness_budget_s=_int(env, "MOF_SEC_FRESHNESS_BUDGET_S", 5, maximum=600),
             companies_source=_get(env, "MOF_COMPANIES_SOURCE") or "auto",
             cache=(_get(env, "MOF_CACHE") or "on").lower(),
             cache_dir=_get(env, "MOF_CACHE_DIR"),

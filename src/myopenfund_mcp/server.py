@@ -151,9 +151,13 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
         from .companies.tools import build_companies_toolset
 
         try:
-            router = SourceRouter(companies_store, companies_live, settings.companies_source)
+            router = SourceRouter(companies_store, companies_live, settings.companies_source,
+                                  freshness_budget_s=settings.sec_freshness_budget_s,
+                                  failure_ttl_s=settings.sec_failure_ttl_s,
+                                  check_workers=settings.companies_max_concurrency)
         except ValueError as exc:  # a source the mode needs is missing (from_env refuses it earlier)
             raise ConfigError(str(exc)) from None
+        owned.append(router)  # its check threads: closed first at shutdown, then the sources
         if companies_store is not None:  # without a store, datasets_* are not mounted
             root.mount(build_datasets_toolset(companies_store, settings, auth_enabled=auth_enabled),
                        namespace="datasets")

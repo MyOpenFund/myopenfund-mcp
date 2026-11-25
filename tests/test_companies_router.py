@@ -118,6 +118,17 @@ def test_as_of_between_a_report_and_its_positions():
     assert router.route(APPLE, ACCEPTED_K24 - dt.timedelta(days=1)) == STORE
 
 
+def test_filings_published_and_nothing_at_sec_by_as_of_answers_from_the_store():
+    """No IndexError: as_of before any filing, a CIK SEC does not know, filings without acceptance time."""
+    store = FakeStore(ciks=(APPLE, MSFT))
+    store.filings[MSFT] = []
+    live = FakeLive(refs={APPLE: list(APPLE_REFS), MSFT: [Ref("0000789019-26-000001", None, "10-Q")]})
+    router = _router(store, live)
+    assert router.route(APPLE, dt.datetime(2020, 1, 1, tzinfo=dt.UTC)) == STORE
+    assert router.route(MSFT) == STORE
+    assert _router(store, FakeLive(refs={})).route(APPLE) == STORE  # SEC does not know the CIK
+
+
 # --- auto: the freshness check cannot run (R27) -------------------------------------------------
 
 
@@ -134,12 +145,15 @@ def test_without_contact_store_companies_are_unchecked_and_the_others_need_sec()
     assert err.value.reason == "not_in_store"
 
 
-def test_sec_failure_during_the_check_is_unchecked_and_checked_again_next_call():
+def test_sec_failure_during_the_check_is_unchecked_and_checked_again_after_the_failure_ttl():
+    now = [0.0]
     live = FakeLive(fail={"filings": SecUnavailable("SEC unavailable")})
-    router = _router(FakeStore(), live)
+    router = _router(FakeStore(), live, failure_ttl_s=60, clock=lambda: now[0])
     assert router.route(APPLE) == UNCHECKED
     live.fail.clear()
     live.refs[APPLE].append(_q("x", ACCEPTED_E24 + dt.timedelta(days=1)))
+    assert router.route(APPLE) == UNCHECKED  # SEC failed less than MOF_SEC_FAILURE_TTL_S ago
+    now[0] = 60
     assert router.route(APPLE) == Route("sec_live", "store_behind")
 
 
@@ -155,7 +169,7 @@ def test_auto_store_failure_is_store_unavailable_and_not_remembered():
 
 
 def test_auto_store_failure_during_the_freshness_reads():
-    store = FakeStore(fail={"read:filings": RuntimeError("down")})
+    store = FakeStore(fail={"known_filings:filings": RuntimeError("down")})
     assert _router(store, FakeLive()).route(APPLE) == Route("sec_live", "store_unavailable")
 
 
@@ -184,10 +198,10 @@ def test_what_the_store_holds_is_remembered_until_a_publication():
     assert router.route(APPLE) == Route("sec_live", "store_behind")
     store.filings[APPLE].append((E24, ACCEPTED_E24))
     assert router.route(APPLE) == Route("sec_live", "store_behind")  # same publication: remembered
-    assert store.calls.count("read:filings") == 1
+    assert store.calls.count("known_filings:filings") == 1
     store.batches += 1  # a publication drops it
     assert router.route(APPLE) == STORE
-    assert store.calls.count("read:filings") == 2
+    assert store.calls.count("known_filings:filings") == 2
 
 
 def test_sec_filings_are_read_on_every_plan_through_the_live_memo():
@@ -313,10 +327,13 @@ def test_auto_entities_without_contact_or_store():
     assert {r["subject_value"] for r in _router(None, FakeLive()).entities()} == {APPLE, MSFT, JPM}
 
 
-def test_close_closes_both_sources():
+def test_close_stops_the_checks_and_leaves_the_sources_to_their_owner():
     store, live = FakeStore(), FakeLive()
-    _router(store, live).close()
-    assert store.closed and live.closed
+    router = _router(store, live)
+    router.route(APPLE)
+    router.close()
+    assert not store.closed and not live.closed
+    assert router.route(APPLE) == UNCHECKED  # no check after close
 
 
 def test_the_live_source_exposes_the_forms_the_router_compares():
@@ -449,3 +466,132 @@ def test_real_store_publication_invalidates_what_was_remembered(real):
     store.close()  # the publisher attaches the catalogue itself; the store reopens lazily
     assert publish_pending(cfg, now=later).exit_code == 0
     assert router.route(APPLE) == STORE
+
+
+# --- a slow or failing SEC during the check (bounded, remembered) -------------------------------
+
+
+def _three_store_companies():
+    store = FakeStore(ciks=(APPLE, MSFT, JPM))
+    for c in (MSFT, JPM):
+        store.filings[c] = list(store.filings[APPLE])
+        store.positions[c] = set(store.positions[APPLE])
+    return store
+
+
+def test_an_sec_failure_stops_the_check_and_is_remembered():
+    import time as _time
+
+    now = [0.0]
+    live = FakeLive(refs={c: list(APPLE_REFS) for c in (APPLE, MSFT, JPM)})
+    real = live.filings
+
+    def failing(cik, **kw):
+        _time.sleep(0.3)
+        live._enter("filings", cik)
+        raise SecUnavailable("SEC unavailable")
+
+    live.filings = failing
+    router = _router(_three_store_companies(), live, check_workers=1, failure_ttl_s=60, clock=lambda: now[0])
+    t0 = _time.monotonic()
+    assert set(router.plan([APPLE, MSFT, JPM]).values()) == {UNCHECKED}
+    assert _time.monotonic() - t0 < 0.6 and live.calls.count("filings") == 1  # the others not asked
+    live.filings = real
+    assert router.route(APPLE) == UNCHECKED and live.calls.count("filings") == 1  # remembered: not asked
+    now[0] = 61
+    assert router.route(APPLE) == STORE
+
+
+def test_a_slow_sec_is_bounded_by_the_freshness_budget():
+    import time as _time
+
+    live = FakeLive(refs={c: list(APPLE_REFS) for c in (APPLE, MSFT, JPM)})
+    real = live.filings
+
+    def slow(cik, **kw):
+        _time.sleep(0.2 if cik == APPLE else 2)
+        return real(cik, **kw)
+
+    live.filings = slow
+    router = _router(_three_store_companies(), live, check_workers=3, freshness_budget_s=0.6)
+    t0 = _time.monotonic()
+    routes = router.plan([APPLE, MSFT, JPM])
+    assert _time.monotonic() - t0 < 1.0
+    assert routes == {APPLE: STORE, MSFT: UNCHECKED, JPM: UNCHECKED}
+    router.close()
+
+
+def test_one_unreadable_sec_answer_leaves_the_others_checked():
+    from myopenfund_mcp.companies.live import LiveDataError
+
+    live = FakeLive(
+        refs={c: list(APPLE_REFS) for c in (APPLE, MSFT, JPM)}, fail={"filings:" + MSFT: LiveDataError("x")}
+    )
+    routes = _router(_three_store_companies(), live, check_workers=1).plan([APPLE, MSFT, JPM])
+    assert routes == {APPLE: STORE, MSFT: UNCHECKED, JPM: STORE}
+
+
+# --- the real seeded store with `filings` published ---------------------------------------------
+
+
+@pytest.fixture
+def real_filings(tmp_path):
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    yield s
+    s.close()
+
+
+def test_real_filings_current_company(real_filings, caplog):
+    from companies_fixture import AAPL_8K_2025
+
+    live = _sec(
+        Ref(AAPL_10K_2024, ACCEPTED_10K_2024),
+        Ref(AAPL_10K_2025, ACCEPTED_10K_2025),
+        Ref(AAPL_8K_2025, ACCEPTED_10K_2025 + dt.timedelta(days=3), "8-K"),
+    )
+    with caplog.at_level(logging.WARNING, logger="myopenfund_mcp.companies"):
+        assert _router(real_filings, live).route(APPLE, dt.datetime(2025, 6, 1, tzinfo=dt.UTC)) == STORE
+    assert "no published 'filings'" not in caplog.text
+
+
+def test_real_filings_behind(real_filings):
+    from companies_fixture import AAPL_8K_2025
+
+    live = _sec(
+        Ref(AAPL_10K_2024, ACCEPTED_10K_2024),
+        Ref(AAPL_10K_2025, ACCEPTED_10K_2025),
+        Ref(AAPL_8K_2025, ACCEPTED_10K_2025 + dt.timedelta(days=3), "8-K"),
+        Ref("0000320193-25-000100", ACCEPTED_10K_2025 + dt.timedelta(days=20), "8-K"),
+    )
+    assert _router(real_filings, live).route(APPLE) == Route("sec_live", "store_behind")
+
+
+def test_real_filings_latest_report_without_positions(real_filings):
+    from companies_fixture import AAPL_8K_2025
+
+    live = _sec(
+        Ref(AAPL_10K_2024, ACCEPTED_10K_2024),
+        Ref(AAPL_10K_2025, ACCEPTED_10K_2025),
+        Ref(AAPL_8K_2025, ACCEPTED_10K_2025 + dt.timedelta(days=3), "8-K"),
+    )
+    assert _router(real_filings, live).route(APPLE) == Route("sec_live", "store_no_positions")
+
+
+def test_real_filings_as_of_before_any_filing(real_filings):
+    live = _sec(Ref(AAPL_10K_2024, ACCEPTED_10K_2024), Ref(AAPL_10K_2025, ACCEPTED_10K_2025))
+    assert _router(real_filings, live).route(APPLE, dt.datetime(2020, 1, 1, tzinfo=dt.UTC)) == STORE
+
+
+def test_real_store_known_filings_is_one_row_per_filing(real_filings):
+    from companies_fixture import AAPL_8K_2025
+
+    assert {r["filing_ref"] for r in real_filings.known_filings(APPLE)} == {
+        AAPL_10K_2024,
+        AAPL_10K_2025,
+        AAPL_8K_2025,
+    }
+    by_facts = real_filings.known_filings(APPLE, dataset="fundamentals")
+    assert sorted(r["filing_ref"] for r in by_facts) == [AAPL_10K_2024, AAPL_10K_2025]
+    with pytest.raises(StoreBadArgument):
+        real_filings.known_filings(APPLE, dataset="filing_statements")
