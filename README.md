@@ -829,7 +829,7 @@ them `0700` for its own uid). Configuration:
   `instrument_identifiers`, ...) are read strictly, like market-data reads them: a source the registry does
   not declare is dropped too (so without the `[market]` extra, which declares the sources, no market row is
   served). Other datasets, and datasets without a `source_code` column, are unchanged. The sources of
-  `MOF_MARKET_TOOL_ONLY_SOURCES` (default `private_history`: its rows hold private tokens and labels) are never
+  `MOF_MARKET_TOOL_ONLY_SOURCES` (default `private_history,manual`: their rows hold private tokens and labels, or an operator's own symbols) are never
   served by these tools, whatever the allow-list: only `market_prices` serves them, by `instrument_id`. `datasets_list`'s
   `rows_estimate` still counts every row of a table.
 - **Time budget, and a store read over SMB.** One call, all its store reads together, gets
@@ -881,7 +881,7 @@ Python API (`market_data.api.prices`), the same code path as a notebook: nothing
   (`MOF_MARKET_MAX_INSTRUMENTS=10`, `MOF_MARKET_LIVE_TIMEOUT_S=60`), ten Massive instruments cannot be fetched
   within the budget: ask for at most about 5 per call, or raise `MOF_MARKET_LIVE_TIMEOUT_S` (and the client's
   own tool-call timeout). Tiingo's free plan is not limited per minute this way.
-- **Private-history rows** (`MOF_MARKET_TOOL_ONLY_SOURCES`, default `private_history`) are served by
+- **Private-history and manual rows** (`MOF_MARKET_TOOL_ONLY_SOURCES`, default `private_history,manual`) are served by
   `market_prices` only, keyed by `instrument_id`: the dataset tools never serve them, whatever the allow-list.
 
 ## Errors
@@ -1043,7 +1043,8 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_MARKET_SOURCE` | `auto` | Where `market_prices` reads when a call gives no `mode`: `auto` (the store when it holds the rows, else a live fetch), `store` (needs `MOF_COMPANIES_CATALOG`) or `live`. `store` or `live` without the `[market]` extra refuses to start. |
 | `MOF_MARKET_RESTRICTED_ALLOW` | unset | `client:source\|source,...`: the restricted sources (licences that forbid sharing, e.g. `massive`, `tiingo`, `private_history`) whose stored rows each client of `MOF_MCP_TOKENS` may read. Unset = none, for every client and over stdio. Each source must be a restricted code of the installed source registry (needs the `[market]` extra). The list applies to HTTP tokens only: over stdio there is no client, so stored restricted rows are never served, and a live fetch uses your own key and is your own data: not gated. A client of `MOF_MARKET_NO_RESTRICTED_CLIENTS` is refused. Errors name the entry by position only. |
 | `MOF_MARKET_NO_RESTRICTED_CLIENTS` | `agents` | Client ids (comma-separated) that `MOF_MARKET_RESTRICTED_ALLOW` may never name: the agents' token never gets restricted sources (it may post publicly). Compared without regard to case (`Agents` is refused too). An empty value keeps the default; a value holding no id (`,`) is refused; an operator whose agents client has another id sets it here. |
-| `MOF_MARKET_TOOL_ONLY_SOURCES` | `private_history` | Source codes (comma-separated, the registry's format) whose rows `datasets_read_asof` / `datasets_export_csv` never serve, whatever `MOF_MARKET_RESTRICTED_ALLOW`: they reach an allowed client only through `market_prices`, keyed by `instrument_id`. A value holding no code (`,`) is refused. |
+| `MOF_MARKET_TOOL_ONLY_SOURCES` | `private_history,manual` | Source codes (comma-separated, the registry's format) whose rows `datasets_read_asof` / `datasets_export_csv` never serve, whatever `MOF_MARKET_RESTRICTED_ALLOW`: they reach an allowed client only through `market_prices`, keyed by `instrument_id`. A value **replaces** the default: list every source to keep (`tiingo` alone re-opens `private_history` and `manual` to allowed clients). Each code must be a source of the installed registry (needs the `[market]` extra): an unknown code (a typo) refuses to start. A value holding no code (`,`) is refused. |
+| `MOF_MARKET_PRECEDENCE` | `private_history,massive,tiingo` | The order in which `market_prices` takes a session's price from the store when several sources the client may read have one: the first with a row wins per instrument and session, so one series spans the private history, then a daily provider. Codes the client may not read are dropped from the order (never passed); readable sources the list leaves out come after it, alphabetically. `source=` in a call still reads one source only. A value **replaces** the default; each code must be a source of the installed registry (an unknown code refuses to start). |
 | `MOF_MARKET_LIVE_CONCURRENCY` | `1` | Live market-data fetches running at once (1-16); one more is `[market_busy]`, never queued. A timed-out fetch keeps its slot until its thread ends. |
 | `MOF_MARKET_MAX_INSTRUMENTS` | `10` | Instruments per `market_prices` call (1-100); more is refused. |
 | `MOF_MARKET_MAX_ROWS` | `5000` | Rows per `market_prices` result (1-1000000); more is refused, never cut (`MOF_MCP_MAX_RESULT_CHARS` applies too). |

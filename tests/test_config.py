@@ -1,4 +1,5 @@
 import os
+import sys
 
 import pytest
 
@@ -616,15 +617,59 @@ def test_no_restricted_clients_are_guarded_case_insensitively(monkeypatch):
                            "MOF_MARKET_NO_RESTRICTED_CLIENTS": "NOTEBOOK"})
 
 
-def test_tool_only_sources():
-    assert Settings.from_env({}).market_tool_only_sources == ("private_history",)
-    assert Settings().market_tool_only_sources == ("private_history",)
+#: every code of the synthetic registry: the restricted ones and two open ones
+ALL_CODES = REGISTRY | {"manual", "openfigi", "sec"}
+
+
+@pytest.fixture
+def codes(monkeypatch):
+    from myopenfund_mcp import auth
+
+    monkeypatch.setattr(auth, "registered_sources", lambda variable: ALL_CODES)
+
+
+def test_tool_only_sources(codes):
+    assert Settings.from_env({}).market_tool_only_sources == ("private_history", "manual")
+    assert Settings().market_tool_only_sources == ("private_history", "manual")
     s = Settings.from_env({"MOF_MARKET_TOOL_ONLY_SOURCES": " private_history , tiingo,tiingo"})
-    assert s.market_tool_only_sources == ("private_history", "tiingo")
-    for bad, where in (("private_history,Tiingo", "entry 2"), ("x y", "entry 1"), (",", "holds no source")):
+    assert s.market_tool_only_sources == ("private_history", "tiingo")  # replaces the default
+    for bad, where in (("private_history,Tiingo", "entry 2"), ("x y", "entry 1"), (",", "holds no source"),
+                       ("private_history,tiingoo", "entry 2: .*not a source of the registry")):
         with pytest.raises(ConfigError, match=rf"^MOF_MARKET_TOOL_ONLY_SOURCES.*{where}") as err:
             Settings.from_env({"MOF_MARKET_TOOL_ONLY_SOURCES": bad})
-        assert "Tiingo" not in str(err.value)
+        assert "Tiingo" not in str(err.value) and "tiingoo" not in str(err.value)
+
+
+def test_precedence(codes):
+    assert Settings.from_env({}).market_precedence == ("private_history", "massive", "tiingo")
+    assert Settings().market_precedence == ("private_history", "massive", "tiingo")
+    s = Settings.from_env({"MOF_MARKET_PRECEDENCE": " tiingo, manual ,tiingo"})
+    assert s.market_precedence == ("tiingo", "manual")  # replaces the default
+    for bad, where in (("tiingo,Massive", "entry 2"), (",", "holds no source"),
+                       ("tiingo,unknown_feed", "entry 2: .*not a source of the registry")):
+        with pytest.raises(ConfigError, match=rf"^MOF_MARKET_PRECEDENCE.*{where}") as err:
+            Settings.from_env({"MOF_MARKET_PRECEDENCE": bad})
+        assert "unknown_feed" not in str(err.value) and "Massive" not in str(err.value)
+
+
+def test_source_lists_need_the_registry_only_when_set(monkeypatch):
+    from myopenfund_mcp import auth
+
+    def boom(variable):
+        raise AssertionError("the registry must not be read for the defaults")
+
+    monkeypatch.setattr(auth, "registered_sources", boom)
+    Settings.from_env({})
+
+
+def test_settings_without_market_variables_import_no_auth_module():
+    """Settings.from_env without a market variable imports nothing new (auth imports fastmcp)."""
+    import subprocess
+
+    code = ("import sys; from myopenfund_mcp.config import Settings; Settings.from_env({}); "
+            "print('myopenfund_mcp.auth' in sys.modules, 'fastmcp' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.split() == ["False", "False"]
 
 
 def test_live_concurrency():

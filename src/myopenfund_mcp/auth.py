@@ -135,31 +135,55 @@ def caller_tier(token: AccessToken | None, *, auth_enabled: bool) -> str:
     return "act" if "act" in token.scopes else "read"
 
 
-def registered_restricted_sources() -> frozenset[str]:
+def _registry_module(variable: str):
+    """open_data_store.sources (>= 0.2.0), else a ConfigError naming `variable` and the [market] extra. Any
+    other ImportError (a broken install) propagates with its cause."""
+    try:
+        import open_data_store.sources  # the dotted import: a missing submodule names itself
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("open_data_store"):
+            raise
+        sources = None
+    else:
+        sources = open_data_store.sources
+    if sources is None or not hasattr(sources, "restricted_codes"):
+        raise ConfigError(f"{variable} needs the [market] extra: the source registry of open-data-store "
+                          ">= 0.2.0 is not installed")
+    return sources
+
+
+def _read_registry(variable: str, read):
+    try:
+        return read()
+    except Exception as exc:  # noqa: BLE001 -- a plugin's own text may name private paths or symbols
+        raise ConfigError(f"{variable}: the source registry could not be read ({type(exc).__name__}); check "
+                          "the installed source plugins (open_data_store.sources entry points)") from None
+
+
+def registered_restricted_sources(variable: str = _ALLOW) -> frozenset[str]:
     """The `restricted` source codes of the installed open-data-store source registry (its entry points:
-    market-data declares massive, tiingo, private_history). Read only when MOF_MARKET_RESTRICTED_ALLOW is
-    set or the market toolset is mounted, so a deployment without the market feature never imports it.
+    market-data declares massive, tiingo, private_history, manual). Read only when a market variable that
+    names sources is set or the market toolset is mounted, so a deployment without the market feature never
+    imports it. Errors name `variable` (the setting that needed the registry).
 
     ConfigError when open-data-store >= 0.2.0 is missing, when the registry cannot be read (a broken plugin
     entry point, a source declared twice: the class only, never the plugin's text) and when it declares no
     restricted source (market-data, which declares them, is not installed). Any other ImportError (a broken
     install) propagates with its cause."""
-    try:
-        from open_data_store.sources import restricted_codes
-    except ModuleNotFoundError as exc:
-        if not (exc.name or "").startswith("open_data_store"):
-            raise
-        raise ConfigError(f"{_ALLOW} needs the [market] extra: the source registry of open-data-store "
-                          ">= 0.2.0 is not installed") from None
-    try:
-        codes = restricted_codes()
-    except Exception as exc:  # noqa: BLE001 -- a plugin's own text may name private paths or symbols
-        raise ConfigError(f"{_ALLOW}: the source registry could not be read ({type(exc).__name__}); check "
-                          "the installed source plugins (open_data_store.sources entry points)") from None
+    sources = _registry_module(variable)
+    codes = _read_registry(variable, lambda: sources.restricted_codes())
     if not codes:
-        raise ConfigError(f"{_ALLOW}: the source registry declares no restricted source: install the [market] "
+        raise ConfigError(f"{variable}: the source registry declares no restricted source: install the [market] "
                           "extra (market-data declares them)")
     return frozenset(codes)
+
+
+def registered_sources(variable: str) -> frozenset[str]:
+    """Every source code of the installed registry, open and restricted: what a list of source codes in
+    `variable` may name (a typo is refused, never ignored). The same ConfigErrors as
+    `registered_restricted_sources`."""
+    sources = _registry_module(variable)
+    return frozenset(_read_registry(variable, lambda: sources.discover_sources()))
 
 
 def parse_restricted_allow(spec: str, client_ids: frozenset[str], restricted: frozenset[str],

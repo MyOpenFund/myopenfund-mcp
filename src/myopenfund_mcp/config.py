@@ -179,11 +179,10 @@ NO_RESTRICTED_CLIENTS = ("agents",)
 def _no_restricted_clients(env: Mapping[str, str]) -> tuple[str, ...]:
     """MOF_MARKET_NO_RESTRICTED_CLIENTS: client ids, comma-separated, without duplicates, in order. An id is
     never echoed (a token pasted here must not reach a log): errors name the entry by position."""
-    from . import auth  # auth imports this module
-
     raw = _get(env, "MOF_MARKET_NO_RESTRICTED_CLIENTS")
     if raw is None:
         return NO_RESTRICTED_CLIENTS
+    from . import auth  # auth imports this module (and fastmcp): only when the variable is set
     ids = [item.strip() for item in raw.split(",") if item.strip()]
     if not ids:  # "," would otherwise disable the guard silently
         raise ConfigError("MOF_MARKET_NO_RESTRICTED_CLIENTS is set but holds no client id: give at least one "
@@ -196,26 +195,38 @@ def _no_restricted_clients(env: Mapping[str, str]) -> tuple[str, ...]:
 
 
 #: Default MOF_MARKET_TOOL_ONLY_SOURCES: sources whose rows only market_prices serves (instrument_id only):
-#: the private export's rows hold private tokens and labels (market-data spec §9.3, §13).
-TOOL_ONLY_SOURCES = ("private_history",)
+#: the private export's rows hold private tokens and labels, manual rows an operator's own symbols
+#: (market-data spec §9.3, §13).
+TOOL_ONLY_SOURCES = ("private_history", "manual")
+#: Default MOF_MARKET_PRECEDENCE: the order in which market_prices takes a session's price when several
+#: sources a client may read have one (the private history, then the daily providers: market-data spec §9).
+MARKET_PRECEDENCE = ("private_history", "massive", "tiingo")
 _SOURCE_CODE = re.compile(r"[a-z][a-z0-9_]{0,62}")  # open-data-store's source-code rule, written out
 
 
-def _tool_only_sources(env: Mapping[str, str]) -> tuple[str, ...]:
-    """MOF_MARKET_TOOL_ONLY_SOURCES: source codes, comma-separated, without duplicates, in order; each in the
-    registry's code format. Errors name the entry by position."""
-    name = "MOF_MARKET_TOOL_ONLY_SOURCES"
+def _source_codes(env: Mapping[str, str], name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """A list of source codes: comma-separated, without duplicates, in order. A set value REPLACES the
+    default; each code must be in the registry's code format and a source of the installed registry (a typo
+    is refused, never ignored: that needs the [market] extra). Unset = the default, without importing the
+    registry. Errors name the entry by position."""
     raw = _get(env, name)
     if raw is None:
-        return TOOL_ONLY_SOURCES
+        return default
     codes = [item.strip() for item in raw.split(",") if item.strip()]
     if not codes:
         raise ConfigError(f"{name} is set but holds no source code (an empty value keeps the default, "
-                          "private_history)")
+                          f"{','.join(default)})")
     for position, code in enumerate(codes, start=1):
         if not _SOURCE_CODE.fullmatch(code):
             raise ConfigError(f"{name} entry {position}: a source code is 1-63 characters of a-z 0-9 _, "
                               "starting with a letter")
+    from . import auth  # auth imports this module
+
+    known = auth.registered_sources(name)
+    for position, code in enumerate(codes, start=1):
+        if code not in known:
+            raise ConfigError(f"{name} entry {position}: not a source of the registry (the installed source "
+                              "plugins)")
     return tuple(dict.fromkeys(codes))
 
 
@@ -393,6 +404,8 @@ class Settings:
     market_live_concurrency: int = 1
     # MOF_MARKET_TOOL_ONLY_SOURCES: sources whose rows the dataset tools never serve, whatever the allow-list
     market_tool_only_sources: tuple[str, ...] = field(default=TOOL_ONLY_SOURCES, repr=False)
+    # MOF_MARKET_PRECEDENCE: the first of these sources with a price wins a session (market_prices, store)
+    market_precedence: tuple[str, ...] = field(default=MARKET_PRECEDENCE, repr=False)
 
     def __post_init__(self) -> None:
         allow = self.market_restricted_allow
@@ -494,7 +507,8 @@ class Settings:
             market_max_rows=_int(env, "MOF_MARKET_MAX_ROWS", 5000, maximum=1_000_000),
             market_live_timeout_s=_int(env, "MOF_MARKET_LIVE_TIMEOUT_S", 60, maximum=3600),
             market_live_concurrency=_int(env, "MOF_MARKET_LIVE_CONCURRENCY", 1, maximum=16),
-            market_tool_only_sources=_tool_only_sources(env),
+            market_tool_only_sources=_source_codes(env, "MOF_MARKET_TOOL_ONLY_SOURCES", TOOL_ONLY_SOURCES),
+            market_precedence=_source_codes(env, "MOF_MARKET_PRECEDENCE", MARKET_PRECEDENCE),
         )
         if settings.market_source not in MARKET_SOURCES:
             raise ConfigError(f"MOF_MARKET_SOURCE must be one of {', '.join(MARKET_SOURCES)}, "
