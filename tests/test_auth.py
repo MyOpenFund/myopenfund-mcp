@@ -6,12 +6,14 @@ from fastmcp.tools import Tool
 
 from myopenfund_mcp.auth import (
     HashedTokenVerifier,
+    allowed_restricted_for,
     caller_tier,
     hash_token,
+    live_restricted_for,
     parse_tokens,
     tier_check,
 )
-from myopenfund_mcp.config import ConfigError
+from myopenfund_mcp.config import ConfigError, Settings
 
 D1, D2 = hash_token("secret-1"), hash_token("secret-2")
 
@@ -130,3 +132,32 @@ def test_caller_tier():
     assert caller_tier(None, auth_enabled=True) == "none"
     assert caller_tier(_tok(["read"]), auth_enabled=True) == "read"
     assert caller_tier(_tok(["read", "act"]), auth_enabled=True) == "act"
+
+
+# --- Restricted market sources: stored rows vs the caller's own live fetches ---------------------------
+RESTRICTED = frozenset({"massive", "tiingo", "private_history"})
+
+
+def _http(allow: dict[str, frozenset[str]]) -> Settings:
+    return Settings(transport="http", tokens="set", market_restricted_allow=allow)
+
+
+def test_agents_token_gets_no_restricted():
+    s = _http({"notebook": frozenset({"massive", "tiingo"})})
+    assert allowed_restricted_for("agents", s) == frozenset()
+    assert live_restricted_for("agents", s, RESTRICTED) == frozenset()
+    assert allowed_restricted_for("notebook", s) == frozenset({"massive", "tiingo"})
+
+
+def test_stored_rows_are_denied_by_default_on_every_channel():
+    assert allowed_restricted_for("notebook", _http({})) == frozenset()
+    assert allowed_restricted_for(None, _http({})) == frozenset()
+    assert allowed_restricted_for(None, Settings()) == frozenset()  # stdio: same rule as HTTP
+
+
+def test_live_fetches_over_stdio_are_the_callers_own_data():
+    assert live_restricted_for(None, Settings(), RESTRICTED) == RESTRICTED
+    # Over HTTP a live fetch uses the deployment's key: serving it is redistribution, same list as stored rows.
+    s = _http({"notebook": frozenset({"tiingo"})})
+    assert live_restricted_for("notebook", s, RESTRICTED) == frozenset({"tiingo"})
+    assert live_restricted_for(None, s, RESTRICTED) == frozenset()

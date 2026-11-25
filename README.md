@@ -979,6 +979,8 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_FILINGS_DEFAULT_FORMS` | `10-K` | Comma-separated form types fetched when the caller names none. |
 | `MOF_CHUNK_MAX_TOKENS` | `480` | Largest passage of the local filings index, in tokens (16-8192). |
 | `MOF_CHUNK_OVERLAP_TOKENS` | `32` | Tokens shared by neighbouring passages (0-2048, below `MOF_CHUNK_MAX_TOKENS`). |
+| `MOF_MARKET_SOURCE` | `auto` | Where market prices are read: `auto` (the store when it holds the rows, else a live fetch with the caller's own key), `store` or `live`. |
+| `MOF_MARKET_RESTRICTED_ALLOW` | unset | `client:source\|source,...`: the restricted sources (licences that forbid sharing, e.g. `massive`, `tiingo`, `private_history`) whose stored rows each client of `MOF_MCP_TOKENS` may read. Unset = none, for every client and over stdio; never list the agents' client. Each source must be a restricted code of the installed source registry (needs the `[market]` extra). A live fetch over stdio uses your own key and is your own data: not gated. Errors name the entry by position only. |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the

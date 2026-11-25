@@ -26,6 +26,9 @@ Q4_RULES = ("ytd9", "sum_of_quarters")
 RAG_DATE_FILTER_MODES = ("auto", "interval", "legacy")
 COMPANIES_SOURCES = ("auto", "store", "sec")  # MOF_COMPANIES_SOURCE: auto = the store when configured, else SEC
 CACHE_MODES = ("on", "off")  # MOF_CACHE
+# MOF_MARKET_SOURCE: where market_prices reads (MCP chantier 3 Q9): auto = the store when it holds the rows,
+# else a live fetch with the caller's own key | store | live
+MARKET_SOURCES = ("auto", "store", "live")
 # rag-engine's ONNX execution providers (OnnxEmbedder `provider`); written out, like the modes above.
 ONNX_PROVIDERS = ("cpu", "coreml")
 #: Largest MOF_SEC_MAX_RPS: SEC's fair-access limit is 10 requests per second.
@@ -166,6 +169,22 @@ def _check_rag_host(host: str) -> None:
     if _HOST.fullmatch(host) is None:
         raise ConfigError(f"{name} must be a host name or an address, without scheme, port or path "
                           "(the port is MOF_RAG_QDRANT_PORT, TLS is MOF_RAG_QDRANT_HTTPS)")
+
+
+def _restricted_allow(env: Mapping[str, str]) -> dict[str, frozenset[str]]:
+    """MOF_MARKET_RESTRICTED_ALLOW, checked against the clients of MOF_MCP_TOKENS and the restricted codes
+    of the source registry. Unset = {} without importing the [market] extra."""
+    spec = _get(env, "MOF_MARKET_RESTRICTED_ALLOW")
+    if spec is None:
+        return {}
+    from . import auth  # auth imports this module
+
+    tokens = _get(env, "MOF_MCP_TOKENS")
+    if tokens is None:
+        raise ConfigError("MOF_MARKET_RESTRICTED_ALLOW names clients of MOF_MCP_TOKENS, which is not set: "
+                          "without tokens no client can be given restricted sources")
+    client_ids = frozenset(e.client_id for e in auth.parse_tokens(tokens))
+    return auth.parse_restricted_allow(spec, client_ids, auth.registered_restricted_sources())
 
 
 @dataclass(frozen=True)
@@ -309,6 +328,10 @@ class Settings:
     filings_default_forms: tuple[str, ...] = ("10-K",)
     chunk_max_tokens: int = 480  # MOF_CHUNK_MAX_TOKENS: largest passage, in tokens
     chunk_overlap_tokens: int = 32  # MOF_CHUNK_OVERLAP_TOKENS: tokens shared by neighbouring passages
+    market_source: str = "auto"  # MOF_MARKET_SOURCE: auto | store | live
+    # MOF_MARKET_RESTRICTED_ALLOW: client:src1|src2,... restricted sources whose stored rows each client of
+    # MOF_MCP_TOKENS may read (auth.allowed_restricted_for); default none; kept out of repr
+    market_restricted_allow: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
 
     def cache_path(self) -> str:
         """The cache folder: MOF_CACHE_DIR, or the platform default (ConfigError when there is none)."""
@@ -396,7 +419,12 @@ class Settings:
             filings_default_forms=_forms(_get(env, "MOF_FILINGS_DEFAULT_FORMS") or "10-K"),
             chunk_max_tokens=_int(env, "MOF_CHUNK_MAX_TOKENS", 480, minimum=16, maximum=8192),
             chunk_overlap_tokens=_int(env, "MOF_CHUNK_OVERLAP_TOKENS", 32, minimum=0, maximum=2048),
+            market_source=_get(env, "MOF_MARKET_SOURCE") or "auto",
+            market_restricted_allow=_restricted_allow(env),
         )
+        if settings.market_source not in MARKET_SOURCES:
+            raise ConfigError(f"MOF_MARKET_SOURCE must be one of {', '.join(MARKET_SOURCES)}, "
+                              f"got {settings.market_source!r}")
         if settings.companies_source not in COMPANIES_SOURCES:
             raise ConfigError(f"MOF_COMPANIES_SOURCE must be one of {', '.join(COMPANIES_SOURCES)}, "
                               f"got {settings.companies_source!r}")

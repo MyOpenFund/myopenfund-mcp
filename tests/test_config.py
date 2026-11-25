@@ -418,3 +418,108 @@ def test_source_sec_with_a_catalogue_set_still_needs_the_contact():
     with pytest.raises(ConfigError, match="MOF_SEC_CONTACT"):
         Settings.from_env({"MOF_COMPANIES_SOURCE": "sec", "MOF_COMPANIES_CATALOG": "postgres:x",
                            "MOF_COMPANIES_DATA_ROOT": "/d"})
+
+
+# --- Market data (MOF_MARKET_*) ----------------------------------------------------------------------
+# Synthetic registry: the restricted codes the open-data-store source registry would report.
+REGISTRY = frozenset({"massive", "tiingo", "private_history"})
+_D1, _D2, _D3 = "1" * 64, "2" * 64, "3" * 64
+TOKENS = f"notebook:{_D1}:read,agents:{_D2}:read,ops:{_D3}"
+
+
+@pytest.fixture
+def registry(monkeypatch):
+    from myopenfund_mcp import auth
+
+    monkeypatch.setattr(auth, "registered_restricted_sources", lambda: REGISTRY)
+
+
+def _market(allow: str) -> dict:
+    return {"MOF_MCP_TOKENS": TOKENS, "MOF_MARKET_RESTRICTED_ALLOW": allow}
+
+
+def test_market_defaults_need_no_market_extra(monkeypatch):
+    from myopenfund_mcp import auth
+
+    def boom():
+        raise AssertionError("the registry must not be read when MOF_MARKET_RESTRICTED_ALLOW is unset")
+
+    monkeypatch.setattr(auth, "registered_restricted_sources", boom)
+    s = Settings.from_env({})
+    assert s.market_source == "auto" and s.market_restricted_allow == {}
+    assert Settings.from_env({"MOF_MCP_TOKENS": TOKENS, "MOF_MARKET_RESTRICTED_ALLOW": " "}).market_restricted_allow == {}
+
+
+@pytest.mark.parametrize("source", ["auto", "store", "live"])
+def test_market_source_vocabulary(source):
+    assert Settings.from_env({"MOF_MARKET_SOURCE": source}).market_source == source
+
+
+@pytest.mark.parametrize("source", ["sec", "LIVE", "both"])
+def test_market_source_off_the_vocabulary_is_refused(source):
+    with pytest.raises(ConfigError, match="MOF_MARKET_SOURCE must be one of auto, store, live"):
+        Settings.from_env({"MOF_MARKET_SOURCE": source})
+
+
+def test_restricted_allow_is_parsed_per_client(registry):
+    s = Settings.from_env(_market(" notebook : massive | tiingo , ops:private_history|massive|massive "))
+    assert s.market_restricted_allow == {
+        "notebook": frozenset({"massive", "tiingo"}),
+        "ops": frozenset({"private_history", "massive"}),
+    }
+    assert "private_history" not in repr(s)
+
+
+def test_restricted_allow_without_tokens_is_refused(registry):
+    with pytest.raises(ConfigError, match="MOF_MARKET_RESTRICTED_ALLOW .*MOF_MCP_TOKENS"):
+        Settings.from_env({"MOF_MARKET_RESTRICTED_ALLOW": "notebook:massive"})
+
+
+def test_restricted_allow_without_the_registry_names_the_market_extra(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_registry(name, *args, **kwargs):
+        if name.startswith("open_data_store"):
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_registry)
+    with pytest.raises(ConfigError, match=r"\[market\] extra"):
+        Settings.from_env(_market("notebook:massive"))
+
+
+@pytest.mark.parametrize(
+    "allow,why",
+    [
+        ("notebook", "expected client:source"),
+        ("notebook:massive:tiingo", "expected client:source"),
+        ("stranger:massive", "not a client of MOF_MCP_TOKENS"),
+        ("Notebook:massive", "not a client of MOF_MCP_TOKENS"),
+        ("notebook:", "at least one source"),
+        ("notebook:massive||tiingo", "source code"),
+        ("notebook:Massive", "source code"),
+        ("notebook:openfigi", "not a restricted source"),
+        ("notebook:massive,notebook:tiingo", "already given"),
+        (",,", "holds no entry"),
+    ],
+)
+def test_restricted_allow_errors_name_the_entry_by_position(registry, allow, why):
+    with pytest.raises(ConfigError, match=why):
+        Settings.from_env(_market(allow))
+
+
+def test_config_error_never_echoes_entry(registry):
+    # A clear token pasted in the client field, a private symbol pasted as a source: neither is echoed.
+    token = "Zx9-q_secret-token-value-0123456789abcdefghijklm"
+    for allow in (f"{token}:massive", f"notebook:{token}", f"notebook:massive|{token}",
+                  "notebook:massive,ops:priv_symbol_xyz", f"notebook:massive,{token}"):
+        with pytest.raises(ConfigError) as err:
+            Settings.from_env(_market(allow))
+        message = str(err.value)
+        assert "MOF_MARKET_RESTRICTED_ALLOW" in message
+        for leaked in (token, "priv_symbol_xyz", "notebook", "ops"):
+            assert leaked not in message
+    with pytest.raises(ConfigError, match="entry 2") as err:
+        Settings.from_env(_market("notebook:massive,ops:priv_symbol_xyz"))

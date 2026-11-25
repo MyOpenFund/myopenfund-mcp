@@ -15,6 +15,13 @@ of the allow-listed alphabet given in the client field would pass for one): they
 the entry by position only.
 
 Over stdio there is no token: the local user owns the process and gets every tier.
+
+Restricted market sources (market-data spec §13) are two notions, never one set:
+- STORED restricted rows a deployment serves: `allowed_restricted_for`, the client's entry of
+  MOF_MARKET_RESTRICTED_ALLOW, empty by default and always empty without a client id (stdio included).
+- LIVE fetches: `live_restricted_for`. Over stdio the fetch uses the caller's own key and returns to that
+  caller: their own data, every restricted source. Over HTTP it would use the deployment's key, so serving
+  it is redistribution: the client's list again.
 """
 from __future__ import annotations
 
@@ -22,15 +29,23 @@ import hashlib
 import hmac
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from fastmcp.server.auth import AccessToken, AuthContext, TokenVerifier
 
 from .config import ConfigError
 
+if TYPE_CHECKING:
+    from .config import Settings
+
 TIERS = ("read", "act")
 SCOPES = {"read": ["read"], "act": ["read", "act"]}
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+# open-data-store's source-code rule (open_data_store.sources.SOURCE_CODE_PATTERN), written out: this
+# module never imports the [market] extra unless MOF_MARKET_RESTRICTED_ALLOW is set.
+_SOURCE_CODE = re.compile(r"[a-z][a-z0-9_]{0,62}")
+_ALLOW = "MOF_MARKET_RESTRICTED_ALLOW"
 
 
 @dataclass(frozen=True)
@@ -116,3 +131,64 @@ def caller_tier(token: AccessToken | None, *, auth_enabled: bool) -> str:
     if token is None:
         return "none"
     return "act" if "act" in token.scopes else "read"
+
+
+def registered_restricted_sources() -> frozenset[str]:
+    """The `restricted` source codes of the installed open-data-store source registry (its entry points:
+    market-data declares massive, tiingo, private_history). Read only when MOF_MARKET_RESTRICTED_ALLOW is
+    set, so a deployment without the market feature never imports it."""
+    try:
+        from open_data_store.sources import restricted_codes
+    except ImportError:
+        raise ConfigError(f"{_ALLOW} needs the [market] extra: the source registry of open-data-store "
+                          ">= 0.2.0 is not installed") from None
+    return restricted_codes()
+
+
+def parse_restricted_allow(spec: str, client_ids: frozenset[str],
+                           restricted: frozenset[str]) -> dict[str, frozenset[str]]:
+    """Entries of MOF_MARKET_RESTRICTED_ALLOW, `client:src1|src2,client2:src3`. Each client must be one of
+    MOF_MCP_TOKENS (`client_ids`), each source a `restricted` code of the registry (`restricted`): opening
+    an open source means nothing, and a typo must not pass silently. Errors name the entry by position,
+    never by content (a token or a private symbol may sit in it)."""
+    allow: dict[str, frozenset[str]] = {}
+    items = [item.strip() for item in spec.split(",") if item.strip()]
+    for position, item in enumerate(items, start=1):
+        parts = [p.strip() for p in item.split(":")]
+        if len(parts) != 2:
+            raise ConfigError(f"{_ALLOW} entry {position}: expected client:source[|source...]")
+        client, sources = parts[0], [s.strip() for s in parts[1].split("|")]
+        if client not in client_ids:
+            raise ConfigError(f"{_ALLOW} entry {position}: the client is not a client of MOF_MCP_TOKENS")
+        if client in allow:
+            raise ConfigError(f"{_ALLOW} entry {position}: client already given to an earlier entry")
+        if sources == [""]:
+            raise ConfigError(f"{_ALLOW} entry {position}: give at least one source")
+        if not all(_SOURCE_CODE.fullmatch(s) for s in sources):
+            raise ConfigError(f"{_ALLOW} entry {position}: a source code must be 1-63 characters of a-z 0-9 _, "
+                              "starting with a letter, separated by |")
+        if not set(sources) <= restricted:
+            raise ConfigError(f"{_ALLOW} entry {position}: a source is not a restricted source of the registry")
+        allow[client] = frozenset(sources)
+    if not allow:
+        raise ConfigError(f"{_ALLOW} is set but holds no entry")
+    return allow
+
+
+def allowed_restricted_for(client_id: str | None, settings: Settings) -> frozenset[str]:
+    """Restricted sources whose STORED rows may be served to this caller: its entry of
+    MOF_MARKET_RESTRICTED_ALLOW, empty by default. No client id (stdio) gets none: the store's restricted
+    rows are not the caller's own data. The agents' token is never given an entry (spec §13)."""
+    if client_id is None:
+        return frozenset()
+    return settings.market_restricted_allow.get(client_id, frozenset())
+
+
+def live_restricted_for(client_id: str | None, settings: Settings,
+                        restricted: frozenset[str]) -> frozenset[str]:
+    """Restricted sources this caller may fetch LIVE. Over stdio (no token) the fetch uses the caller's own
+    key and returns to that caller: every one of `restricted` (the registry's restricted codes). Over HTTP
+    the key is the deployment's, so serving the fetch is redistribution: `allowed_restricted_for`."""
+    if settings.transport == "stdio" and client_id is None:
+        return frozenset(restricted)
+    return allowed_restricted_for(client_id, settings)
