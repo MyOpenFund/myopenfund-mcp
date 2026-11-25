@@ -73,21 +73,6 @@ To try the latest `main` before a release (the dependencies still come from PyPI
 pip install "myopenfund-mcp @ git+https://github.com/MyOpenFund/myopenfund-mcp"
 ```
 
-**Working across repos**
-
-Clone the repos side by side and install a sibling editable over the PyPI version in this environment:
-`pip install -e ../vault/query` (or `../open-data-store`, `../company-corpus`, `../rag-engine`). A change here
-that needs an unreleased sibling version waits for that sibling's release before its PR merges.
-
-**How to release**
-
-Bump `__version__` in `src/myopenfund_mcp/__init__.py` in a PR. After it merges, go to Actions, then release, then Run workflow: pick the `main` branch and target `pypi`. Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `v<version>` and the GitHub Release itself.
-It fails before publishing if it is not run on the default branch or if that tag already exists. Target `testpypi` is a rehearsal: it publishes to TestPyPI and creates no tag and no release.
-Pushing a tag `v<version>` by hand still works: the workflow checks that the tag equals the package version and is on the default branch, then publishes and attaches the files to the Release.
-If PyPI got the package but the tag or the Release is missing, re-run the failed `github-release` job from Actions; do not push the tag by hand (the re-run would fail at the PyPI upload).
-
-From a checkout (development): `pip install -e ".[vault,companies,rag,dev]"`.
-
 Register it with your MCP client. With Claude Code:
 
 ```bash
@@ -159,11 +144,11 @@ the ones the CI tested:
   `pyproject.toml` below their next breaking release (`>=0.1.0,<0.2`) and pinned to one exact version in
   `constraints.txt`.
 
-The `install` service passes both files of the release's commit as URLs and pins the package itself:
+The `install` service passes both files of the release's tag as URLs and pins the package itself (the constraints files of the release's tag `v<version>`):
 
 ```
-pip install -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/constraints.txt \
-  --build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/build-constraints.txt \
+pip install -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/v<version>/constraints.txt \
+  --build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/v<version>/build-constraints.txt \
   'myopenfund-mcp[...]==<version>'
 ```
 
@@ -294,7 +279,7 @@ into a volume at each start of the stack.
    read by one scroll of the collection, in the background (up to 100,000 points; beyond that, filter
    values are no longer checked).
 
-   At this commit the engine also creates the datetime indexes on `date_start` and `date_end` (payload
+   The engine (`myopenfund-rag-engine` 0.1) also creates the datetime indexes on `date_start` and `date_end` (payload
    schema version 2). Once they exist, `auto` mode applies date bounds to the intervals (within
    `MOF_RAG_DATE_FILTER_REFRESH_S` seconds, without a restart of the MCP). That is safe before the payloads
    carry their intervals (a point without one is still found by its `date`), but a month or a year
@@ -375,9 +360,9 @@ into a volume at each start of the stack.
    `tests/integration/test_real_qdrant.py` creates and deletes collections: it is for a throwaway Qdrant
    only (see [Development](https://github.com/MyOpenFund/myopenfund-mcp#development)).
 
-**Redeploying a new version** (such as the one that raised the rag-engine pin to `6be21ac` and added the date
+**Redeploying a new version** (such as the one that moved to `myopenfund-rag-engine` 0.1 and added the date
 settings): the same steps, from step 3. Rebuild the image, or point the `install` service at the new
-`<version>` and `<commit>`; restart; check as in step 7. No new volume, no new variable to set (the date settings have
+`<version>` (and the constraints URLs of its tag `v<version>`); restart; check as in step 7. No new volume, no new variable to set (the date settings have
 defaults), and the model cache is kept: the pinned model revision did not change. Step 2 is not needed
 again for the server: the indexes the new version uses are created by the orchestrator's `sync-metadata`,
 and until they exist date bounds behave as before.
@@ -434,7 +419,7 @@ must then be installed, or the server refuses to start (`MOF_VAULT_DATABASE_URL 
 extra is not installed`). Timestamps in results are UTC: the server's database session runs with
 `timezone=UTC`, whatever the database or role default.
 
-**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0, pinned at 0.6.0 `d3c4497`, which takes `until` on run reads and breaks search sort ties by `doc_id, corpus`: documents
+**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0; this server needs `myopenfund-vault-query` `>=0.1.0,<0.2`, the former 0.6.0, which takes `until` on run reads and breaks search sort ties by `doc_id, corpus`: documents
 keyed `(corpus, doc_id)`, columns `date_precision` / `date_kind` / `entity_scheme` / `entity_value`, table
 `vocabulary`; `runs_sources.bad_content`). Deploy the vault (and run its ingestion, which applies the
 schema) before this server. Against an older schema, a tool that reads a missing column or table answers
@@ -869,6 +854,19 @@ python -m venv .venv
 .venv/bin/ruff check .
 .venv/bin/python -m pytest -q
 ```
+
+**Working across repos**
+
+Clone the repos side by side and install a sibling editable over the PyPI version in this environment:
+`pip install -e ../vault/query` (or `../open-data-store`, `../company-corpus`, `../rag-engine`). A change here
+that needs an unreleased sibling version waits for that sibling's release before its PR merges.
+
+**How to release**
+
+Bump `__version__` in `src/myopenfund_mcp/__init__.py` in a PR. After it merges, go to Actions, then release, then Run workflow: pick the `main` branch and target `pypi`. Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `v<version>` and the GitHub Release itself.
+It fails before publishing if it is not run on the default branch or if that tag already exists. Target `testpypi` is a rehearsal: it publishes to TestPyPI and creates no tag and no release.
+Pushing a tag `v<version>` by hand still works: the workflow checks that the tag equals the package version and is on the default branch, then publishes and attaches the files to the Release.
+If PyPI got the package but the tag or the Release is missing, re-run the failed `github-release` job from Actions; do not push the tag by hand (the re-run would fail at the PyPI upload).
 
 The default test run needs no database, network or model. Opt-in suites are excluded by default and run
 with an explicit marker:

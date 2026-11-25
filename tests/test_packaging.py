@@ -53,7 +53,7 @@ def test_dynamic_version_from_init():
     assert "version" in cfg["project"]["dynamic"]
     assert "version" not in cfg["project"]
     assert cfg["tool"]["hatch"]["version"] == {"path": "src/myopenfund_mcp/__init__.py"}
-    assert myopenfund_mcp.__version__ == "0.1.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", myopenfund_mcp.__version__)
 
 
 def test_installed_version_matches_init():

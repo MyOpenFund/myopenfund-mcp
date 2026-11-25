@@ -40,7 +40,7 @@ def test_compose_variant_uses_the_same_image():
 
 def test_image_and_install_line_use_the_constraints():
     assert "-c constraints.txt" in DOCKERFILE and "COPY pyproject.toml README.md LICENSE constraints.txt" in DOCKERFILE
-    assert "-c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/constraints.txt" in COMPOSE
+    assert "-c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/v<version>/constraints.txt" in COMPOSE
 
 
 def test_constraints_are_exact_pins_without_urls():
@@ -53,9 +53,6 @@ def test_constraints_are_exact_pins_without_urls():
     assert "myopenfund-mcp" not in names
     # the old, unprefixed names are not the published distributions
     assert not {"vault-query", "open-data-store", "company-corpus", "rag-engine"} & set(names)
-
-
-GIT_URL = re.compile(r"git\+|@\s*https?://|\.git\b")
 
 
 def test_no_git_urls_anywhere():
@@ -126,7 +123,7 @@ def test_build_backends_are_pinned_and_used():
     assert all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*==\S+", line) for line in lines)
     assert "hatchling" in names  # this package's only build backend
     assert "--build-constraint build-constraints.txt" in DOCKERFILE and "build-constraints.txt ./" in DOCKERFILE
-    assert ("--build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/"
+    assert ("--build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/v<version>/"
             "build-constraints.txt") in COMPOSE
 
 
@@ -145,7 +142,7 @@ def test_build_constraints_cover_build_requires():
     """The backends of this package's `[build-system] requires` (plus `editables`, which hatchling asks
     for in an editable install) are pinned in build-constraints.txt, within their specifiers."""
     requirements = updater.build_requires()
-    assert "hatchling>=1.25" in requirements and "editables" in requirements
+    assert "hatchling>=1.27" in requirements and "editables" in requirements
     pins = checker.read_constraints(ROOT / "build-constraints.txt")
     assert checker.check_build(pins, requirements) == []
 
@@ -239,7 +236,7 @@ def test_build_check_wants_every_build_requirement_pinned_within_its_specifier()
 
 def test_build_check_runs_on_the_committed_files(monkeypatch):
     """The `--build` mode as the locked job runs it, with build_requires replaced."""
-    requirements = ["editables", "hatchling>=1.25"]
+    requirements = ["editables", "hatchling>=1.27"]
     monkeypatch.setattr(checker, "_build_requires", lambda: requirements)
     assert checker.main(["--build"]) == 0
     monkeypatch.setattr(checker, "_build_requires", lambda: ["hatchling>=99"])
