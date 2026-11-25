@@ -215,7 +215,7 @@ def test_release_workflow_publishes_through_environment():
     with_id_token = [
         name for name, job in workflow["jobs"].items() if "id-token" in job.get("permissions", {})
     ]
-    assert with_id_token == ["publish"]
+    assert with_id_token == ["publish", "mcp-registry"]  # the registry call is checked in test_registry.py
     assert publish["needs"] in ("build", ["build"])
 
 
@@ -225,6 +225,8 @@ def test_actions_pinned_by_sha():
         uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)", text, re.MULTILINE)
         assert uses
         for ref in uses:
+            if ref == "./.github/workflows/mcp-registry.yml":  # local reusable workflow, same commit
+                continue
             assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", ref), ref
 
 

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.MyOpenFund/myopenfund-mcp",
+  "title": "MyOpenFund MCP",
+  "description": "Official documents, pipeline health, RAG search and company data from the MyOpenFund bricks.",
+  "repository": {
+    "url": "https://github.com/MyOpenFund/myopenfund-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "myopenfund-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
