@@ -10,7 +10,7 @@ through the SEC client and its disk cache, and converted to Markdown by company-
   Software, not data: they stay in the persistent cache folder even with `MOF_CACHE=off`;
 - `<root>/index/<collection>/`: rag-engine's `LocalIndex` (Qdrant local mode + SQLite FTS5). The
   collection name (`rag_engine.local.collection_name`) holds the model, its pinned revision, the
-  chunker version (`v2-t<MOF_CHUNK_MAX_TOKENS>-o<MOF_CHUNK_OVERLAP_TOKENS>`) and the ONNX provider,
+  chunker version (`v2-t<MOF_CHUNK_MAX_TOKENS>-o<MOF_CHUNK_OVERLAP_TOKENS>-<TITLE_FORMAT>`) and the ONNX provider,
   so vectors of two setups are never mixed;
 - `<root>/index/status.sqlite3`: this module's record, keyed by collection: one row per document
   (state, chunks done/total, error, metadata, title, fingerprint of its cut) and one row per stored
@@ -26,7 +26,8 @@ half the token cap when the cap is below 240, the most rag-engine allows). So ev
 section, and its `section` payload is the name of the section it starts in, exactly. Chunk numbers
 run in document order; they are the `first_index` positions given to `LocalIndex.add`, so the point
 ids do not depend on the order chunks are embedded in. Payload of each chunk: `doc_id`, `doc_type`
-(the form), `date` (filed, `YYYY-MM-DD`), `title` (`<company> <form> <filed>`), `source_code` (the
+(the form), `date` (filed, `YYYY-MM-DD`), `title` (`filing_title`: `<company> <form> for the period
+ended <report_date>, filed <filed>`; also the chunk context), `source_code` (the
 CIK), `section`, `chunker_version`, `accession`, `url`. A document without any chunk is `failed`.
 
 **Order.** The chunks of the form's priority sections (`company_corpus.live.documents.
@@ -226,9 +227,41 @@ def chunk_options(settings: Settings) -> ChunkingOptions:
     )
 
 
+#: Version of the chunk title format (`filing_title`). The title is the chunk context (embedded
+#: and FTS-indexed), so it is part of the cut's label: a new format means a new collection, and
+#: documents indexed under the old titles are never served as ready. Bump it when the format changes.
+TITLE_FORMAT = "ttl2"
+
+
 def chunker_version(options: ChunkingOptions) -> str:
-    """The label of a cut: the profile and the two sizes the settings change (`v2-t480-o32`)."""
-    return f"{options.version}-t{options.max_chunk_token_count}-o{options.overlap_tokens}"
+    """The label of a cut: the profile, the two sizes the settings change and the title format
+    (`v2-t480-o32-ttl2`)."""
+    return f"{options.version}-t{options.max_chunk_token_count}-o{options.overlap_tokens}-{TITLE_FORMAT}"
+
+
+def filing_title(company: str, form: str, report_date: dt.date | None, filed: dt.date | None) -> str:
+    """The title of a filing's chunks (ruling R40): `<company> <form> for the period ended
+    <report_date>, filed <filed>`, ISO dates; a missing date leaves its clause out. The period is
+    stated by its end date, not a fiscal-year label (a retailer's FY naming is ambiguous).
+    rag-engine's `scripts/filings_eval.py` titles its sidecars in this format: keep them in step."""
+    title = f"{company} {form}"
+    if report_date is not None:
+        title += f" for the period ended {report_date.isoformat()}"
+    if filed is not None:
+        title += f", filed {filed.isoformat()}"
+    return title
+
+
+def title_company(title: str | None, form: str) -> str | None:
+    """The company of a `filing_title` of a `form` filing, or None when `title` is not one."""
+    if not title:
+        return None
+    for marker in (f" {form} for the period ended ", f" {form}, filed "):
+        at = title.rfind(marker)
+        if at > 0:
+            return title[:at]
+    suffix = f" {form}"
+    return title[: -len(suffix)] if title.endswith(suffix) and len(title) > len(suffix) else None
 
 
 def document_chunks(
@@ -238,6 +271,8 @@ def document_chunks(
 
     The Markdown is cut at section boundaries (the text outside every section is cut at them too)
     and each piece is chunked on its own, so a chunk never spans two sections."""
+    # rag-engine's `scripts/filings_eval.py` (`--cuts section`) mirrors this cut to measure what
+    # ships: a change here (or to `filing_title`) must be made there too, or the eval drifts.
     markdown = document.markdown
     pieces: list[tuple[str | None, int, int]] = []
     cursor = 0
@@ -666,7 +701,8 @@ class FilingsIndexer:
         for filing in refs:
             doc_id = filing_doc_id(filing)
             filed = filing.filed.isoformat() if filing.filed else None
-            title = f"{names.get(filing.cik) or f'CIK {filing.cik}'} {filing.form} {filed or 'undated'}"
+            company = names.get(filing.cik) or f"CIK {filing.cik}"
+            title = filing_title(company, filing.form, filing.report_date, filing.filed)
             with self._lock:
                 current = self._get(doc_id)
                 if current is not None and (current.state == "ready" or doc_id in self._active):

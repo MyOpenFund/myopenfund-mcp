@@ -24,8 +24,11 @@ from myopenfund_mcp.filings.indexer import (
     IndexUnavailable,
     SectionNotFound,
     chunk_options,
+    chunker_version,
     document_chunks,
+    filing_title,
     model_files_cached,
+    title_company,
 )
 from myopenfund_mcp.paging import result_chars
 
@@ -33,6 +36,7 @@ MARKDOWN = (Path(__file__).parent / "fixtures" / "filings" / "example_10k.md").r
 CIK = "0000789019"
 CONTACT = "someone@example.com"
 SPEC = ModelSpec.from_settings(EngineSettings())
+TITLE = "MICROSOFT CORP 10-K for the period ended 2024-06-30, filed 2024-07-30"
 
 
 class WordTokenizer:
@@ -126,7 +130,7 @@ def pieces(tmp_path: Path):
         load(filing, None),
         options=chunk_options(settings(tmp_path)),
         tokenizer=WordTokenizer(),
-        title="MICROSOFT CORP 10-K 2024-07-30",
+        title=TITLE,
     )
 
 
@@ -186,7 +190,7 @@ def test_priority_section_is_searchable_before_the_document_is_ready(tmp_path, i
         payload = hits[0].payload
         assert payload["doc_type"] == "10-K"
         assert payload["date"] == "2024-07-30"
-        assert payload["title"] == "MICROSOFT CORP 10-K 2024-07-30"
+        assert payload["title"] == TITLE
         assert payload["source_code"] == CIK
         assert payload["accession"] == "0000789019-24-000001"
         assert payload["url"].startswith("https://www.sec.gov/Archives/")
@@ -302,7 +306,7 @@ def test_read_walks_a_section_and_the_document_within_the_budget(tmp_path, max_t
         load(ref(), None),
         options=chunk_options(settings(tmp_path, chunk_max_tokens=max_tokens)),
         tokenizer=WordTokenizer(),
-        title="MICROSOFT CORP 10-K 2024-07-30",
+        title=TITLE,
     )
     try:
         indexer.enqueue([ref()], names={CIK: "MICROSOFT CORP"})
@@ -536,7 +540,7 @@ def test_resume_keeps_the_title_of_the_first_indexing(tmp_path, item7):
         wait_until(lambda: state_of(b, DOC).state == "ready")
         hits, _ = b.search("revenue cash debt risk", doc_ids=[DOC], limit=total)
         assert len(hits) == total
-        assert {hit.payload["title"] for hit in hits} == {"MICROSOFT CORP 10-K 2024-07-30"}
+        assert {hit.payload["title"] for hit in hits} == {TITLE}
         assert len(second.passages) < total  # resumed, not recut
     finally:
         b.close()
@@ -919,3 +923,59 @@ def test_closed_is_its_own_type(tmp_path):
     indexer.close()
     with pytest.raises(IndexClosed):
         indexer.status()
+
+
+# --- the chunk title (ruling R40) --------------------------------------------------------------
+
+
+def test_filing_title_states_the_period_and_the_filing_date():
+    assert filing_title("MICROSOFT CORP", "10-K", dt.date(2024, 6, 30), dt.date(2024, 7, 30)) == TITLE
+
+
+def test_filing_title_omits_the_period_when_the_report_date_is_missing():
+    assert filing_title("AMAZON COM INC", "8-K", None, dt.date(2024, 2, 1)) == "AMAZON COM INC 8-K, filed 2024-02-01"
+
+
+def test_filing_title_omits_the_filing_date_when_it_is_missing():
+    assert filing_title("CIK 0000789019", "10-K", dt.date(2024, 6, 30), None) == (
+        "CIK 0000789019 10-K for the period ended 2024-06-30"
+    )
+    assert filing_title("CIK 0000789019", "10-K", None, None) == "CIK 0000789019 10-K"
+
+
+@pytest.mark.parametrize(
+    ("report", "filed"),
+    [
+        (dt.date(2024, 6, 30), dt.date(2024, 7, 30)),
+        (None, dt.date(2024, 7, 30)),
+        (dt.date(2024, 6, 30), None),
+        (None, None),
+    ],
+)
+def test_title_company_reads_the_company_back(report, filed):
+    assert title_company(filing_title("AMAZON COM INC", "10-K/A", report, filed), "10-K/A") == "AMAZON COM INC"
+
+
+def test_title_company_of_a_foreign_title_is_none():
+    assert title_company("Some other title", "10-K") is None
+    assert title_company("10-K, filed 2024-07-30", "10-K") is None
+    assert title_company(None, "10-K") is None
+
+
+def test_enqueue_titles_chunks_with_the_period(tmp_path):
+    indexer = make(tmp_path)
+    doc_id = "sec-0000789019-24-000001"
+    try:
+        indexer.enqueue([ref()], names={CIK: "MICROSOFT CORP"})
+        rows = indexer._query(
+            "SELECT title FROM documents WHERE collection = ? AND doc_id = ?", (indexer.collection, doc_id)
+        )
+        assert rows == [(TITLE,)]
+    finally:
+        indexer.close()
+
+
+def test_the_chunker_version_names_the_title_format():
+    """The title is the chunk context (embedded and FTS-indexed): a new title format is a new
+    collection, so a document indexed under the old titles is never served as ready."""
+    assert chunker_version(chunk_options(Settings())) == "v2-t480-o32-ttl2"

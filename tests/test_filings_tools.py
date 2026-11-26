@@ -29,6 +29,7 @@ from myopenfund_mcp.filings.indexer import (
     SearchResult,
     SectionNotFound,
     StatusResult,
+    filing_title,
 )
 from myopenfund_mcp.server import build_server
 
@@ -94,7 +95,7 @@ def hit(
         text=text,
         score=0.9,
         doc_id=ref.doc_id,
-        title=f"{name} {ref.form} {ref.filed}",
+        title=filing_title(name, ref.form, ref.report_date, ref.filed),
         date=ref.filed.isoformat(),
         source_code=ref.cik,
         doc_type=ref.form,
@@ -111,7 +112,7 @@ class FakeIndexer:
     """The FilingsIndexer API over a dict of statuses; records every call; `fail`: method -> exception."""
 
     model_name = "nomic-ai/nomic-embed-text-v1.5"
-    chunker_version = "v2-t480-o32"
+    chunker_version = "v2-t480-o32-ttl2"
 
     def __init__(self, docs=(), *, hits=(), download=False, fail=None, read_result=None, companies=None):
         self.docs = {d.doc_id: d for d in docs}
@@ -731,7 +732,7 @@ async def test_end_to_end_on_the_real_indexer(tmp_path):
             assert section["chunks"] and all(ch["section"] == "Item 7" for ch in section["chunks"])
             info = (await c.call_tool("server_info", {})).data["filings"]
             assert info["documents"] == {"ready": 1, "total": 1}
-            assert info["chunker_version"] == "v2-t60-o8" and info["model"] == indexer.model_name
+            assert info["chunker_version"] == "v2-t60-o8-ttl2" and info["model"] == indexer.model_name
     finally:
         indexer.close()
 

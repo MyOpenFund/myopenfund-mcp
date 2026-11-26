@@ -62,6 +62,7 @@ from .indexer import (
     SectionNotFound,
     chunk_id,
     filing_doc_id,
+    title_company,
 )
 
 log = logging.getLogger("myopenfund_mcp.filings")
@@ -165,11 +166,10 @@ def _forms(forms: list[str] | None) -> list[str] | None:
 
 
 def _company(hit, names: dict[str, str]) -> str | None:
-    """The company of a hit: its resolved name, else the one in the chunk title (`<name> <form> <filed>`)."""
+    """The company of a hit: its resolved name, else the one in the chunk title (`filing_title`)."""
     if names.get(hit.source_code):
         return names[hit.source_code]
-    title, suffix = hit.title or "", f" {hit.doc_type} {hit.date or 'undated'}"
-    return title[: -len(suffix)] if title.endswith(suffix) and len(title) > len(suffix) else None
+    return title_company(hit.title, hit.doc_type or "")
 
 
 def _local_index(companies: list[dict]) -> dict[str, dict]:
