@@ -304,14 +304,21 @@ async def test_timeout_is_coded(store):
 
 
 async def test_one_time_budget_for_the_whole_call(store):
-    """Each read alone fits the budget; three of them do not: the call times out within ~1 budget."""
-    real = store.concept_rows
+    """The lookup and the read each fit the budget alone; one after the other they do not: the call
+    times out within ~1 budget. (Companies are read concurrently, so the steps that add up are the
+    serial ones: the lookup, then the reads.)"""
+    real_entities, real_rows = store.entities, store.concept_rows
 
-    def slow(cik, as_of):
+    def slow_entities():
         time.sleep(0.6)
-        return real(cik, as_of)
+        return real_entities()
 
-    store.concept_rows, settled = _tracked(slow)
+    def slow_rows(cik, as_of, **kw):
+        time.sleep(0.6)
+        return real_rows(cik, as_of, **kw)
+
+    store.entities = slow_entities
+    store.concept_rows, settled = _tracked(slow_rows)
     async with _client(store, companies_query_timeout_s=1) as c:
         t0 = time.monotonic()
         with pytest.raises(ToolError, match=r"^\[timeout\]"):
