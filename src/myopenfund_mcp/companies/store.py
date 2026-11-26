@@ -30,7 +30,10 @@ the allow-list: their rows (private tokens, labels) reach a client only through 
 instrument_id. The market datasets (open-data-store's ``MARKET_CONTRACTS``) are read in strict mode, as
 market-data's own binding reads them: a source the registry does not declare is denied too, so without
 the registry (no [market] extra) no market row is served. Other datasets keep their unregistered sources
-(SEC data declares none). A dataset without ``source_code`` is unchanged.
+(SEC data declares none). A dataset without ``source_code`` is unchanged. For a market dataset the filter
+is also pushed into the read (``source_code IN`` the sources the caller may read, `_readable`), so a
+caller allowed nothing does not make the store materialise the restricted rows; the gate after the read
+stays the authority (a ``source_symbol`` identifier naming a denied source).
 """
 from __future__ import annotations
 
@@ -245,6 +248,19 @@ def _market_datasets() -> frozenset[str]:
     return frozenset(c.name for c in MARKET_CONTRACTS)
 
 
+def _readable(dataset: str, allowed: frozenset[str], denied: frozenset[str]) -> list[str] | None:
+    """The source codes a caller may read in a market dataset (strict: registered, open or ``allowed``,
+    never ``denied``), sorted: pushed into the read as a filter. None for another dataset (an unregistered
+    source is kept there, so no list of codes names them all)."""
+    if dataset not in _market_datasets():
+        return None
+    try:
+        restricted, registered = _source_registry()
+    except Exception as exc:  # noqa: BLE001 -- fail closed; a plugin's text is never forwarded
+        raise StoreBackendError(f"source registry unreadable ({type(exc).__name__})") from None
+    return sorted(c for c in registered if (c not in restricted or c in allowed) and c not in denied)
+
+
 def _gate(table, dataset: str, allowed: frozenset[str], denied: frozenset[str] = frozenset()):
     """``table`` without the rows of a source the caller may not read (see the module docstring); ``denied``
     sources are dropped whatever ``allowed`` says (and whether or not the registry knows them)."""
@@ -434,6 +450,14 @@ class CompaniesStore:
             # Sort, slice and project in Arrow: only the returned rows become Python objects (an
             # unfiltered read of a large dataset must not be materialised). Arrow's sort is stable
             # and puts nulls last by default (pinned by a test).
+            if allowed_restricted is not None and "source_code" in {c["name"] for c in description["columns"]}:
+                codes = _readable(description["name"], frozenset(allowed_restricted), frozenset(denied_sources))
+                if codes is not None:  # pushed into the read; the gate below stays the authority
+                    asked = (checked or {}).get("source_code")
+                    codes = codes if asked is None else [c for c in asked if c in codes]
+                    if not codes:  # nothing this caller may read: nothing to read
+                        return []
+                    checked = {**(checked or {}), "source_code": codes}
             t = s.read_asof(dataset, as_of, filters=checked, vintages=vintages)
             if allowed_restricted is not None:
                 t = _gate(t, description["name"], allowed_restricted, denied_sources)

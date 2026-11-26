@@ -1,4 +1,5 @@
 import datetime as dt
+import functools
 import json
 import sys
 import time
@@ -368,3 +369,37 @@ async def test_tool_only_sources_are_configurable(market_store):
         async with Client(url, auth=token) as c:
             rows = (await c.call_tool("datasets_read_asof", {"dataset": "prices"})).data["rows"]
     assert {r["source_code"] for r in rows} == {"private_history"} and len(rows) == N_PRIVATE
+
+
+def test_the_source_filter_is_pushed_into_the_read(market_store, monkeypatch):
+    """A market dataset is read with ``source_code IN`` the sources the caller may read: a client allowed
+    nothing materialises no restricted row. The gate after it stays the authority (identifier rows whose
+    ``source_symbol`` names a denied source)."""
+    from open_data_store.reader import Store
+
+    seen: list = []
+    real = Store.read_asof
+
+    def spy(self, dataset, *args, **kwargs):
+        seen.append((dataset, kwargs.get("filters")))
+        return real(self, dataset, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "read_asof", spy)
+    now = dt.datetime.now(dt.UTC)
+    read = functools.partial(market_store.read, as_of=now, columns=None, limit=None,
+                   denied_sources=frozenset({"private_history", "manual"}))
+    assert read("prices", filters=None, allowed_restricted=frozenset()) == []
+    tiingo = read("prices", filters=None, allowed_restricted=frozenset({"tiingo", "private_history"}))
+    mine = read("prices", filters={"source_code": ["private_history"]},
+                allowed_restricted=frozenset({"tiingo", "private_history"}))
+    ids = read("instrument_identifiers", filters=None, allowed_restricted=frozenset({"tiingo"}))
+    sec = market_store.read("prices", as_of=now, filters=None, columns=None, limit=None)  # the server's own
+    assert [d for d, _ in seen] == ["prices", "prices", "instrument_identifiers", "prices"]  # (3) read nothing
+    assert seen[0][1]["source_code"] == ["openfigi", "sec"]  # allowed nothing: the open sources only
+    assert seen[1][1]["source_code"] == ["openfigi", "sec", "tiingo"]  # never private_history (tool-only)
+    assert seen[2][1]["source_code"] == ["openfigi", "sec", "tiingo"]
+    assert seen[3][1] is None  # the server's own reads: no source filter
+    assert len(tiingo) == 5 and {r["source_code"] for r in tiingo} == {"tiingo"}
+    assert mine == []  # a filter on sources the caller may not read: nothing to read
+    assert {r["source_code"] for r in ids} == {"tiingo", "openfigi", "sec"}
+    assert len(sec) == 11
