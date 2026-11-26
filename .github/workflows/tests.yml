@@ -43,3 +43,20 @@ jobs:
       # Reads the git dependencies' build requirements from raw.githubusercontent.com at their pinned commits.
       - run: python scripts/check_constraints.py --build
       - run: python -m pytest -q
+  # Without the [market] extra: the server starts without market_prices, and the datasets tools (which
+  # filter restricted sources with open-data-store 0.2) keep working. The other extras as in `locked`.
+  without-market:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.18"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints.txt
+            build-constraints.txt
+      - run: pip install -c constraints.txt --build-constraint build-constraints.txt -e ".[vault,companies,rag,filings,dev]"
+      - run: python -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('market_data') is not None)"
+      - run: python -m pytest -q
