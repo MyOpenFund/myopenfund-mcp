@@ -313,7 +313,9 @@ class Settings:
     rag_onnx_provider: str = "cpu"  # MOF_RAG_ONNX_PROVIDER: cpu | coreml
     search_rrf_k: int = 60  # MOF_SEARCH_RRF_K: constant k of the reciprocal-rank fusion of a search
     search_candidates: int = 50  # MOF_SEARCH_CANDIDATES: passages each retriever hands to the fusion
-    search_eigenmind: bool = False  # MOF_SEARCH_EIGENMIND: add the graph retriever to a search (off until evaluated)
+    # MOF_SEARCH_EIGENMIND: select a search's passages for diversity (eigenmind selection over the fused
+    # candidates); off: no better than hybrid ranking in rag-engine's filings evaluation (2026-11)
+    search_eigenmind: bool = False
     # MOF_FILINGS_DEFAULT_FORMS: comma-separated form types, stripped and without duplicates
     filings_default_forms: tuple[str, ...] = ("10-K",)
     chunk_max_tokens: int = 480  # MOF_CHUNK_MAX_TOKENS: largest passage, in tokens

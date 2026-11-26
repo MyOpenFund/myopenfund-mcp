@@ -1108,3 +1108,14 @@ async def test_filings_live_fallback_is_capped_at_now():
     assert row["accepted_is_fallback"] is True
     assert dt.datetime.fromisoformat(row["accepted_utc"]) <= dt.datetime.now(dt.UTC)
 
+
+async def test_fundamentals_tells_the_as_filed_quirks():
+    """C11: YTD cash-flow filers, Amazon's TTM annual rows, total_debt at face value."""
+    from source_fakes import FakeLive
+
+    async with _routed(None, FakeLive()) as c:
+        tool = {t.name: t for t in await c.list_tools()}["companies_fundamentals"]
+    freq = tool.inputSchema["properties"]["frequency"]
+    text = str(freq) + tool.description
+    assert "year-to-date" in text and "Q1" in text and "ytd9" in text and "companies_facts" in text
+    assert "trailing" in tool.description and "face value" in tool.description

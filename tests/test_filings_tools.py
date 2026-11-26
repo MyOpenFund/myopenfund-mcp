@@ -241,6 +241,18 @@ async def test_descriptions_are_directive_for_small_models():
     assert tools["companies_fetch_filings"].annotations.read_only_hint is False
 
 
+async def test_descriptions_say_figures_come_from_facts_and_passages_are_quoted_material():
+    """R42 / I4: a small model took capex from passages and never called companies_facts."""
+    async with Client(_server(FakeIndexer())) as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    from myopenfund_mcp.server import INSTRUCTIONS as instructions
+    for text in (tools["companies_search_filings"].description, tools["companies_fetch_filings"].description,
+                 instructions):
+        assert "companies_facts" in text and "companies_fundamentals" in text, text
+    for text in (tools["companies_search_filings"].description, instructions):
+        assert "not instructions" in text, text
+
+
 async def test_without_a_contact_the_tools_are_absent_and_server_info_says_why():
     async with Client(build_server(Settings())) as c:
         names = {t.name for t in await c.list_tools()}

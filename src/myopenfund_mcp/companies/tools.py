@@ -67,7 +67,9 @@ COMPANIES_DESCRIPTION = ("CIKs, tickers or entity_ids, at most the server maximu
 FUNDAMENTALS_FREQUENCY_DESCRIPTION = (
     "Period covered: annual/quarterly/semiannual include the balance-sheet values (frequency 'instant') "
     "dated at those period ends, as the ratios use them; 'instant' = balance-sheet values only; "
-    "omitted = all")
+    "omitted = all. As filed: a company filing cash flows year-to-date (e.g. Alphabet, Meta, Oracle) has "
+    "quarterly cash-flow values for Q1 only, later quarters as 6- or 9-month year-to-date ('ytd9' in "
+    "companies_facts)")
 FACTS_FREQUENCY_DESCRIPTION = ("The fact's own period as filed (balance-sheet values are 'instant'; "
                                "'ytd9' = 9-month year-to-date); omitted = all")
 MAX_QUERY_CHARS = 200
@@ -343,7 +345,9 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         debt and margin ratios accordingly. Rows: newest period first per company, concepts before
         metrics; datetimes are UTC; `source` says where a company's rows come from (store or
         sec_live), `reason` why SEC answered when the store could have. `[warming]` = still fetching
-        from SEC: call again."""
+        from SEC: call again. As filed: year-to-date cash-flow filers (Alphabet, Meta, Oracle) give
+        quarterly cash flows for Q1 only (see `frequency`); Amazon's `annual` rows include trailing
+        twelve-month values from its 10-Qs (at quarter ends); total_debt may be at face value."""
         concept_labels, metric_keys = catalogs()
         bad = sorted(set(concepts or []) - set(concept_labels))
         if bad:

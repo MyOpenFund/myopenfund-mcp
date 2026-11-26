@@ -99,6 +99,13 @@ gives it.
   the local filings index and the model. Facts and filing lists are reused for 24 hours
   (`MOF_CACHE_TTL_COMPANYFACTS_H`, `MOF_CACHE_TTL_SUBMISSIONS_H`); the HTTP part is capped at
   `MOF_CACHE_MAX_GB` (20 GB), the model and the index are never evicted. Delete the folder to start over.
+- **One server per cache folder.** The filings index is locked by the process that opened it: a second
+  MCP server, or `warm`, on the same `MOF_CACHE_DIR` answers `[index_unavailable]` for the filings tools
+  (the other tools work). Give each its own `MOF_CACHE_DIR`, or stop the first.
+- **Upgrading from an earlier build.** The index folder under `<MOF_CACHE_DIR>/index/` is named after the
+  model and the chunker version; builds before the chunk titles stated the period (chunker version ending
+  `ttl2`) wrote folders that are no longer read: their documents are fetched and indexed again, and the
+  old folders are orphaned, safe to delete.
 - **The embedding model is downloaded once, at the first fetch of filings**: about 1.1 GB, pinned to one
   revision. Later runs read it from the cache. No other model or data file is downloaded.
 - **`MOF_CACHE=off`** keeps no HTTP entries and no index between runs: they live in a temporary folder
@@ -110,7 +117,7 @@ gives it.
 
 `auto` (the default) uses your own company store when you have one and SEC otherwise; with no store
 configured, as here, everything comes from SEC. `store` reads only the store, `sec` only SEC (needs
-`MOF_SEC_CONTACT`). Every row of a company tool says its `source` (`store` or `sec`) and, when the choice
+`MOF_SEC_CONTACT`). Every row of a company tool says its `source` (`store` or `sec_live`) and, when the choice
 needs explaining, a `reason` (for example `freshness_unchecked`: SEC could not be asked, so the store's
 answer is not checked for freshness). A store is optional: if you run one, point `MOF_COMPANIES_CATALOG` and
 `MOF_COMPANIES_DATA_ROOT` at it (see [Companies and datasets](#companies-and-datasets)).
@@ -495,7 +502,8 @@ Qdrant (checked behind a recording proxy that refuses everything: no request in 
 
 ## Tools
 
-Tool names carry their toolset prefix. All v1 tools are read-only (`readOnlyHint`). Only
+Tool names carry their toolset prefix. Every tool is read-only (`readOnlyHint`) except
+`companies_fetch_filings`, which downloads and indexes filings (act tier). Only
 `vault_search_documents` is paged: it returns `next_cursor` to pass back unchanged with the same filters.
 `vault_corpus_stats`, `vault_runs_status` and `vault_vocabulary` only bound their lists with `limit` (no cursor). Every
 `limit` defaults to `MOF_MCP_DEFAULT_ROWS`; a value outside `[1, MOF_MCP_MAX_ROWS]` is refused, not
@@ -791,12 +799,16 @@ and passed to the engine with every search, with `MOF_RAG_DATE_FILTER_REFRESH_S`
 
 ### Companies and datasets
 
-The `companies_*` and `datasets_*` tools (read-only, over the published open-data-store) exist only when
-`MOF_COMPANIES_CATALOG` and `MOF_COMPANIES_DATA_ROOT` are set; the `[companies]` extra must then be installed
+The `companies_*` tools exist when a company store is configured (`MOF_COMPANIES_CATALOG` and
+`MOF_COMPANIES_DATA_ROOT`) or SEC can be read (`MOF_SEC_CONTACT`, with `MOF_COMPANIES_SOURCE` not `store`);
+the `datasets_*` tools only with a store. The filing-text tools (`companies_fetch_filings`,
+`companies_search_filings`, `companies_read_filing`) need SEC and the `[filings]` extra. The `[companies]`
+extra must be installed
 (from a checkout, `pip install ".[vault,companies]"`, or from the git URL,
 `pip install "myopenfund-mcp[companies] @ git+https://github.com/MyOpenFund/myopenfund-mcp"`; the extra pins two
 git dependencies, so git must be available). The
-store is read-only (as the `lake_reader` role); nothing is ever written. In a hardened container, DuckDB
+store is read-only (as the `lake_reader` role): nothing is ever written to it. Reading SEC writes to the
+local cache folder only (`MOF_CACHE_DIR`: HTTP answers, the filings index, the model). In a hardened container, DuckDB
 downloads and loads its `ducklake` and `postgres` extensions under `$HOME/.duckdb` at each start: `HOME` must be
 writable, a tmpfs holding it must allow exec (`/tmp:exec`), and the container needs outbound HTTPS to
 `extensions.duckdb.org`. The process must also be able to read the store's `lake/` files (open-data-store creates
@@ -810,6 +822,9 @@ them `0700` for its own uid). Configuration:
 | `companies_facts` | Raw reported facts of up to `MOF_COMPANIES_MAX_COMPANIES` companies, as filed, with filing reference and provenance. |
 | `companies_fundamentals` | Standardised concepts and ratios per company and period, with their provenance. |
 | `companies_filings` | A company's filings (`forms`, report-period window) with `accepted_utc`, the time each became public on EDGAR: the event date for share-price studies. `accepted_is_fallback` marks an acceptance time EDGAR did not give (end of the filing day, New York). The store covers report forms (see `covered_forms` in the result); other forms, and omitted `forms` (= all), are read from SEC, or, when only the store can answer (`MOF_COMPANIES_SOURCE=store`, or no SEC contact), the covered forms are answered and `covered_forms`, `all_forms_covered` and `forms_not_covered` say what the store could not. |
+| `companies_fetch_filings` | **act tier.** Download companies' filings (`forms`, report-period window; at most `MOF_FILINGS_MAX_DOCS` per call) and queue them for indexing on this machine; returns at once with each document's `doc_id` and `state` (`queued`, `fetching`, `indexing`, `partial`, `ready`, `failed`, with a fixed `error` text). Fetching again is harmless: a ready document stays ready, a partial or failed one resumes. |
+| `companies_search_filings` | Hybrid search (dense + BM25) over the passages indexed so far of the fetched filings (`companies`, `forms`, period); hits carry `company`, `cik`, `form`, `filed`, `section`, `url`, `doc_id`, `chunk_id`, `text`, plus `indexed` and the documents `not_ready`. Passages explain; figures come from `companies_facts` / `companies_fundamentals`. |
+| `companies_read_filing` | A fetched filing's stored text, bounded: from a hit's `chunk_id` (or `around` it), a `section`, or the start; continue with `next_chunk_id` / `next_offset` while `more`. |
 | `datasets_list` | The datasets the store publishes: name, version, kind, licence, row estimate. |
 | `datasets_describe` | Columns (type, allowed values, doc), natural key and licence of one dataset. |
 | `datasets_read_asof` | Rows of a dataset as known at `as_of`, with structured filters (no free SQL), paged with `next_cursor`. |
@@ -837,7 +852,7 @@ them `0700` for its own uid). Configuration:
   header alone if `columns` is given, else an empty string.
 - **Time budget, and a store read over SMB.** One call, all its store reads together, gets
   `MOF_COMPANIES_QUERY_TIMEOUT_S` seconds (default 20) and then answers `[timeout]`. The default is sized
-  for the NAS, where the server runs next to the store and reads `lake/` from local disk. Read over SMB
+  for your store host, where the server runs next to the store and reads `lake/` from local disk. Read over SMB
   instead (measured from a Mac, 2026-11), `companies_fundamentals` took 42 to 51 s cold and about 17 s
   warm, so the default fails cold calls. A deployment that reads the store over SMB (or another network
   share) should raise `MOF_COMPANIES_QUERY_TIMEOUT_S`, e.g. to 90; the client's own tool-call timeout must
@@ -851,12 +866,12 @@ branch on the code and show the message.
 | Code | Meaning | What to do |
 |---|---|---|
 | `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a `doc_type` filter or grouping without `corpus` (the message lists each corpus's codes: ask the user which corpus, or infer it), a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
-| `not_found` | No document with that `doc_id` (in that `corpus`, when one is given: omit `corpus` to look in every corpus). | Find ids with `vault_search_documents`. |
-| `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
+| `not_found` | No document with that `doc_id` (in that `corpus`, when one is given: omit `corpus` to look in every corpus). For `companies_read_filing`: no stored chunk with that `chunk_id`, or no such `section` in the document (the message lists its sections). | Find ids with `vault_search_documents`; for a filing, take `doc_id` and `chunk_id` from `companies_search_filings`. |
+| `timeout` | The vault query, the company store read or the SEC requests exceeded the call's time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`, plus `MOF_SEC_CALL_BUDGET_S` when SEC is read). A `companies_fetch_filings` timeout says whether the documents may already be queued. | Narrow the filters; for SEC, call again (the cache keeps what was read). |
 | `schema_outdated` | The vault database lacks a column or table the pinned vault-query reads: the vault is older than this server (see Minimum vault schema under [Tools](#tools)). | Deploy the vault (and run its ingestion) first; check the deployment. |
-| `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
+| `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query); on a company read from SEC, an SEC answer that cannot be read (the message then names SEC, not the store); for the filings tools, an unexpected failure of the local index. | Retry later; check the deployment. |
 | `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free), `internal_error` (the search failed with an error the server does not expect; the log names its class). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `internal_error`, retry and report it if it lasts; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
-| `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |
+| `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`; `companies_search_filings` for more than `MOF_FILINGS_SEARCH_MAX_LIMIT`; `companies_fetch_filings` matched more filings than `MOF_FILINGS_MAX_DOCS`. | Ask for at most the maximum the message names; narrow `forms` or the period, or fetch fewer companies at once. |
 | `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit` (`rag_search` names the largest that fits). |
 | `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
 | `unknown_company` | No company matches the reference. | Use `companies_resolve`. |
@@ -865,6 +880,14 @@ branch on the code and show the message.
 | `unknown_dataset` | No dataset with that name. | Names come from `datasets_list`. |
 | `unknown_column` | A filter or column is not in the dataset. | Columns come from `datasets_describe`. |
 | `too_many_companies` | More companies than `MOF_COMPANIES_MAX_COMPANIES`. | Split the request. |
+| `sec_contact_missing` | A company must be read from SEC and no `MOF_SEC_CONTACT` is set. | Set `MOF_SEC_CONTACT` (your name and e-mail) and restart. |
+| `sec_refused` | SEC refused the requests as an undeclared automated tool. | Check `MOF_SEC_CONTACT` (a real name and e-mail). |
+| `sec_unavailable` | SEC is unreachable or throttling after the retries (remembered for `MOF_SEC_FAILURE_TTL_S`). | Retry later. |
+| `warming` | A company's facts are still being fetched from SEC; the message says how far. | Call again in a few seconds. |
+| `no_facts` | SEC holds no XBRL financial facts for that company (a fund, or a foreign private issuer before XBRL). | Nothing to read from facts; its filings' text may still be fetched. |
+| `not_fetched` | `companies_search_filings` or `companies_read_filing` on filings never fetched (for these companies, forms or period). | Call `companies_fetch_filings` first. |
+| `index_not_ready` | Nothing is searchable yet among the fetched filings in scope; the message gives the progress and says whether indexing is in progress. | Call again in a minute; if nothing is in progress (partial or failed documents), call `companies_fetch_filings` again. |
+| `index_unavailable` | The local filings index cannot be used: another process holds its folder (two MCP servers, or a server and `warm`, on one `MOF_CACHE_DIR`), or the server is shutting down. | Stop the other process, or give each its own `MOF_CACHE_DIR`. |
 
 Arguments that do not match a tool's input schema (wrong type, string too long, e.g. an over-long company
 id) are rejected by the MCP framework before a tool runs, without a `[code]`. An unexpected internal failure reaches the client as a generic error
@@ -876,7 +899,8 @@ unknown token is rejected with HTTP `401` before any tool runs.
 ## Tiers and tokens
 
 - Two tiers: **`read`** (read-only tools) and **`act`** (every tool; implies `read`). An entry without a
-  tier is `act`. v1 ships no act-only tool yet; the tiers are enforced all the same. A tool above the
+  tier is `act`. `companies_fetch_filings` is the act-only tool (it downloads and indexes filings on the
+  server's machine); a `read` client searches and reads what an `act` client fetched. A tool above the
   caller's tier is not listed to that caller and cannot be called.
 - One token per client, each with its tier, in `MOF_MCP_TOKENS` as `client:sha256hex[:tier]`,
   comma-separated. Client ids are 1-32 characters of `A-Z a-z 0-9 _ . -`. The client id appears in the
@@ -991,7 +1015,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_ONNX_PROVIDER` | `cpu` | ONNX execution provider of the local embedding: `cpu` or `coreml`. |
 | `MOF_SEARCH_RRF_K` | `60` | Constant k of the reciprocal-rank fusion of a filings search (1-1000). |
 | `MOF_SEARCH_CANDIDATES` | `50` | Passages each retriever hands to the fusion (1-1000). |
-| `MOF_SEARCH_EIGENMIND` | `false` | Add the graph (eigenmind) retriever to a filings search. Off until an evaluation decides. Needs the `[filings]` extra. |
+| `MOF_SEARCH_EIGENMIND` | `false` | Select a filings search's passages for diversity (rag-engine's eigenmind selection over the fused candidates). Off: in the filings evaluation (rag-engine, 2026-11) it was no better than plain hybrid ranking, and worse when it changed the selection. Needs the `[filings]` extra. |
 | `MOF_FILINGS_DEFAULT_FORMS` | `10-K` | Comma-separated form types fetched when the caller names none. |
 | `MOF_CHUNK_MAX_TOKENS` | `480` | Largest passage of the local filings index, in tokens (16-8192). |
 | `MOF_CHUNK_OVERLAP_TOKENS` | `32` | Tokens shared by neighbouring passages (0-2048, below `MOF_CHUNK_MAX_TOKENS`). |
@@ -1044,7 +1068,7 @@ The default test run needs no database, network or model. Opt-in suites (`integr
 are excluded by default and run with an explicit marker:
 
 - `pytest -m integration`: against a real vault database, with `MOF_MCP_IT_DATABASE_URL` set.
-- `pytest -m integration tests/integration/test_real_store.py`: against a real company store, with `MOF_MCP_IT_COMPANIES_CATALOG` and `MOF_MCP_IT_COMPANIES_DATA_ROOT` set (optional: `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, default 120; `MOF_MCP_IT_ASSERT_LATENCY=1` to enforce the 5 s criterion, on the NAS only; add `-s` or `-rP` to see the printed fundamentals latency).
+- `pytest -m integration tests/integration/test_real_store.py`: against a real company store, with `MOF_MCP_IT_COMPANIES_CATALOG` and `MOF_MCP_IT_COMPANIES_DATA_ROOT` set (optional: `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, default 120; `MOF_MCP_IT_ASSERT_LATENCY=1` to enforce the 5 s criterion, on your store host only; add `-s` or `-rP` to see the printed fundamentals latency).
 - `pytest -m integration tests/integration/test_real_qdrant.py`: `rag_search` against a **throwaway** Qdrant (never a production one: the test creates and deletes collections), with `MOF_MCP_IT_QDRANT_URL` set (e.g. `http://127.0.0.1:6333`). The test creates, seeds (through rag-engine, with its model-free `FakeEmbedder`) and deletes collections named `mof-mcp-it-*`. Optional, for a Qdrant with keys: `MOF_MCP_IT_QDRANT_API_KEY` (can write) and `MOF_MCP_IT_QDRANT_READ_ONLY_API_KEY` (given to the server).
 - `pytest -m integration tests/integration/test_no_vault_real.py`: the companies tools against the real SEC (no store), with `MOF_SEC_CONTACT` set: quarterly capex and total debt of the scenario's five companies since 2022, and values checked by hand against their 10-K text. `pytest -m models` on the same file indexes real 10-Ks (downloads the embedding model unless `MOF_MCP_IT_MODELS_DIR` points at a folder holding it): the first quotable passage of each company within `MOF_MCP_IT_FIRST_PASSAGE_S` (default 120 s) of `companies_fetch_filings`, and a French question over the Microsoft FY2024 10-K finding its Item 7 (optional: `MOF_MCP_IT_CACHE_DIR`, `MOF_MCP_IT_INDEX_TIMEOUT_S`, default 1800; set `MOF_RAG_ONNX_PROVIDER=coreml` to measure a Mac's accelerator).
 - `pytest -m integration tests/integration/test_store_vs_live.py`: the same companies read from a real store and from SEC live, at the same `as_of`, with `MOF_MCP_IT_COMPANIES_CATALOG`, `MOF_MCP_IT_COMPANIES_DATA_ROOT` and `MOF_SEC_CONTACT` set: at least `MOF_MCP_IT_PARITY_MIN_SHARE` (default 0.99) of the rows equal, every difference printed (optional: `MOF_MCP_IT_PARITY_COMPANIES`, `MOF_MCP_IT_PARITY_AS_OF`, default 2025-06-30, `MOF_MCP_IT_PARITY_FROM`, default 2022-01-01, `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, `MOF_MCP_IT_CACHE_DIR`).
