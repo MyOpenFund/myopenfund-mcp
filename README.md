@@ -981,8 +981,11 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_FILINGS_SEARCH_MAX_LIMIT` | `20` | Largest `limit` a caller may ask `companies_search_filings` for (1-1000); a larger one is refused with `[limit_exceeded]`. |
 | `MOF_FILINGS_SEARCH_MAX_DOCS` | `40` | Fetched filings a `companies_search_filings` call without `companies` may cover (1-10000); with more fetched, the call is refused with `[invalid_argument]` asking for `companies`. |
 | `MOF_FILINGS_NOT_READY_LISTED` | `10` | Not-yet-ready documents listed in a search result (`not_ready`, 0-1000); `not_ready_total` counts them all. |
-| `MOF_INDEX_WORKERS` | `1` | Filings indexed in parallel (1-32). |
-| `MOF_INDEX_CLOSE_TIMEOUT_S` | `10` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600. Past it the index is released; the document is resumed (`partial`) next time. |
+| `MOF_INDEX_WORKERS` | `1` | Embedding workers of the filings indexer: batches embedded in parallel, one per document (1-32). One more thread fetches and cuts the documents ahead of them. |
+| `MOF_INDEX_BATCH_SIZE` | `32` | Passages embedded and added to the index in one step (1-1024), the unit of the indexing order (rag-engine's ONNX batch size; about 8-12 s on 4 CPU cores). |
+| `MOF_INDEX_FIRST_BATCHES` | `1` | Batches of the MD&A (Item 7) of each company's newest queued document indexed in the first round, one company after the other, before any other work (0-100; 0 = no first round: document by document). See [How long it takes](#how-long-it-takes). |
+| `MOF_INDEX_FETCH_AHEAD` | `24` | Documents fetched and cut ahead of the embedding, at most (1-1000; a few MB of memory each). A company's newest queued document is fetched ahead whatever the count. |
+| `MOF_INDEX_CLOSE_TIMEOUT_S` | `30` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600; one batch takes about 8-12 s on 4 CPU cores. Past it the index is released; the document is resumed (`partial`) next time. |
 | `MOF_WARM_POLL_INTERVAL_S` | `5.0` | Seconds `myopenfund-mcp warm` waits between two looks at the SEC fetch (still warming) and at the indexing progress (above 0, at most 3600); `--poll-interval` overrides it. |
 | `MOF_WARM_STALL_S` | `1800` | Seconds without any progress after which `myopenfund-mcp warm` stops waiting for the documents still queued or indexing, lists them and exits 1 (1-604800). |
 | `MOF_RAG_ONNX_PROVIDER` | `cpu` | ONNX execution provider of the local embedding: `cpu` or `coreml`. |

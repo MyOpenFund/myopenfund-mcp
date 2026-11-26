@@ -57,6 +57,7 @@ class GatedEmbedder(FakeEmbedder):
         self.gate = threading.Event()
         self.passage_calls = 0
         self.passages: list[str] = []
+        self.sizes: list[int] = []
         self._count = threading.Lock()
 
     def encode_passage(self, texts):
@@ -66,6 +67,7 @@ class GatedEmbedder(FakeEmbedder):
         if self.allowed is not None and number > self.allowed:
             self.gate.wait(30)
         self.passages.extend(texts)
+        self.sizes.append(len(texts))
         return super().encode_passage(texts)
 
 
@@ -101,6 +103,7 @@ def settings(tmp_path: Path, **overrides) -> Settings:
 
 def make(tmp_path: Path, embedder: FakeEmbedder | None = None, *, loader=load, **overrides) -> FilingsIndexer:
     embedder = embedder if embedder is not None else GatedEmbedder()
+    overrides.setdefault("index_batch_size", getattr(embedder, "batch_size", 2))
     return FilingsIndexer(
         settings(tmp_path, **overrides),
         sec=object(),
@@ -206,6 +209,147 @@ def test_priority_section_is_searchable_before_the_document_is_ready(tmp_path, i
     finally:
         embedder.gate.set()
         indexer.close()
+
+
+def company_ref(cik: str, year: int) -> FilingRef:
+    """A 10-K of company `cik` for fiscal `year` (filed the next July)."""
+    accession = f"{cik[-4:]}-{year % 100:02d}-000001"
+    return FilingRef(
+        cik=cik,
+        accession=accession,
+        form="10-K",
+        report_date=dt.date(year, 6, 30),
+        filed=dt.date(year, 7, 30),
+        accepted=None,
+        primary_document="example-10k.htm",
+        url=f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}",
+        doc_id=f"sec-{cik}-{year}",
+    )
+
+
+def record_units(indexer: FilingsIndexer, monkeypatch) -> list[tuple[str, str | None, int]]:
+    """(doc_id, section, first chunk number) of every batch, in the order the batches are stored."""
+    units: list[tuple[str, str | None, int]] = []
+    real = indexer._record_batch
+
+    def recording(doc_id, batch, sections, chunks, done):
+        units.append((doc_id, sections[batch[0]], batch[0]))
+        return real(doc_id, batch, sections, chunks, done)
+
+    monkeypatch.setattr(indexer, "_record_batch", recording)
+    return units
+
+
+def run_in_order(tmp_path, monkeypatch, refs, **overrides):
+    """Enqueue `refs` with the first batch held until every document is fetched and cut, so the order
+    of the units does not depend on fetch timing; the units in the order they were stored."""
+    embedder = GatedEmbedder(allowed=0, batch_size=2)
+    indexer = make(tmp_path, embedder, **overrides)
+    units = record_units(indexer, monkeypatch)
+    try:
+        indexer.enqueue(refs)
+        wait_until(lambda: all(s.state == "indexing" for s in indexer.status()))
+        embedder.gate.set()
+        wait_until(lambda: all(s.state == "ready" for s in indexer.status()))
+    finally:
+        embedder.gate.set()
+        indexer.close()
+    return units
+
+
+A, B = "0000000001", "0000000002"
+
+
+def test_order_interleaves_companies_newest_document_first(tmp_path, monkeypatch, item7):
+    """R41: two companies, two 10-Ks each, fetched in one call (oldest first, company by company): the
+    first Item 7 batch of each company's newest document, round robin; then the rest of the Item 7
+    sections (newest documents first, company by company); then the remainders in the same order."""
+    _, n7 = item7
+    refs = [company_ref(A, 2022), company_ref(A, 2023), company_ref(B, 2022), company_ref(B, 2023)]
+    units = run_in_order(tmp_path, monkeypatch, refs, index_first_batches=1)
+    new_a, old_a, new_b, old_b = (f"sec-{A}-2023", f"sec-{A}-2022", f"sec-{B}-2023", f"sec-{B}-2022")
+    item7_batches = -(-n7 // 2)
+    rest_batches = sum(1 for doc, section, _ in units if doc == new_a and section != "Item 7")
+    assert rest_batches > 1 and len(units) == 4 * (item7_batches + rest_batches)
+    order = [(doc, section == "Item 7") for doc, section, _ in units]
+    expected = (
+        [(new_a, True), (new_b, True)]  # pass 1: one batch each
+        + [(new_a, True)] * (item7_batches - 1) + [(new_b, True)] * (item7_batches - 1)  # pass 2, rank 0
+        + [(old_a, True)] * item7_batches + [(old_b, True)] * item7_batches  # pass 2, rank 1
+        + [(new_a, False)] * rest_batches + [(new_b, False)] * rest_batches  # pass 3, rank 0
+        + [(old_a, False)] * rest_batches + [(old_b, False)] * rest_batches  # pass 3, rank 1
+    )
+    assert order == expected
+    # within a document, chunks still go in document order inside each pass
+    for doc in (new_a, old_b):
+        numbers = [n for d, s, n in units if d == doc and s == "Item 7"]
+        assert numbers == sorted(numbers)
+
+
+def test_order_first_unit_of_several_batches_round_robin(tmp_path, monkeypatch, item7):
+    assert item7[1] > 2  # two Item 7 batches of 2 at least
+    refs = [company_ref(A, 2023), company_ref(B, 2023)]
+    units = run_in_order(tmp_path, monkeypatch, refs, index_first_batches=2)
+    head = [(doc, section) for doc, section, _ in units[:4]]
+    assert head == [(f"sec-{A}-2023", "Item 7"), (f"sec-{B}-2023", "Item 7")] * 2
+
+
+def test_order_five_companies_each_get_a_first_passage_before_any_remainder(tmp_path, monkeypatch, item7):
+    """R41, the failing shape of C11: five companies fetched in one call (their 10-Ks oldest first)."""
+    ciks = [f"00000000{n:02d}" for n in range(1, 6)]
+    refs = [company_ref(cik, year) for cik in ciks for year in (2022, 2023, 2024)]
+    units = run_in_order(tmp_path, monkeypatch, refs, index_first_batches=1)
+    assert [(doc, section) for doc, section, _ in units[:5]] == [
+        (f"sec-{cik}-2024", "Item 7") for cik in ciks
+    ]
+    first_rest = next(i for i, (_, section, _) in enumerate(units) if section != "Item 7")
+    assert all(section == "Item 7" for _, section, _ in units[:first_rest])
+    assert len(units[:first_rest]) == 15 * -(-item7[1] // 2)  # every Item 7 before any remainder
+
+
+def test_first_batches_zero_goes_document_by_document(tmp_path, monkeypatch, item7):
+    refs = [company_ref(A, 2023), company_ref(B, 2023)]
+    units = run_in_order(tmp_path, monkeypatch, refs, index_first_batches=0)
+    n7b = -(-item7[1] // 2)
+    assert [d for d, _, _ in units[:n7b]] == [f"sec-{A}-2023"] * n7b
+
+
+def test_fetch_ahead_bounds_the_documents_cut_but_not_a_companys_first_round(tmp_path, monkeypatch):
+    embedder = GatedEmbedder(allowed=0, batch_size=2)
+    indexer = make(tmp_path, embedder, index_fetch_ahead=1, index_first_batches=1)
+    units = record_units(indexer, monkeypatch)
+    new_a, old_a, new_b = f"sec-{A}-2023", f"sec-{A}-2022", f"sec-{B}-2023"
+    try:
+        indexer.enqueue([company_ref(A, 2022), company_ref(A, 2023), company_ref(B, 2023)])
+        wait_until(lambda: state_of(indexer, new_b).state == "indexing")  # past the bound: a first round
+        time.sleep(0.3)
+        assert state_of(indexer, old_a).state == "queued"  # held back by MOF_INDEX_FETCH_AHEAD
+        embedder.gate.set()
+        wait_until(lambda: all(s.state == "ready" for s in indexer.status()))
+    finally:
+        embedder.gate.set()
+        indexer.close()
+    assert [doc for doc, _, _ in units[:2]] == [new_a, new_b]
+
+
+def test_default_batch_size_is_the_onnx_batch_size():
+    from rag_engine.embedding import ONNX_BATCH_SIZE
+
+    assert Settings().index_batch_size == Settings.from_env({}).index_batch_size == ONNX_BATCH_SIZE
+
+
+def test_index_batch_size_setting_sizes_the_batches(tmp_path, item7):
+    total, n7 = item7
+    embedder = GatedEmbedder(batch_size=2)
+    indexer = make(tmp_path, embedder, index_batch_size=3)
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "ready")
+    finally:
+        indexer.close()
+    assert len(embedder.passages) == total
+    assert max(embedder.sizes) == 3  # MOF_INDEX_BATCH_SIZE, not the embedder's own batch size
+    assert embedder.sizes[: -(-n7 // 3)] == [3] * (n7 // 3) + ([n7 % 3] if n7 % 3 else [])
 
 
 def test_restart_mid_document_shows_partial_then_resumes_to_ready(tmp_path, item7):
@@ -668,7 +812,7 @@ def test_close_does_not_wait_past_its_timeout(tmp_path):
             indexer.status()
     finally:
         release.set()
-    for worker in indexer._workers:
+    for worker in [*indexer._workers, indexer._fetcher]:
         worker.join(10)
         assert not worker.is_alive()
     b = make(tmp_path)
@@ -749,7 +893,7 @@ def test_the_sec_contact_never_reaches_the_log(tmp_path, monkeypatch, caplog):
     caplog.set_level(logging.DEBUG, logger="myopenfund_mcp")
     try:
         indexer.enqueue([ref()])
-        wait_until(lambda: failures and DOC not in indexer._active)
+        wait_until(lambda: failures and DOC not in indexer._jobs)
         assert "RuntimeError" in caplog.text and "OperationalError" in caplog.text
         assert CONTACT not in caplog.text
         assert all(record.exc_info is None for record in caplog.records)

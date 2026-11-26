@@ -71,6 +71,8 @@ FIELDS = {
     "MOF_FILINGS_SEARCH_MAX_DOCS": "filings_search_max_docs",
     "MOF_FILINGS_NOT_READY_LISTED": "filings_not_ready_listed",
     "MOF_INDEX_WORKERS": "index_workers", "MOF_INDEX_CLOSE_TIMEOUT_S": "index_close_timeout_s",
+    "MOF_INDEX_BATCH_SIZE": "index_batch_size", "MOF_INDEX_FIRST_BATCHES": "index_first_batches",
+    "MOF_INDEX_FETCH_AHEAD": "index_fetch_ahead",
     "MOF_WARM_POLL_INTERVAL_S": "warm_poll_interval_s", "MOF_WARM_STALL_S": "warm_stall_s", "MOF_RAG_ONNX_PROVIDER": "rag_onnx_provider",
     "MOF_SEARCH_RRF_K": "search_rrf_k", "MOF_SEARCH_CANDIDATES": "search_candidates",
     "MOF_SEARCH_EIGENMIND": "search_eigenmind", "MOF_FILINGS_DEFAULT_FORMS": "filings_default_forms",

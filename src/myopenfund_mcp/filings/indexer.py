@@ -3,7 +3,8 @@
 A document goes through: `queued` (enqueued) -> `fetching` (its primary document is downloaded,
 through the SEC client and its disk cache, and converted to Markdown by company-corpus) ->
 `indexing` (chunked, embedded, added) -> `ready`; or `failed` (with a one-line error), or `partial`
-(see "Restart"). `enqueue` returns at once; daemon worker threads (`MOF_INDEX_WORKERS`) do the work.
+(see "Restart"). `enqueue` returns at once; daemon threads (a fetcher and `MOF_INDEX_WORKERS`
+embedding workers) do the work.
 
 **Where things live** (never evicted by the HTTP cache):
 - `<cache_path()>/models/`: the embedding model files (a Hugging Face cache layout; 1.1 GB once).
@@ -30,12 +31,21 @@ ids do not depend on the order chunks are embedded in. Payload of each chunk: `d
 ended <report_date>, filed <filed>`; also the chunk context), `source_code` (the
 CIK), `section`, `chunker_version`, `accession`, `url`. A document without any chunk is `failed`.
 
-**Order.** The chunks of the form's priority sections (`company_corpus.live.documents.
-priority_sections`: Item 7 of a 10-K) are embedded and added first, then the others in document
-order, in batches of the embedder's batch size, each batch within one section. A search serves what
-is added so far: the MD&A of a document is searchable before the document is `ready`.
+**Order (ruling R41).** One fetcher thread downloads, converts and cuts the queued documents ahead
+of the embedding workers (`MOF_INDEX_WORKERS`), at most `MOF_INDEX_FETCH_AHEAD` documents cut and
+waiting (a company's newest document is fetched ahead whatever the count). The work is done in
+batches of `MOF_INDEX_BATCH_SIZE` passages, each within one section, in three passes over every
+document in flight, companies taken in the order they were first queued, a company's documents newest
+filing first (its rank):
+1. the first `MOF_INDEX_FIRST_BATCHES` batches of the priority sections (`company_corpus.live.
+   documents.priority_sections`: Item 7 of a 10-K) of each company's newest document, one batch of
+   each company in turn: every company fetched by one call has a first quotable passage early;
+2. the rest of the priority sections, by rank (the newest documents of every company, then the next
+   ones), company after company;
+3. the remainders, in the same order.
+A search serves what is added so far: the MD&A of a document is searchable before it is `ready`.
 
-**Model.** Loaded in a worker when the first document is taken, never at start-up; a `search` of
+**Model.** Loaded by the fetcher when the first document is taken, never at start-up; a `search` of
 documents indexed by an earlier process, made before any `enqueue`, loads it (and waits for a load in
 progress). Once loaded, searches never wait on it. The first `enqueue` result of the process has
 `model_download=True` when the pinned model files are not yet in `models/` (reported once).
@@ -57,7 +67,7 @@ first call that needs it; when another process holds it, every method raises `In
 message>` (the SEC contact is never written) and the worker continues with the next one. Log lines
 carry exception type names only.
 
-`close()` stops the workers after their current step (the model load, the fetch, the chunking or a
+`close()` stops the threads after their current step (the model load, the fetch, the chunking or a
 batch), waiting at most `MOF_INDEX_CLOSE_TIMEOUT_S`, then releases the index; a worker still busy
 then (a model download) finds the index closed and ends with the process. A document cut that way
 is `partial` for the next process. Calls after `close()` raise `IndexUnavailable`.
@@ -71,7 +81,6 @@ import datetime as dt
 import hashlib
 import json
 import logging
-import queue
 import sqlite3
 import tempfile
 import threading
@@ -86,7 +95,7 @@ from company_corpus.live.filings import FilingRef
 from company_corpus.live.sec import SecGet
 from rag_engine.chunking import Chunk, ChunkingOptions, chunk_markdown, load_tokenizer
 from rag_engine.config import Settings as EngineSettings
-from rag_engine.embedding import ONNX_BATCH_SIZE, ONNX_MODELS, Embedder, ModelSpec, OnnxEmbedder
+from rag_engine.embedding import ONNX_MODELS, Embedder, ModelSpec, OnnxEmbedder
 from rag_engine.local import LocalIndex, collection_name, hybrid_search
 from rag_engine.search import Hit, SearchFilters
 from rag_engine.select import select_diverse
@@ -141,6 +150,10 @@ class SectionNotFound(LookupError):
     """`read(section=...)` of a section the document's stored chunks do not have."""
 
 
+class NoText(ValueError):
+    """The primary document gives no chunk to index."""
+
+
 class _Stopped(Exception):
     """The indexer is closing: the worker leaves the document as it is (partial for the next process)."""
 
@@ -162,6 +175,25 @@ class DocStatus:
         out = dataclasses.asdict(self)
         out["filed"] = self.filed.isoformat() if self.filed else None
         return out
+
+
+@dataclass(eq=False)
+class _Job:
+    """A document in flight in this process: fetched and cut by the fetcher (`batches` set), then
+    embedded batch by batch by the workers. `busy` while one thread works on it."""
+
+    doc_id: str
+    filing: FilingRef
+    seq: int  # the company's turn: the order companies were first queued in this process
+    priority: frozenset[str]
+    rank: int = 0  # 0 = the company's newest document in flight (`FilingsIndexer._rank`)
+    busy: bool = False
+    batches: list[list[int]] | None = None  # None until fetched and cut
+    pieces: list[tuple[str | None, Chunk]] = dataclasses.field(default_factory=list)
+    sections: list[str | None] = dataclasses.field(default_factory=list)
+    payload: dict[str, Any] = dataclasses.field(default_factory=dict)
+    done: int = 0  # chunks stored
+    first_done: int = 0  # priority batches embedded while the company's newest document
 
 
 class EnqueueResult(list):
@@ -442,10 +474,11 @@ class FilingsIndexer:
         self._reconciled: set[str] = set()  # documents checked against the index in this process
         self._index: LocalIndex | None = None
         self._db: sqlite3.Connection | None = None
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._cv = threading.Condition(self._lock)  # a job became available, or the indexer stops
         self._workers: list[threading.Thread] = []
-        self._refs: dict[str, FilingRef] = {}
-        self._active: set[str] = set()
+        self._fetcher: threading.Thread | None = None
+        self._jobs: dict[str, _Job] = {}  # the documents in flight in this process
+        self._seq: dict[str, int] = {}  # CIK -> the company's turn in the indexing order
         self._stop = threading.Event()
         self._closed = False
 
@@ -536,6 +569,8 @@ class FilingsIndexer:
                 worker = threading.Thread(target=self._work, name=f"filings-indexer-{number}", daemon=True)
                 worker.start()
                 self._workers.append(worker)
+            self._fetcher = threading.Thread(target=self._fetch_loop, name="filings-fetcher", daemon=True)
+            self._fetcher.start()
 
     # --- the model -----------------------------------------------------------------------------
 
@@ -594,7 +629,7 @@ class FilingsIndexer:
             status = _status(row)
             if status.state == "ready" and index.count(status.doc_id) != status.chunks_total:
                 with self._lock:
-                    if status.doc_id not in self._active:
+                    if status.doc_id not in self._jobs:
                         self._update(status.doc_id, state="partial")
             with self._lock:
                 self._reconciled.add(status.doc_id)
@@ -698,45 +733,50 @@ class FilingsIndexer:
         names = names or {}
         self._reconcile(filing_doc_id(filing) for filing in refs)
         queued = False
-        for filing in refs:
-            doc_id = filing_doc_id(filing)
-            filed = filing.filed.isoformat() if filing.filed else None
-            company = names.get(filing.cik) or f"CIK {filing.cik}"
-            title = filing_title(company, filing.form, filing.report_date, filing.filed)
-            with self._lock:
-                current = self._get(doc_id)
-                if current is not None and (current.state == "ready" or doc_id in self._active):
-                    result.append(current)
-                    continue
-                self._conn().execute(
-                    "INSERT INTO documents (collection, doc_id, cik, form, accession, filed, report_date, url,"
-                    " title, state, chunks_done, chunks_total, error, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, ?)"
-                    " ON CONFLICT (collection, doc_id) DO UPDATE SET cik = excluded.cik, form = excluded.form,"
-                    " accession = excluded.accession, filed = excluded.filed,"
-                    " report_date = excluded.report_date, url = excluded.url,"
-                    " title = CASE WHEN documents.chunks_done > 0 THEN documents.title ELSE excluded.title END,"
-                    " state = 'queued', error = NULL, updated_at = excluded.updated_at",
-                    (
-                        self.collection,
-                        doc_id,
-                        filing.cik,
-                        filing.form,
-                        filing.accession,
-                        filed,
-                        filing.report_date.isoformat() if filing.report_date else None,
-                        filing.url,
-                        title,
-                        _now(),
-                    ),
-                )
-                self._refs[doc_id] = filing
-                self._active.add(doc_id)
-                self._queue.put(doc_id)
-                queued = True
-                status = self._get(doc_id)
-                assert status is not None
-                result.append(status)
+        # One lock over the whole call: the fetcher sees every document of it at once (the order is
+        # newest first per company, whatever the order of `refs`).
+        with self._cv:
+            for filing in refs:
+                doc_id = filing_doc_id(filing)
+                filed = filing.filed.isoformat() if filing.filed else None
+                company = names.get(filing.cik) or f"CIK {filing.cik}"
+                title = filing_title(company, filing.form, filing.report_date, filing.filed)
+                with self._lock:
+                    current = self._get(doc_id)
+                    if current is not None and (current.state == "ready" or doc_id in self._jobs):
+                        result.append(current)
+                        continue
+                    self._conn().execute(
+                        "INSERT INTO documents (collection, doc_id, cik, form, accession, filed, report_date, url,"
+                        " title, state, chunks_done, chunks_total, error, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, ?)"
+                        " ON CONFLICT (collection, doc_id) DO UPDATE SET cik = excluded.cik, form = excluded.form,"
+                        " accession = excluded.accession, filed = excluded.filed,"
+                        " report_date = excluded.report_date, url = excluded.url,"
+                        " title = CASE WHEN documents.chunks_done > 0 THEN documents.title ELSE excluded.title END,"
+                        " state = 'queued', error = NULL, updated_at = excluded.updated_at",
+                        (
+                            self.collection,
+                            doc_id,
+                            filing.cik,
+                            filing.form,
+                            filing.accession,
+                            filed,
+                            filing.report_date.isoformat() if filing.report_date else None,
+                            filing.url,
+                            title,
+                            _now(),
+                        ),
+                    )
+                    seq = self._seq.setdefault(filing.cik, len(self._seq))
+                    self._jobs[doc_id] = _Job(doc_id, filing, seq, frozenset(priority_sections(filing.form)))
+                    queued = True
+                    status = self._get(doc_id)
+                    assert status is not None
+                    result.append(status)
+            for cik in dict.fromkeys(filing.cik for filing in refs):
+                self._rank(cik)
+            self._cv.notify_all()
         if queued and download:
             with self._lock:
                 result.model_download = not self._download_reported
@@ -1004,16 +1044,15 @@ class FilingsIndexer:
                 return
             self._closed = True
             self._stop.set()
-            workers = list(self._workers)
-        for _ in workers:
-            self._queue.put(None)
+            self._cv.notify_all()
+            workers = [*self._workers, *([self._fetcher] if self._fetcher else [])]
         deadline = time.monotonic() + self._settings.index_close_timeout_s
         for worker in workers:
             worker.join(max(0.0, deadline - time.monotonic()))
         busy = sum(worker.is_alive() for worker in workers)
         if busy:
             log.warning(
-                "%d filings indexing worker(s) still busy after MOF_INDEX_CLOSE_TIMEOUT_S: the index is "
+                "%d filings indexing thread(s) still busy after MOF_INDEX_CLOSE_TIMEOUT_S: the index is "
                 "released, their documents are resumed next time",
                 busy,
             )
@@ -1027,42 +1066,137 @@ class FilingsIndexer:
         if self._embedder is not None and not busy:
             self._embedder.release()
 
-    # --- the worker ----------------------------------------------------------------------------
+    # --- the scheduler -------------------------------------------------------------------------
+
+    def _rank(self, cik: str) -> None:
+        """Rank the in-flight documents of company `cik`, newest filing first (0 = its newest). Set
+        when a document of the company is queued, kept while its documents are indexed. Call with the
+        lock held."""
+        jobs = [job for job in self._jobs.values() if job.filing.cik == cik]
+        jobs.sort(key=lambda job: (-(job.filing.filed or dt.date.min).toordinal(), job.doc_id))
+        for rank, job in enumerate(jobs):
+            job.rank = rank
+
+    def _key(self, job: _Job) -> tuple:
+        """Where the next step of `job` comes in the indexing order (smallest first):
+        pass 1 `(1, i, company)`: batch i < MOF_INDEX_FIRST_BATCHES of the priority section of a
+        company's newest document, companies taken in turn; pass 2 `(2, rank, company)`: the rest of
+        the priority sections, newest documents first; pass 3 `(3, rank, company)`: the remainders.
+        A document not fetched yet takes the key of its first batch (its fetch comes first)."""
+        first = self._settings.index_first_batches
+        if job.batches is None:
+            priority = bool(priority_sections(job.filing.form))
+            if priority and job.rank == 0 and first > 0:
+                return (1, 0, job.seq, job.doc_id)
+            return (2 if priority else 3, job.rank, job.seq, job.doc_id)
+        nxt = job.batches[0]
+        if job.sections[nxt[0]] in job.priority:
+            if job.rank == 0 and job.first_done < first:
+                return (1, job.first_done, job.seq, job.doc_id)
+            return (2, job.rank, job.seq, job.doc_id)
+        return (3, job.rank, job.seq, job.doc_id)
+
+    def _next_job(self, *, fetch: bool) -> _Job | None:
+        """The idle job whose next step comes first: one to fetch (`fetch`), else one with batches
+        left. A fetch beyond MOF_INDEX_FETCH_AHEAD documents waiting is held back, except a company's
+        newest document's first round. Call with the lock held."""
+        if fetch:
+            waiting = sum(job.batches is not None for job in self._jobs.values())
+            idle = [job for job in self._jobs.values() if job.batches is None and not job.busy]
+        else:
+            idle = [job for job in self._jobs.values() if job.batches and not job.busy]
+        if not idle:
+            return None
+        best = min(idle, key=self._key)
+        if fetch and waiting >= self._settings.index_fetch_ahead and self._key(best)[0] != 1:
+            return None
+        return best
+
+    def _take(self, *, fetch: bool) -> _Job | None:
+        """Wait for a job to work on (marked busy), or None when the indexer stops."""
+        with self._cv:
+            while True:
+                if self._stop.is_set():
+                    return None
+                job = self._next_job(fetch=fetch)
+                if job is not None:
+                    job.busy = True
+                    return job
+                self._cv.wait()
+
+    def _finish(self, job: _Job, final: tuple[str, str | None] | None) -> None:
+        """Record the final state (None: left as it is, partial for the next process) and leave the
+        in-flight set, together: `enqueue` sees both or neither."""
+        with self._cv:
+            try:
+                if final is not None:
+                    self._update(job.doc_id, state=final[0], error=final[1])
+            except Exception as exc:  # noqa: BLE001 - the index may be closing
+                log.warning("could not record the state of filing %s: %s", job.doc_id, type(exc).__name__)
+            finally:
+                self._jobs.pop(job.doc_id, None)
+                self._cv.notify_all()
+
+    def _fail(self, job: _Job, exc: BaseException) -> None:
+        # Type names only: a message, or its chained context, may hold the SEC contact.
+        log.warning("filing %s failed: %s", job.doc_id, type(exc).__name__)
+        self._finish(job, ("failed", _short_error(exc, self._settings.sec_contact)))
+
+    # --- the workers ---------------------------------------------------------------------------
+
+    def _fetch_loop(self) -> None:
+        """Fetch and cut the documents, in the indexing order, ahead of the embedding workers."""
+        while True:
+            job = self._take(fetch=True)
+            if job is None:
+                return
+            try:
+                self._prepare(job)
+            except _Stopped:
+                self._finish(job, None)
+                continue
+            except Exception as exc:  # noqa: BLE001 - one document fails, the fetcher goes on
+                self._fail(job, exc)
+                continue
+            if not job.batches:  # every chunk was stored already
+                self._finish(job, ("ready", None))
+                continue
+            with self._cv:
+                job.busy = False
+                self._cv.notify_all()
 
     def _work(self) -> None:
+        """Embed and add batches, the next one in the indexing order each time."""
         while True:
-            doc_id = self._queue.get()
-            if doc_id is None or self._stop.is_set():
+            job = self._take(fetch=False)
+            if job is None:
                 return
-            final: tuple[str, str | None] | None = None
             try:
-                self._index_one(doc_id)
-                final = ("ready", None)
+                self._embed(job, job.batches[0])
             except _Stopped:
-                pass  # left as it is: partial for the next process
+                self._finish(job, None)
+                continue
             except Exception as exc:  # noqa: BLE001 - one document fails, the worker goes on
-                # Type names only: a message, or its chained context, may hold the SEC contact.
-                log.warning("filing %s failed: %s", doc_id, type(exc).__name__)
-                final = ("failed", _short_error(exc, self._settings.sec_contact))
-            # The final state and leaving the in-flight set together: enqueue sees both or neither.
-            with self._lock:
-                try:
-                    if final is not None:
-                        self._update(doc_id, state=final[0], error=final[1])
-                except Exception as exc:  # noqa: BLE001 - the index may be closing
-                    log.warning("could not record the state of filing %s: %s", doc_id, type(exc).__name__)
-                finally:
-                    self._active.discard(doc_id)
+                self._fail(job, exc)
+                continue
+            with self._cv:
+                job.batches.pop(0)
+                done = not job.batches
+                job.busy = False
+                self._cv.notify_all()
+            if done:
+                self._finish(job, ("ready", None))
 
     def _check_stop(self) -> None:
         if self._stop.is_set():
             raise _Stopped
 
-    def _index_one(self, doc_id: str) -> None:
-        filing = self._refs[doc_id]
+    def _prepare(self, job: _Job) -> None:
+        """Fetch the document, cut it, compare the cut with the stored one; the batches left."""
+        doc_id, filing = job.doc_id, job.filing
         self._update(doc_id, state="fetching", error=None)
         self._check_stop()
-        embedder, tokenizer = self._model()
+        _, tokenizer = self._model()
         self._check_stop()
         document = self._loader(filing, self._sec)
         self._check_stop()
@@ -1072,8 +1206,9 @@ class FilingsIndexer:
         )
         title, fingerprint = stored[0]
         pieces = document_chunks(document, options=self.options, tokenizer=tokenizer, title=title)
+        del document
         if not pieces:
-            raise ValueError("no text to index in the primary document")
+            raise NoText("no text to index in the primary document")
         self._check_stop()
         cut = _fingerprint(self.chunker_version, title, pieces)
         with self._lock:
@@ -1089,9 +1224,10 @@ class FilingsIndexer:
         self._update(
             doc_id, state="indexing", chunks_total=len(pieces), chunks_done=len(done), fingerprint=cut
         )
-        sections = [name for name, _ in pieces]
-        size = getattr(embedder, "batch_size", ONNX_BATCH_SIZE)
-        base = {
+        job.pieces = pieces
+        job.sections = [name for name, _ in pieces]
+        job.done = len(done)
+        job.payload = {
             "doc_type": filing.form,
             "date": filing.filed.isoformat() if filing.filed else None,
             "title": title,
@@ -1100,13 +1236,22 @@ class FilingsIndexer:
             "accession": filing.accession,
             "url": filing.url,
         }
-        for batch in _batches(sections, done, set(priority_sections(filing.form)), size):
-            self._check_stop()
-            section = sections[batch[0]]
-            if any(sections[number] != section for number in batch):  # one payload per batch
-                raise RuntimeError("a batch spans two sections")
-            chunks = [pieces[number][1] for number in batch]
-            vectors = embedder.encode_passage([chunk.embedded_text for chunk in chunks])
-            index.add(doc_id, chunks, vectors, {**base, "section": section}, first_index=batch[0])
-            self._record_batch(doc_id, batch, sections, chunks, len(done) + len(batch))
-            done.update(batch)
+        job.batches = _batches(job.sections, done, job.priority, self._settings.index_batch_size)
+
+    def _embed(self, job: _Job, batch: Sequence[int]) -> None:
+        self._check_stop()
+        embedder, _ = self._model()
+        with self._lock:
+            index = self._index
+            if index is None:
+                raise IndexClosed("the filings index is closed")
+        section = job.sections[batch[0]]
+        if any(job.sections[number] != section for number in batch):  # one payload per batch
+            raise RuntimeError("a batch spans two sections")
+        chunks = [job.pieces[number][1] for number in batch]
+        vectors = embedder.encode_passage([chunk.embedded_text for chunk in chunks])
+        index.add(job.doc_id, chunks, vectors, {**job.payload, "section": section}, first_index=batch[0])
+        self._record_batch(job.doc_id, batch, job.sections, chunks, job.done + len(batch))
+        job.done += len(batch)
+        if section in job.priority and job.rank == 0:
+            job.first_done += 1

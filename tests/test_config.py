@@ -365,6 +365,8 @@ def test_contact_is_never_shown_or_echoed():
         {"MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "0"}, {"MOF_FILINGS_SEARCH_MAX_LIMIT": "1001"},
         {"MOF_FILINGS_SEARCH_MAX_DOCS": "0"}, {"MOF_FILINGS_NOT_READY_LISTED": "1001"},
         {"MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "21"},
+        {"MOF_INDEX_BATCH_SIZE": "0"}, {"MOF_INDEX_BATCH_SIZE": "1025"}, {"MOF_INDEX_FIRST_BATCHES": "-1"},
+        {"MOF_INDEX_FIRST_BATCHES": "101"}, {"MOF_INDEX_FETCH_AHEAD": "0"}, {"MOF_INDEX_FETCH_AHEAD": "1001"},
     ],
 )
 def test_bad_no_vault_values_are_refused(env):
@@ -377,6 +379,14 @@ def test_rps_is_a_float_up_to_ten_and_retries_may_be_zero():
     assert Settings.from_env({"MOF_SEC_MAX_RPS": "10"}).sec_max_rps == 10.0
     assert Settings.from_env({"MOF_SEC_RETRIES": "0"}).sec_retries == 0
     assert Settings.from_env({"MOF_SEARCH_EIGENMIND": "true"}).search_eigenmind is True
+
+
+def test_indexing_order_settings():
+    default = Settings.from_env({})
+    assert (default.index_batch_size, default.index_first_batches, default.index_fetch_ahead) == (32, 1, 24)
+    assert default.index_close_timeout_s == 30  # one batch (8-12 s on 4 CPU) fits
+    got = Settings.from_env({"MOF_INDEX_BATCH_SIZE": "8", "MOF_INDEX_FIRST_BATCHES": "0", "MOF_INDEX_FETCH_AHEAD": "3"})
+    assert (got.index_batch_size, got.index_first_batches, got.index_fetch_ahead) == (8, 0, 3)
 
 
 def test_default_cache_dir_ignores_a_relative_base_and_names_a_missing_home(monkeypatch, tmp_path):
