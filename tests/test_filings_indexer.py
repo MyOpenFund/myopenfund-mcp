@@ -331,6 +331,91 @@ def test_fetch_ahead_bounds_the_documents_cut_but_not_a_companys_first_round(tmp
     assert [doc for doc, _, _ in units[:2]] == [new_a, new_b]
 
 
+def test_beyond_the_fetch_ahead_bound_a_document_waits_for_a_cut_one_to_finish(tmp_path, monkeypatch):
+    """More documents than MOF_INDEX_FETCH_AHEAD (2): the newest of each company is cut and gets its
+    Item 7 first; each later document is fetched only once a cut one is finished, remainder included,
+    so its Item 7 comes after that remainder (the documented limit of the bound)."""
+    embedder = GatedEmbedder(allowed=0, batch_size=2)
+    indexer = make(tmp_path, embedder, index_fetch_ahead=2, index_first_batches=1)
+    units = record_units(indexer, monkeypatch)
+    newest = [f"sec-{A}-2024", f"sec-{B}-2024"]
+    held = [f"sec-{A}-2023", f"sec-{B}-2023", f"sec-{A}-2022", f"sec-{B}-2022"]  # their fetch order
+    try:
+        indexer.enqueue([company_ref(cik, year) for cik in (A, B) for year in (2022, 2023, 2024)])
+        wait_until(lambda: all(state_of(indexer, doc).state == "indexing" for doc in newest))
+        time.sleep(0.3)
+        assert {state_of(indexer, doc).state for doc in held} == {"queued"}  # held back by the bound
+        embedder.gate.set()
+        wait_until(lambda: all(s.state == "ready" for s in indexer.status()))
+    finally:
+        embedder.gate.set()
+        indexer.close()
+    assert [doc for doc, _, _ in units[:2]] == newest  # pass 1
+    first_rest = next(i for i, (_, section, _) in enumerate(units) if section != "Item 7")
+    assert {doc for doc, _, _ in units[:first_rest]} == set(newest)  # the cut documents' Item 7 first
+    last = {doc: max(i for i, (d, _, _) in enumerate(units) if d == doc) for doc in newest + held}
+    for k, doc in enumerate(held):
+        start = min(i for i, (d, _, _) in enumerate(units) if d == doc)
+        assert units[start][1] == "Item 7"
+        finished_before = sum(1 for other, end in last.items() if end < start)
+        assert finished_before >= k + 1, (doc, finished_before)  # at most 2 documents cut and waiting
+
+
+def test_a_company_whose_newest_document_fails_at_fetch_keeps_its_first_round(tmp_path, monkeypatch):
+    """A, B, C x 2 10-Ks; B's newest fails at fetch: B's next document takes its first-round slot."""
+    C = "0000000003"
+
+    def loader(filing, sec):
+        if filing.cik == B and filing.filed.year == 2024:
+            raise RuntimeError("boom")
+        return load(filing, sec)
+
+    embedder = GatedEmbedder(allowed=0, batch_size=2)
+    indexer = make(tmp_path, embedder, loader=loader, index_first_batches=1)
+    units = record_units(indexer, monkeypatch)
+    try:
+        indexer.enqueue([company_ref(cik, year) for cik in (A, B, C) for year in (2023, 2024)])
+        wait_until(
+            lambda: state_of(indexer, f"sec-{B}-2024").state == "failed"
+            and all(s.state == "indexing" for s in indexer.status() if s.state != "failed")
+        )
+        embedder.gate.set()
+        wait_until(lambda: all(s.state in ("ready", "failed") for s in indexer.status()))
+    finally:
+        embedder.gate.set()
+        indexer.close()
+    assert [(doc, section) for doc, section, _ in units[:3]] == [
+        (f"sec-{A}-2024", "Item 7"), (f"sec-{B}-2023", "Item 7"), (f"sec-{C}-2024", "Item 7")
+    ]
+
+
+def test_fetching_again_does_not_rerank_documents_in_flight(tmp_path, monkeypatch):
+    """Polling by fetching the same filings again queues nothing new and changes no rank: once A's
+    newest is ready, A's older remainder still comes after B's newest remainder (rank 1 after rank 0)."""
+    refs = [company_ref(cik, year) for cik in (A, B) for year in (2023, 2024)]
+    probe = run_in_order(tmp_path / "probe", monkeypatch, refs, index_first_batches=1)
+    new_a, old_a, new_b = f"sec-{A}-2024", f"sec-{A}-2023", f"sec-{B}-2024"
+    through_new_a = max(i for i, (d, _, _) in enumerate(probe) if d == new_a) + 1
+    assert through_new_a < len(probe)  # A's newest is ready before the end
+
+    embedder = GatedEmbedder(allowed=through_new_a, batch_size=2)
+    indexer = make(tmp_path, embedder, index_first_batches=1)
+    units = record_units(indexer, monkeypatch)
+    try:
+        indexer.enqueue(refs)
+        wait_until(lambda: state_of(indexer, new_a).state == "ready")
+        again = indexer.enqueue(refs)  # nothing new: every document is ready or in flight
+        assert {s.state for s in again} <= {"ready", "indexing"}
+        embedder.gate.set()
+        wait_until(lambda: all(s.state == "ready" for s in indexer.status()))
+    finally:
+        embedder.gate.set()
+        indexer.close()
+    rest_b = [i for i, (d, s, _) in enumerate(units) if d == new_b and s != "Item 7"]
+    rest_old_a = [i for i, (d, s, _) in enumerate(units) if d == old_a and s != "Item 7"]
+    assert max(rest_b) < min(rest_old_a)
+
+
 def test_default_batch_size_is_the_onnx_batch_size():
     from rag_engine.embedding import ONNX_BATCH_SIZE
 

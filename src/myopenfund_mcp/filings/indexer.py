@@ -43,6 +43,12 @@ filing first (its rank):
 2. the rest of the priority sections, by rank (the newest documents of every company, then the next
    ones), company after company;
 3. the remainders, in the same order.
+A company whose newest 10-K has no detected Item 7 gets no first-round passage: its next document's
+Item 7 comes in pass 2. One whose newest document fails at fetch is ranked again: its next document
+takes the first-round slot. The passes cover the documents cut: beyond `MOF_INDEX_FETCH_AHEAD`, a
+document is fetched only once a cut one is finished, so documents cut later get their Item 7 after
+the remainders of the documents already cut. The default bound (40) is the default
+`MOF_FILINGS_MAX_DOCS`, so every document of one fetch call is cut ahead; keep it at least as high.
 A search serves what is added so far: the MD&A of a document is searchable before it is `ready`.
 
 **Model.** Loaded by the fetcher when the first document is taken, never at start-up; a `search` of
@@ -758,6 +764,7 @@ class FilingsIndexer:
         names = names or {}
         self._reconcile(filing_doc_id(filing) for filing in refs)
         queued = False
+        gained: dict[str, None] = {}  # the companies with a document newly in flight, in order
         # One lock over the whole call: the fetcher sees every document of it at once (the order is
         # newest first per company, whatever the order of `refs`).
         with self._cv:
@@ -796,10 +803,11 @@ class FilingsIndexer:
                     seq = self._seq.setdefault(filing.cik, len(self._seq))
                     self._jobs[doc_id] = _Job(doc_id, filing, seq, frozenset(priority_sections(filing.form)))
                     queued = True
+                    gained[filing.cik] = None
                     status = self._get(doc_id)
                     assert status is not None
                     result.append(status)
-            for cik in dict.fromkeys(filing.cik for filing in refs):
+            for cik in gained:  # a fetch that queues nothing new changes no rank
                 self._rank(cik)
             self._cv.notify_all()
         if queued and download:
@@ -1095,8 +1103,9 @@ class FilingsIndexer:
 
     def _rank(self, cik: str) -> None:
         """Rank the in-flight documents of company `cik`, newest filing first (0 = its newest). Set
-        when a document of the company is queued, kept while its documents are indexed. Call with the
-        lock held."""
+        when a document of the company is queued and when one leaves without being ready (failed or
+        stopped: the next one takes its first-round slot); kept while a ready one leaves. Call with
+        the lock held."""
         jobs = [job for job in self._jobs.values() if job.filing.cik == cik]
         jobs.sort(key=lambda job: (-(job.filing.filed or dt.date.min).toordinal(), job.doc_id))
         for rank, job in enumerate(jobs):
@@ -1160,6 +1169,8 @@ class FilingsIndexer:
                 log.warning("could not record the state of filing %s: %s", job.doc_id, type(exc).__name__)
             finally:
                 self._jobs.pop(job.doc_id, None)
+                if final is None or final[0] != "ready":
+                    self._rank(job.filing.cik)
                 self._cv.notify_all()
 
     def _fail(self, job: _Job, exc: BaseException) -> None:
@@ -1205,6 +1216,8 @@ class FilingsIndexer:
                 self._fail(job, exc)
                 continue
             with self._cv:
+                if job.sections[job.batches[0][0]] in job.priority and job.rank == 0:
+                    job.first_done += 1
                 job.batches.pop(0)
                 done = not job.batches
                 job.busy = False
@@ -1278,5 +1291,3 @@ class FilingsIndexer:
         index.add(job.doc_id, chunks, vectors, {**job.payload, "section": section}, first_index=batch[0])
         self._record_batch(job.doc_id, batch, job.sections, chunks, job.done + len(batch))
         job.done += len(batch)
-        if section in job.priority and job.rank == 0:
-            job.first_done += 1
