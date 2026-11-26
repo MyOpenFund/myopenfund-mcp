@@ -6,15 +6,18 @@
 
 `-m integration`: quarterly capex and total debt of Microsoft, Amazon, Alphabet, Meta and Oracle since 2022,
 and values checked by hand against their 10-K text (the pinned values below). `-m models` (downloads the
-embedding model, 1.1 GB, unless MOF_MCP_IT_MODELS_DIR gives it, and indexes 10-Ks: minutes on 4 CPU cores):
+embedding model once per run, 1.1 GB, unless MOF_MCP_IT_MODELS_DIR gives it — before any timing — and
+indexes 10-Ks: minutes on 4 CPU cores):
 - the first quotable passage of each company (spec §8): seconds from `companies_fetch_filings` (its 10-Ks
   since 2022, in a fresh cache folder) to the first `companies_search_filings` hit in Item 7 about capex or
-  financing; criterion MOF_MCP_IT_FIRST_PASSAGE_S (default 120, the spec's 2 minutes);
+  financing; criterion MOF_MCP_IT_FIRST_PASSAGE_S (default 120, the spec's 2 minutes); once per company
+  fetched alone, and once for the five fetched in ONE call (22 10-Ks: each company within the criterion);
 - a French question over the Microsoft FY2024 10-K finds a passage of its Item 7 (Review Focus 5).
 
 Optional: MOF_MCP_IT_CACHE_DIR (absolute; the cache folder of the facts tests and the French one, default a
 temporary folder per run), MOF_MCP_IT_MODELS_DIR (absolute; a folder holding the model files, the `models/` of
 an earlier cache folder: linked into every fresh cache folder instead of downloading),
+MOF_SEC_MAX_RPS, MOF_RAG_ONNX_* and MOF_INDEX_* (passed to the server; no other variable of the shell is),
 MOF_MCP_IT_INDEX_TIMEOUT_S (seconds a models test waits for indexing, default 1800). Set
 MOF_RAG_ONNX_PROVIDER=coreml to measure the Mac's accelerator. The contact is read from the environment only,
 never printed.
@@ -86,15 +89,32 @@ def _int_env(name: str, default: int) -> int:
     return value
 
 
-def _fresh_cache(path) -> str:
-    """A new cache folder; the model files of MOF_MCP_IT_MODELS_DIR linked into it when given."""
+def _fresh_cache(path, models: str | None = None) -> str:
+    """A new cache folder; the model files of `models` (a `models/` folder) linked into it when given."""
     os.makedirs(path, mode=0o700, exist_ok=True)
-    models = os.environ.get("MOF_MCP_IT_MODELS_DIR")
     if models:
-        if not os.path.isabs(models) or not os.path.isdir(models):
-            pytest.fail("MOF_MCP_IT_MODELS_DIR must be the absolute path of an existing folder")
         os.symlink(models, os.path.join(path, "models"))
     return str(path)
+
+
+@pytest.fixture(scope="module")
+def models_dir(tmp_path_factory) -> str:
+    """The embedding model files, once per module: MOF_MCP_IT_MODELS_DIR, else downloaded here (1.1 GB)
+    before any timed test, so that no timing counts the download."""
+    given = os.environ.get("MOF_MCP_IT_MODELS_DIR")
+    if given:
+        if not os.path.isabs(given) or not os.path.isdir(given):
+            pytest.fail("MOF_MCP_IT_MODELS_DIR must be the absolute path of an existing folder")
+        return given
+    from rag_engine.chunking import load_tokenizer
+    from rag_engine.config import Settings as EngineSettings
+    from rag_engine.embedding import ModelSpec, OnnxEmbedder
+
+    folder = str(tmp_path_factory.mktemp("models"))
+    spec = ModelSpec.from_settings(EngineSettings())
+    OnnxEmbedder(spec, cache_dir=folder).encode_passage(["warm up"])
+    load_tokenizer(folder, spec.name)
+    return folder
 
 
 @pytest.fixture(scope="module")
@@ -104,11 +124,19 @@ def cache_dir(tmp_path_factory) -> str:
         if not os.path.isabs(given):
             pytest.fail("MOF_MCP_IT_CACHE_DIR must be an absolute path")
         return given
-    return _fresh_cache(tmp_path_factory.mktemp("mof") / "cache")
+    return _fresh_cache(tmp_path_factory.mktemp("mof") / "cache", os.environ.get("MOF_MCP_IT_MODELS_DIR"))
+
+
+#: what the server reads from this process's environment: the contact, the ONNX knobs, the SEC rate
+PASSED_ENV = ("MOF_SEC_CONTACT", "MOF_SEC_MAX_RPS", "MOF_RAG_ONNX_PROVIDER", "MOF_RAG_ONNX_THREADS",
+              "MOF_INDEX_WORKERS", "MOF_INDEX_BATCH_SIZE", "MOF_INDEX_FIRST_BATCHES", "MOF_INDEX_FETCH_AHEAD")
 
 
 def _client(cache_dir: str) -> Client:
-    env = {**os.environ, "MOF_COMPANIES_SOURCE": "sec", "MOF_CACHE_DIR": cache_dir}
+    """A server on `cache_dir` with a clean environment: only the variables above (no other MOF_* of
+    the shell, which could point the test at a store or another cache)."""
+    env = {k: os.environ[k] for k in PASSED_ENV if k in os.environ}
+    env.update({"MOF_COMPANIES_SOURCE": "sec", "MOF_CACHE_DIR": cache_dir})
     return Client(build_server(Settings.from_env(env)))
 
 
@@ -175,33 +203,70 @@ def _quotable(hits: list[dict]) -> dict | None:
                 None)
 
 
+async def _first_passages(c: Client, tickers: list[str], t0: float, wait_s: int) -> dict[str, float]:
+    """Seconds from `t0` to each company's first quotable Item 7 hit (searched company by company,
+    every 2 s); a company still without one after `wait_s` is missing from the result."""
+    found: dict[str, float] = {}
+    while len(found) < len(tickers) and time.monotonic() - t0 < wait_s:
+        for ticker in tickers:
+            if ticker in found:
+                continue
+            try:
+                res = await _call(c, "companies_search_filings",
+                                  {"query": SCENARIO_QUERY, "companies": [ticker], "limit": 10})
+            except ToolError as exc:
+                if not str(exc).startswith("[index_not_ready]"):
+                    raise
+                continue
+            hit = _quotable(res["hits"])
+            if hit is not None:
+                assert hit["url"].startswith("https://www.sec.gov/")
+                found[ticker] = time.monotonic() - t0
+        if len(found) < len(tickers):
+            await asyncio.sleep(2)
+    return found
+
+
 @pytest.mark.models
 @pytest.mark.parametrize("ticker", TICKERS)
-async def test_first_quotable_passage(tmp_path, ticker):
+async def test_first_quotable_passage(tmp_path, models_dir, ticker):
     limit_s = _int_env("MOF_MCP_IT_FIRST_PASSAGE_S", 120)
     wait_s = _int_env("MOF_MCP_IT_INDEX_TIMEOUT_S", 1800)
-    async with _client(_fresh_cache(tmp_path / "cache")) as c:
+    async with _client(_fresh_cache(tmp_path / "cache", models_dir)) as c:
         t0 = time.monotonic()
         fetched = await _call(c, "companies_fetch_filings",
                               {"companies": [ticker], "forms": ["10-K"], "period_from": SINCE})
         assert len(fetched["documents"]) >= 4
-        hit = None
-        while hit is None and time.monotonic() - t0 < wait_s:
-            try:
-                res = await _call(c, "companies_search_filings",
-                                  {"query": SCENARIO_QUERY, "companies": [ticker], "limit": 10})
-                hit = _quotable(res["hits"])
-            except ToolError as exc:
-                if not str(exc).startswith("[index_not_ready]"):
-                    raise
-            if hit is None:
-                await asyncio.sleep(2)
-        elapsed = time.monotonic() - t0
-    print(f"{ticker}: first quotable Item 7 passage after {elapsed:.0f} s "
+        assert fetched["model_download"] is False
+        found = await _first_passages(c, [ticker], t0, wait_s)
+    print(f"{ticker}: first quotable Item 7 passage after {found.get(ticker, float('nan')):.0f} s "
           f"({len(fetched['documents'])} 10-Ks queued)")
-    assert hit is not None, f"{ticker}: no quotable Item 7 passage after {elapsed:.0f} s"
-    assert hit["url"].startswith("https://www.sec.gov/")
-    assert elapsed <= limit_s, f"{ticker}: {elapsed:.0f} s > {limit_s} s (MOF_MCP_IT_FIRST_PASSAGE_S)"
+    assert ticker in found, f"{ticker}: no quotable Item 7 passage after {wait_s} s"
+    assert found[ticker] <= limit_s, f"{ticker}: {found[ticker]:.0f} s > {limit_s} s (MOF_MCP_IT_FIRST_PASSAGE_S)"
+
+
+@pytest.mark.models
+async def test_first_quotable_passage_of_five_companies_fetched_in_one_call(tmp_path, models_dir):
+    """R41, the failing shape of C11: the five companies' 10-Ks since 2022 (22 documents) in ONE
+    fetch; each company's first quotable Item 7 passage within the criterion of the fetch call."""
+    limit_s = _int_env("MOF_MCP_IT_FIRST_PASSAGE_S", 120)
+    wait_s = _int_env("MOF_MCP_IT_INDEX_TIMEOUT_S", 1800)
+    async with _client(_fresh_cache(tmp_path / "cache", models_dir)) as c:
+        t0 = time.monotonic()
+        fetched = await _call(c, "companies_fetch_filings",
+                              {"companies": TICKERS, "forms": ["10-K"], "period_from": SINCE})
+        fetch_s = time.monotonic() - t0
+        assert len(fetched["documents"]) >= 20
+        assert fetched["model_download"] is False
+        found = await _first_passages(c, TICKERS, t0, min(wait_s, 3 * limit_s))
+    total = time.monotonic() - t0
+    for ticker in TICKERS:
+        print(f"{ticker}: first quotable Item 7 passage after {found.get(ticker, float('nan')):.0f} s")
+    print(f"fetch call {fetch_s:.1f} s, {len(fetched['documents'])} 10-Ks queued; last first passage "
+          f"{max(found.values(), default=float('nan')):.0f} s; measured for {total:.0f} s")
+    assert set(found) == set(TICKERS), f"no quotable Item 7 passage for {sorted(set(TICKERS) - set(found))}"
+    late = {t: round(s) for t, s in found.items() if s > limit_s}
+    assert not late, f"first passage above {limit_s} s (MOF_MCP_IT_FIRST_PASSAGE_S): {late}"
 
 
 @pytest.mark.models

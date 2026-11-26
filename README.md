@@ -133,14 +133,17 @@ machine; later questions about it are answered from the index. Measured on 4 CPU
 | Embedding model download (once, 1.1 GB) | 18 s on a fast connection; minutes on a home one |
 | Facts (`companies_fundamentals`), first call for a company | 17 to 26 s; later calls under 1 s |
 | One 10-K downloaded, converted and indexed (390 to 720 passages) | 95 to 216 s, median 159 s |
-| First quotable passage (Item 7) after `companies_fetch_filings` of **one** company | 17 to 32 s |
+| First quotable passage (Item 7) after `companies_fetch_filings` of **one** company (its 4-5 10-Ks) | 24 to 45 s |
+| First quotable passage of **each** company when the five are fetched in **one** call (22 10-Ks) | Microsoft 42 s, Amazon 55 s, Alphabet 67 s, Meta 80 s, Oracle 93 s (fetch call 3 s) |
 | The five companies' 22 10-Ks, fetched in one call, all indexed | 56 min |
 | A search once indexed | 0.25 s |
 
-Documents are indexed one after the other, in the order fetched (`MOF_INDEX_WORKERS`, default 1), the
-Item 7 (MD&A) of each first. So fetch the company you are asking about first: when five companies are
-fetched in one call, the last one's first passage waits for the others' documents (43 min in the run
-above). For several companies over several years, run `warm` beforehand. On Apple Silicon, set
+(First-passage times measured 2026-11-26 with the model already on disk; the model download is not
+counted.) The indexer takes the companies in turn: first one batch (`MOF_INDEX_BATCH_SIZE`, 32 passages,
+about 10 s) of the MD&A (Item 7) of each company's newest document, then the rest of the MD&As, newest
+documents first, then everything else (`MOF_INDEX_FIRST_BATCHES`). So every company fetched in one call
+gets quotable passages within two minutes, while the full documents take longer. For several companies
+over several years, run `warm` beforehand. On Apple Silicon, set
 `MOF_RAG_ONNX_PROVIDER=coreml` to run the embedding on the Mac's accelerator instead of the CPU (`cpu`
 is the default). `MOF_RAG_ONNX_THREADS` limits the CPU threads. While a filing is still being prepared,
 the tools say so and which documents are not ready; ask again a little later.
@@ -1070,7 +1073,7 @@ are excluded by default and run with an explicit marker:
 - `pytest -m integration`: against a real vault database, with `MOF_MCP_IT_DATABASE_URL` set.
 - `pytest -m integration tests/integration/test_real_store.py`: against a real company store, with `MOF_MCP_IT_COMPANIES_CATALOG` and `MOF_MCP_IT_COMPANIES_DATA_ROOT` set (optional: `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, default 120; `MOF_MCP_IT_ASSERT_LATENCY=1` to enforce the 5 s criterion, on your store host only; add `-s` or `-rP` to see the printed fundamentals latency).
 - `pytest -m integration tests/integration/test_real_qdrant.py`: `rag_search` against a **throwaway** Qdrant (never a production one: the test creates and deletes collections), with `MOF_MCP_IT_QDRANT_URL` set (e.g. `http://127.0.0.1:6333`). The test creates, seeds (through rag-engine, with its model-free `FakeEmbedder`) and deletes collections named `mof-mcp-it-*`. Optional, for a Qdrant with keys: `MOF_MCP_IT_QDRANT_API_KEY` (can write) and `MOF_MCP_IT_QDRANT_READ_ONLY_API_KEY` (given to the server).
-- `pytest -m integration tests/integration/test_no_vault_real.py`: the companies tools against the real SEC (no store), with `MOF_SEC_CONTACT` set: quarterly capex and total debt of the scenario's five companies since 2022, and values checked by hand against their 10-K text. `pytest -m models` on the same file indexes real 10-Ks (downloads the embedding model unless `MOF_MCP_IT_MODELS_DIR` points at a folder holding it): the first quotable passage of each company within `MOF_MCP_IT_FIRST_PASSAGE_S` (default 120 s) of `companies_fetch_filings`, and a French question over the Microsoft FY2024 10-K finding its Item 7 (optional: `MOF_MCP_IT_CACHE_DIR`, `MOF_MCP_IT_INDEX_TIMEOUT_S`, default 1800; set `MOF_RAG_ONNX_PROVIDER=coreml` to measure a Mac's accelerator).
+- `pytest -m integration tests/integration/test_no_vault_real.py`: the companies tools against the real SEC (no store), with `MOF_SEC_CONTACT` set: quarterly capex and total debt of the scenario's five companies since 2022, and values checked by hand against their 10-K text. `pytest -m models` on the same file indexes real 10-Ks (downloads the embedding model once, before any timing, unless `MOF_MCP_IT_MODELS_DIR` points at a folder holding it): the first quotable passage of each company within `MOF_MCP_IT_FIRST_PASSAGE_S` (default 120 s) of `companies_fetch_filings`, each company fetched alone and the five fetched in one call, and a French question over the Microsoft FY2024 10-K finding its Item 7 (optional: `MOF_MCP_IT_CACHE_DIR`, `MOF_MCP_IT_INDEX_TIMEOUT_S`, default 1800; set `MOF_RAG_ONNX_PROVIDER=coreml` to measure a Mac's accelerator).
 - `pytest -m integration tests/integration/test_store_vs_live.py`: the same companies read from a real store and from SEC live, at the same `as_of`, with `MOF_MCP_IT_COMPANIES_CATALOG`, `MOF_MCP_IT_COMPANIES_DATA_ROOT` and `MOF_SEC_CONTACT` set: at least `MOF_MCP_IT_PARITY_MIN_SHARE` (default 0.99) of the rows equal, every difference printed (optional: `MOF_MCP_IT_PARITY_COMPANIES`, `MOF_MCP_IT_PARITY_AS_OF`, default 2025-06-30, `MOF_MCP_IT_PARITY_FROM`, default 2022-01-01, `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, `MOF_MCP_IT_CACHE_DIR`).
 - `pytest -m llm`: scripted sessions with a local model, with `MOF_MCP_IT_OLLAMA_URL` set (optional: `MOF_MCP_IT_OLLAMA_MODEL`, default `qwen3:4b` for the scenario test; `MOF_MCP_IT_OLLAMA_TIMEOUT_S`, default 300 s per model answer, to raise on a slow CPU; see [Local models](#local-models)).
 
