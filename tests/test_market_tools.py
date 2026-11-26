@@ -564,3 +564,52 @@ async def test_massive_401_is_a_refused_key():
     async with Client(build_server(Settings(), market_adapter=_fake_massive(401, []))) as c:
         with pytest.raises(ToolError, match=r"^\[market_key_missing\].*massive.*MASSIVE_API_KEY"):
             await _call(c, instruments=["AAA"], mode="live", source="massive")
+
+
+# --- start-up checks --------------------------------------------------------------------------------
+def test_tokens_without_a_guarded_client_log_one_warning(caplog):
+    import logging
+
+    tokens = f"agent-1:{hash_token(AGENTS_TOKEN)}:read,notebook:{hash_token(NOTEBOOK_TOKEN)}:read"
+    with caplog.at_level(logging.WARNING, logger="myopenfund_mcp"):
+        build_server(Settings(transport="http", tokens=tokens))
+    warned = [r.getMessage() for r in caplog.records if "MOF_MARKET_NO_RESTRICTED_CLIENTS" in r.getMessage()]
+    assert len(warned) == 1 and "2 client(s)" in warned[0]
+    assert "agent-1" not in caplog.text and "notebook" not in caplog.text  # no client id in the log
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="myopenfund_mcp"):
+        build_server(Settings(transport="http", tokens=tokens, market_no_restricted_clients=("Agent-1",)))
+        build_server(Settings())  # stdio: no token, nothing to guard
+    assert "MOF_MARKET_NO_RESTRICTED_CLIENTS" not in caplog.text
+
+
+def test_an_open_data_store_without_the_source_filter_refuses_to_start(monkeypatch, market_store):
+    from open_data_store import sources
+
+    monkeypatch.delattr(sources, "filter_sources")  # what open-data-store 0.1 lacks
+    with pytest.raises(ConfigError, match=r"myopenfund-open-data-store>=0\.2") as err:
+        build_server(Settings(), companies_store=market_store)
+    assert err.value.__cause__ is None
+    with pytest.raises(ConfigError, match=r"myopenfund-open-data-store>=0\.2"):
+        build_server(Settings())  # the market toolset alone needs it too
+
+
+def test_a_market_import_error_is_not_a_missing_extra(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.delitem(sys.modules, "myopenfund_mcp.market.tools", raising=False)
+    import myopenfund_mcp.market as pkg
+
+    monkeypatch.delattr(pkg, "tools", raising=False)
+    real = __import__("builtins").__import__
+
+    def broken(name, *args, **kwargs):
+        if name == "market_data":
+            raise ImportError("libsomething.so: cannot open shared object file")
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", broken)
+    with caplog.at_level(logging.ERROR, logger="myopenfund_mcp"), \
+            pytest.raises(ConfigError, match=r"market toolset could not be imported"):
+        build_server(Settings())
+    assert "ImportError" in caplog.text
