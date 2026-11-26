@@ -141,8 +141,12 @@ machine; later questions about it are answered from the index. Measured on 4 CPU
 (First-passage times measured 2026-11-26 with the model already on disk; the model download is not
 counted.) The indexer takes the companies in turn: first one batch (`MOF_INDEX_BATCH_SIZE`, 32 passages,
 about 10 s) of the MD&A (Item 7) of each company's newest document, then the rest of the MD&As, newest
-documents first, then everything else (`MOF_INDEX_FIRST_BATCHES`). So every company fetched in one call
-gets quotable passages within two minutes, while the full documents take longer. For several companies
+documents first, then everything else (`MOF_INDEX_FIRST_BATCHES`). So each of the five companies
+fetched in one call got quotable passages within two minutes (42 s, then about 13 s per extra company
+on 4 CPU cores), while the full documents take longer. The order covers the documents fetched and cut
+ahead, at most `MOF_INDEX_FETCH_AHEAD` (default 40, the default `MOF_FILINGS_MAX_DOCS`, so a whole
+fetch call): beyond the bound, documents cut later get their MD&A only after the remainders of the
+documents already cut. For several companies
 over several years, run `warm` beforehand. On Apple Silicon, set
 `MOF_RAG_ONNX_PROVIDER=coreml` to run the embedding on the Mac's accelerator instead of the CPU (`cpu`
 is the default). `MOF_RAG_ONNX_THREADS` limits the CPU threads. While a filing is still being prepared,
@@ -1011,7 +1015,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_INDEX_WORKERS` | `1` | Embedding workers of the filings indexer: batches embedded in parallel, one per document (1-32). One more thread fetches and cuts the documents ahead of them. |
 | `MOF_INDEX_BATCH_SIZE` | `32` | Passages embedded and added to the index in one step (1-1024), the unit of the indexing order (rag-engine's ONNX batch size; about 8-12 s on 4 CPU cores). |
 | `MOF_INDEX_FIRST_BATCHES` | `1` | Batches of the MD&A (Item 7) of each company's newest queued document indexed in the first round, one company after the other, before any other work (0-100; 0 = no first round: document by document). See [How long it takes](#how-long-it-takes). |
-| `MOF_INDEX_FETCH_AHEAD` | `24` | Documents fetched and cut ahead of the embedding, at most (1-1000; a few MB of memory each). A company's newest queued document is fetched ahead whatever the count. |
+| `MOF_INDEX_FETCH_AHEAD` | `40` | Documents fetched and cut ahead of the embedding, at most (1-1000; a few MB of memory each). A company's newest queued document is fetched ahead whatever the count. Keep it at least `MOF_FILINGS_MAX_DOCS`: beyond the bound, documents cut later get their MD&A after the remainders of the documents already cut. |
 | `MOF_INDEX_CLOSE_TIMEOUT_S` | `30` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600; one batch takes about 8-12 s on 4 CPU cores. Past it the index is released; the document is resumed (`partial`) next time. |
 | `MOF_WARM_POLL_INTERVAL_S` | `5.0` | Seconds `myopenfund-mcp warm` waits between two looks at the SEC fetch (still warming) and at the indexing progress (above 0, at most 3600); `--poll-interval` overrides it. |
 | `MOF_WARM_STALL_S` | `1800` | Seconds without any progress after which `myopenfund-mcp warm` stops waiting for the documents still queued or indexing, lists them and exits 1 (1-604800). |

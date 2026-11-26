@@ -299,8 +299,10 @@ class Settings:
     # embedded in the first round, company after company, before any other work (0 = no first round)
     index_first_batches: int = 1
     # MOF_INDEX_FETCH_AHEAD: documents fetched and cut ahead of the embedding (memory bound, a few MB
-    # each); a company's newest queued document is fetched ahead whatever the count
-    index_fetch_ahead: int = 24
+    # each); a company's newest queued document is fetched ahead whatever the count. Default: the
+    # default MOF_FILINGS_MAX_DOCS, so every document of one fetch call is cut ahead and gets its Item 7
+    # before any remainder; beyond the bound a document cut later waits for the remainders of those cut
+    index_fetch_ahead: int = 40
     # MOF_INDEX_CLOSE_TIMEOUT_S: seconds closing the filings indexer waits for its workers' current step
     # (a batch, a fetch, a model load); past it the index is released and the workers die with the process
     index_close_timeout_s: int = 30
@@ -399,7 +401,7 @@ class Settings:
             index_workers=_int(env, "MOF_INDEX_WORKERS", 1, maximum=32),
             index_batch_size=_int(env, "MOF_INDEX_BATCH_SIZE", 32, maximum=1024),
             index_first_batches=_int(env, "MOF_INDEX_FIRST_BATCHES", 1, minimum=0, maximum=100),
-            index_fetch_ahead=_int(env, "MOF_INDEX_FETCH_AHEAD", 24, maximum=1000),
+            index_fetch_ahead=_int(env, "MOF_INDEX_FETCH_AHEAD", 40, maximum=1000),
             index_close_timeout_s=_int(env, "MOF_INDEX_CLOSE_TIMEOUT_S", 30, minimum=0, maximum=3600),
             warm_poll_interval_s=_float(env, "MOF_WARM_POLL_INTERVAL_S", 5.0, WARM_POLL_MAX_S),
             warm_stall_s=_int(env, "MOF_WARM_STALL_S", 1800, maximum=604800),

@@ -383,7 +383,10 @@ def test_rps_is_a_float_up_to_ten_and_retries_may_be_zero():
 
 def test_indexing_order_settings():
     default = Settings.from_env({})
-    assert (default.index_batch_size, default.index_first_batches, default.index_fetch_ahead) == (32, 1, 24)
+    assert (default.index_batch_size, default.index_first_batches, default.index_fetch_ahead) == (32, 1, 40)
+    # every document of one fetch call can be cut ahead: none waits for another's remainder
+    assert default.index_fetch_ahead >= default.filings_max_docs
+    assert Settings().index_fetch_ahead >= Settings().filings_max_docs
     assert default.index_close_timeout_s == 30  # one batch (8-12 s on 4 CPU) fits
     got = Settings.from_env({"MOF_INDEX_BATCH_SIZE": "8", "MOF_INDEX_FIRST_BATCHES": "0", "MOF_INDEX_FETCH_AHEAD": "3"})
     assert (got.index_batch_size, got.index_first_batches, got.index_fetch_ahead) == (8, 0, 3)
