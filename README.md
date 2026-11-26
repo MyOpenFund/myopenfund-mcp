@@ -1080,8 +1080,12 @@ model, over a fake SEC (no network, no download), to compare the capital expendi
 two fiscal years and to quote and cite what each annual report says about financing them. A run passes
 when the answer has both FY2024 values, equal to the rows the tools returned, and quotes a passage with
 the `url` of a `companies_search_filings` result; the model must pass at least 4 runs of 6. The default
-test model is `qwen3:4b`; if it fails, the documented default is the smallest model that passes. Run it
-with a local Ollama (`ollama pull qwen3:4b`):
+test model is `qwen3:4b`; if it fails, the documented default is the smallest model that passes.
+**Status (0.2.0): not yet validated with a small model.** `qwen3:4b` scored 0 of 6 on a 4-CPU cloud run
+(it answered from the passages without calling `companies_facts`, before the tool descriptions said
+facts come first); the reference runs, `qwen3:4b` then `qwen3:8b`, are on Apple silicon. Claude
+(Claude Code over stdio, real SEC) answers the same scenario correctly. Run it with a local Ollama
+(`ollama pull qwen3:4b`):
 
 ```bash
 MOF_MCP_IT_OLLAMA_URL=http://127.0.0.1:11434 MOF_MCP_IT_OLLAMA_MODEL=qwen3:4b \
