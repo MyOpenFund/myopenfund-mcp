@@ -1030,7 +1030,7 @@ with an explicit marker:
 - `pytest -m integration`: against a real vault database, with `MOF_MCP_IT_DATABASE_URL` set.
 - `pytest -m integration tests/integration/test_real_store.py`: against a real company store, with `MOF_MCP_IT_COMPANIES_CATALOG` and `MOF_MCP_IT_COMPANIES_DATA_ROOT` set (optional: `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, default 120; `MOF_MCP_IT_ASSERT_LATENCY=1` to enforce the 5 s criterion, on the NAS only; add `-s` or `-rP` to see the printed fundamentals latency).
 - `pytest -m integration tests/integration/test_real_qdrant.py`: `rag_search` against a **throwaway** Qdrant (never a production one: the test creates and deletes collections), with `MOF_MCP_IT_QDRANT_URL` set (e.g. `http://127.0.0.1:6333`). The test creates, seeds (through rag-engine, with its model-free `FakeEmbedder`) and deletes collections named `mof-mcp-it-*`. Optional, for a Qdrant with keys: `MOF_MCP_IT_QDRANT_API_KEY` (can write) and `MOF_MCP_IT_QDRANT_READ_ONLY_API_KEY` (given to the server).
-- `pytest -m llm`: scripted sessions with a local model, with `MOF_MCP_IT_OLLAMA_URL` set (optional: `MOF_MCP_IT_OLLAMA_MODEL`, default `qwen3:4b` for the scenario test; see [Local models](#local-models)).
+- `pytest -m llm`: scripted sessions with a local model, with `MOF_MCP_IT_OLLAMA_URL` set (optional: `MOF_MCP_IT_OLLAMA_MODEL`, default `qwen3:4b` for the scenario test; `MOF_MCP_IT_OLLAMA_TIMEOUT_S`, default 300 s per model answer, to raise on a slow CPU; see [Local models](#local-models)).
 
 Build the image with `docker build -t myopenfund-mcp .`; `docker run --rm myopenfund-mcp myopenfund-mcp
 --help` lists the commands.
