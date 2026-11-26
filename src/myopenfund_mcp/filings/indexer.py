@@ -287,18 +287,6 @@ def filing_title(company: str, form: str, report_date: dt.date | None, filed: dt
     return title
 
 
-def title_company(title: str | None, form: str) -> str | None:
-    """The company of a `filing_title` of a `form` filing, or None when `title` is not one."""
-    if not title:
-        return None
-    for marker in (f" {form} for the period ended ", f" {form}, filed "):
-        at = title.rfind(marker)
-        if at > 0:
-            return title[:at]
-    suffix = f" {form}"
-    return title[: -len(suffix)] if title.endswith(suffix) and len(title) > len(suffix) else None
-
-
 def document_chunks(
     document: FilingDocument, *, options: ChunkingOptions, tokenizer: Any, title: str | None
 ) -> list[tuple[str | None, Chunk]]:

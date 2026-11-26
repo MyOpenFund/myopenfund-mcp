@@ -28,7 +28,6 @@ from myopenfund_mcp.filings.indexer import (
     document_chunks,
     filing_title,
     model_files_cached,
-    title_company,
 )
 from myopenfund_mcp.paging import result_chars
 
@@ -1164,25 +1163,6 @@ def test_filing_title_omits_the_filing_date_when_it_is_missing():
         "CIK 0000789019 10-K for the period ended 2024-06-30"
     )
     assert filing_title("CIK 0000789019", "10-K", None, None) == "CIK 0000789019 10-K"
-
-
-@pytest.mark.parametrize(
-    ("report", "filed"),
-    [
-        (dt.date(2024, 6, 30), dt.date(2024, 7, 30)),
-        (None, dt.date(2024, 7, 30)),
-        (dt.date(2024, 6, 30), None),
-        (None, None),
-    ],
-)
-def test_title_company_reads_the_company_back(report, filed):
-    assert title_company(filing_title("AMAZON COM INC", "10-K/A", report, filed), "10-K/A") == "AMAZON COM INC"
-
-
-def test_title_company_of_a_foreign_title_is_none():
-    assert title_company("Some other title", "10-K") is None
-    assert title_company("10-K, filed 2024-07-30", "10-K") is None
-    assert title_company(None, "10-K") is None
 
 
 def test_enqueue_titles_chunks_with_the_period(tmp_path):

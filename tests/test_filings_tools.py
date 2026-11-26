@@ -490,12 +490,33 @@ async def test_search_hits_carry_the_citation_fields_and_the_progress():
 async def test_search_without_companies_passes_every_fetched_doc_id():
     indexer = FakeIndexer(
         [status(MSFT_K24, "ready", 5, 5), status(APPLE_K24, "ready", 3, 3)],
-        hits=[hit(APPLE_K24, 0, name="Apple Inc.")],
+        hits=[hit(APPLE_K24, 0, name="A title name, not the company's")],
+        companies={APPLE: ("Apple Inc.", ["AAPL"])},
     )
     res = await _call(indexer, "companies_search_filings", {"query": "capex"})
     (search,) = [kw for m, kw in indexer.calls if m == "search"]
     assert search["doc_ids"] is not None and set(search["doc_ids"]) == {MSFT_K24.doc_id, APPLE_K24.doc_id}
-    assert res["indexed"] == "2/2" and res["hits"][0]["company"] == "Apple Inc."  # from the chunk title
+    # the name recorded at fetch (the indexer's companies table), never parsed back from the chunk title
+    assert res["indexed"] == "2/2" and res["hits"][0]["company"] == "Apple Inc."
+    # a company fetched without a name: None
+    indexer = FakeIndexer([status(APPLE_K24, "ready", 3, 3)], hits=[hit(APPLE_K24, 0, name="Apple Inc.")])
+    res = await _call(indexer, "companies_search_filings", {"query": "capex"})
+    assert res["hits"][0]["company"] is None
+
+
+@pytest.mark.parametrize(
+    ("args", "title"),
+    [
+        # the literal cases of rag-engine's tests/test_eval_spans.py (its eval sidecars use this format)
+        (("AMAZON COM INC", "10-K", dt.date(2022, 12, 31), dt.date(2023, 2, 3)),
+         "AMAZON COM INC 10-K for the period ended 2022-12-31, filed 2023-02-03"),
+        (("AMAZON COM INC", "8-K", None, dt.date(2023, 2, 3)), "AMAZON COM INC 8-K, filed 2023-02-03"),
+        (("MICROSOFT CORP", "10-K", dt.date(2024, 6, 30), dt.date(2024, 7, 30)),
+         "MICROSOFT CORP 10-K for the period ended 2024-06-30, filed 2024-07-30"),
+    ],
+)
+def test_filing_title_matches_the_rag_engine_eval_literals(args, title):
+    assert filing_title(*args) == title
 
 
 async def test_search_limit_uses_its_own_settings():

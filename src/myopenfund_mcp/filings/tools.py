@@ -63,7 +63,6 @@ from .indexer import (
     chunk_id,
     filing_doc_id,
     public_error,
-    title_company,
 )
 
 log = logging.getLogger("myopenfund_mcp.filings")
@@ -164,13 +163,6 @@ def _forms(forms: list[str] | None) -> list[str] | None:
     if wanted is not None and (not wanted or not all(wanted)):
         raise tool_error(INVALID_ARGUMENT, "forms must name at least one form, e.g. ['10-K']")
     return wanted
-
-
-def _company(hit, names: dict[str, str]) -> str | None:
-    """The company of a hit: its resolved name, else the one in the chunk title (`filing_title`)."""
-    if names.get(hit.source_code):
-        return names[hit.source_code]
-    return title_company(hit.title, hit.doc_type or "")
 
 
 def _local_index(companies: list[dict]) -> dict[str, dict]:
@@ -459,6 +451,13 @@ def build_filings_toolset(
                 period_to=period_to,
                 limit=page,
             )
+            if any(
+                not names.get(cik)
+                for cik in {h.source_code for h in found.hits} | {s.cik for s in found.not_ready}
+            ):
+                # the names recorded at fetch (the indexer's companies table) for the others
+                recorded = {c["cik"]: c["name"] for c in await run("fetched_companies")}
+                names = {**recorded, **{cik: name for cik, name in names.items() if name}}
         matched = found.matched
         if not matched:
             raise tool_error(
@@ -471,7 +470,7 @@ def build_filings_toolset(
             raise tool_error(INDEX_NOT_READY, _not_ready_message(matched))
         hits = [
             {
-                "company": _company(h, names),
+                "company": names.get(h.source_code),
                 "cik": h.source_code,
                 "form": h.doc_type,
                 "filed": h.date,
