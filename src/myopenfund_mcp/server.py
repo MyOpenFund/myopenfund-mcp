@@ -28,6 +28,16 @@ MISSING_COMPANIES_EXTRA = ("MOF_COMPANIES_CATALOG is set but the [companies] ext
 MISSING_LIVE_EXTRA = ("MOF_SEC_CONTACT is set but the [companies] extra is not installed: "
                       "pip install 'myopenfund-mcp[companies]'")
 
+MISSING_MARKET_EXTRA = ("MOF_MARKET_SOURCE is set to {mode} but the [market] extra is not installed: "
+                        "pip install 'myopenfund-mcp[market]'")
+#: the distributions of the [market] extra: a missing one means the extra is not installed
+_MARKET_MODULES = ("market_data", "open_data_store")
+MARKET_IMPORT_FAILED = ("the market toolset could not be imported, although the [market] extra seems installed: "
+                        "see the error logged just before this one")
+OLD_OPEN_DATA_STORE = ("the installed open_data_store has no source filter (open_data_store.sources.filter_sources): "
+                       "the datasets and market tools need the distribution myopenfund-open-data-store>=0.2 "
+                       "(an older open-data-store install shadows it): pip install 'myopenfund-open-data-store>=0.2'")
+
 MISSING_RAG_EXTRA = ("MOF_RAG_QDRANT_HOST is set but the [rag] extra is not installed: "
                      "pip install 'myopenfund-mcp[rag]'")
 
@@ -43,7 +53,8 @@ RAG_IMPORT_FAILED = ("MOF_RAG_QDRANT_HOST is set but the rag toolset could not b
                      "[rag] extra seems installed: see the error logged just before this one")
 
 INSTRUCTIONS = (
-    "MyOpenFund: official primary sources only (central banks and SEC company filings). "
+    "MyOpenFund: official primary sources (central banks and SEC company filings) and, where the market "
+    "toolset is enabled, daily market prices from the providers the user chose (each row names its source). "
     "Call server_info first to see which toolsets this deployment enables. Results carry doc_id, "
     "dates and source URLs: cite them. Company data is point-in-time: pass as_of to see what was "
     "known then. Errors start with a stable [code]."
@@ -72,14 +83,16 @@ def _close(owned: list) -> None:
 
 
 def build_server(settings: Settings, *, vault_reader=None, companies_store=None, companies_live=None,
-                 rag_backend=None, filings_indexer=None) -> FastMCP:
+                 rag_backend=None, filings_indexer=None, market_adapter=None) -> FastMCP:
     """``companies_store`` / ``companies_live`` / ``filings_indexer``: injected sources (tests); the server
-    closes only the ones it builds itself: at shutdown, or at once when a later step refuses to start."""
+    closes only the ones it builds itself: at shutdown, or at once when a later step refuses to start.
+    ``market_adapter``: a ``(source_code, budget) -> Adapter`` factory for market_prices' live fetches
+    (tests)."""
     owned: list = []
     try:
         return _build_server(settings, owned, vault_reader=vault_reader, companies_store=companies_store,
                              companies_live=companies_live, rag_backend=rag_backend,
-                             filings_indexer=filings_indexer)
+                             filings_indexer=filings_indexer, market_adapter=market_adapter)
     except BaseException:
         _close(owned)
         raise
@@ -109,14 +122,66 @@ def _filings(settings: Settings, sec, injected, owned: list):
     return handle, None
 
 
+def _warn_unguarded(settings: Settings) -> None:
+    """One WARNING when no client of MOF_MCP_TOKENS is one of MOF_MARKET_NO_RESTRICTED_CLIENTS: the agents'
+    guard is by client id, so it protects no token then (the agents' client has another id). Counts only:
+    a client id is never logged."""
+    clients = {e.client_id.casefold() for e in parse_tokens(settings.tokens)}
+    guarded = {c.casefold() for c in settings.market_no_restricted_clients}
+    if clients and not clients & guarded:
+        log.warning("market: none of the %d client(s) of MOF_MCP_TOKENS is one of the %d id(s) of "
+                    "MOF_MARKET_NO_RESTRICTED_CLIENTS: the guard that keeps restricted sources from the agents' "
+                    "token protects no token; set MOF_MARKET_NO_RESTRICTED_CLIENTS to the agents' client id",
+                    len(clients), len(guarded))
+
+
+def _require_source_filter() -> None:
+    """The datasets and market tools filter restricted sources with open-data-store 0.2's
+    ``filter_sources``: an older ``open_data_store`` (the 0.1 distribution's files) refuses to start, never a
+    raw ImportError later."""
+    try:
+        from open_data_store.sources import filter_sources  # noqa: F401
+    except ImportError as exc:
+        if isinstance(exc, ModuleNotFoundError) and not (exc.name or "").startswith("open_data_store"):
+            raise  # a broken install of something else
+        raise ConfigError(OLD_OPEN_DATA_STORE) from None
+
+
+def _market(root: FastMCP, settings: Settings, store, adapter, *, auth_enabled: bool) -> str:
+    """Mount market_prices (namespace market) when the [market] extra is installed; its server_info status.
+    Without the extra the server runs without it, unless MOF_MARKET_SOURCE asks for a mode explicitly. An
+    installed extra that cannot be imported refuses to start (its class logged): an open_data_store without
+    the source filter names the distribution to install, anything else points to the log."""
+    try:
+        from .market.tools import build_market_toolset
+    except ImportError as exc:
+        top = (exc.name or "").split(".")[0] if isinstance(exc, ModuleNotFoundError) else None
+        if top == "market_data" or (top == "open_data_store" and exc.name == top):
+            if settings.market_source != "auto":
+                raise ConfigError(MISSING_MARKET_EXTRA.format(mode=settings.market_source)) from None
+            log.info("market: the [market] extra is not installed (%s)", exc.name)
+            return "not installed"
+        if top is not None and top not in _MARKET_MODULES:
+            raise  # a broken install of another module, not the extra
+        _require_source_filter()
+        log.error("market: the toolset could not be imported (%s)", type(exc).__name__)
+        raise ConfigError(MARKET_IMPORT_FAILED) from None
+    _require_source_filter()
+    root.mount(build_market_toolset(store, settings, auth_enabled=auth_enabled, adapter_factory=adapter),
+               namespace="market")
+    return "enabled"
+
+
 def _build_server(settings: Settings, owned: list, *, vault_reader, companies_store, companies_live,
-                  rag_backend, filings_indexer) -> FastMCP:
+                  rag_backend, filings_indexer, market_adapter) -> FastMCP:
     auth_enabled = settings.transport == "http"
     if auth_enabled and not settings.tokens:
         raise ConfigError(
             "MOF_MCP_TRANSPORT=http requires MOF_MCP_TOKENS: the HTTP server never runs unauthenticated"
         )
     auth = HashedTokenVerifier(parse_tokens(settings.tokens)) if auth_enabled else None
+    if auth_enabled:
+        _warn_unguarded(settings)
     # mask_error_details: an unexpected exception (driver error, DSN in a message) reaches the
     # client as a generic error; our ToolError / ResourceError keep their `[code] message`.
     @asynccontextmanager
@@ -189,6 +254,7 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
             raise ConfigError(str(exc)) from None
         owned.append(router)  # its check threads: closed first at shutdown, then the sources
         if companies_store is not None:  # without a store, datasets_* are not mounted
+            _require_source_filter()
             root.mount(build_datasets_toolset(companies_store, settings, auth_enabled=auth_enabled),
                        namespace="datasets")
         root.mount(build_companies_toolset(router, settings, auth_enabled=auth_enabled),
@@ -231,6 +297,7 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
 
         root.mount(build_rag_toolset(rag_backend, settings, auth_enabled=auth_enabled), namespace="rag")
 
+    market_status = _market(root, settings, companies_store, market_adapter, auth_enabled=auth_enabled)
     companies_status = ("enabled" if companies_store is not None or companies_live is not None
                         else "not configured")
     datasets_status = "enabled" if companies_store is not None else "not configured"
@@ -251,6 +318,7 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
         companies_read_filing): `status` enabled with the embedding `model`, its `provider`, the
         `chunker_version` and `documents` (`ready`, `total`; null until the first filings call opens the
         index), or `status` with the reason they are not available; `graph`: not available yet.
+        `toolsets.market`: market_prices, enabled or not installed (the [market] extra).
         `companies_source` (auto, store or sec: where company data comes from), `sec_contact_configured`
         (whether SEC can be reached; never the contact itself), `cache` (`dir`: the SEC cache folder,
         `bytes`: its size, null while no cache is open).
@@ -260,7 +328,8 @@ def _build_server(settings: Settings, owned: list, *, vault_reader, companies_st
             "tier": caller_tier(get_access_token(), auth_enabled=auth_enabled),
             "toolsets": {"vault": "enabled" if vault_reader is not None else "not configured",
                          "rag": "enabled" if rag_backend is not None else "not configured",
-                         "companies": companies_status, "datasets": datasets_status},
+                         "companies": companies_status, "datasets": datasets_status,
+                         "market": market_status},
             "freshness": None,
             "companies_source": settings.companies_source,
             "sec_contact_configured": bool(settings.sec_contact),

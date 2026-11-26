@@ -4,6 +4,7 @@ import logging
 import sys
 
 import pytest
+from extras import MARKET_STATUS, MARKET_TOOLS
 from fakes import (
     DOC_TYPE_NEEDS_CORPUS,
     DOCS,
@@ -34,7 +35,7 @@ def _client(reader=None, **settings):
 async def test_tools_are_namespaced_and_read_only():
     async with _client() as c:
         tools = {t.name: t for t in await c.list_tools()}
-    assert set(tools) == VAULT_TOOLS | {"server_info"}
+    assert set(tools) == VAULT_TOOLS | {"server_info"} | MARKET_TOOLS
     for name in VAULT_TOOLS | {"server_info"}:
         assert tools[name].annotations.read_only_hint is True, name
 
@@ -354,7 +355,7 @@ async def test_server_info_reports_toolsets_tier_and_freshness():
     async with _client() as c:
         info = (await c.call_tool("server_info", {})).data
     assert info["toolsets"] == {"vault": "enabled", "rag": "not configured", "companies": "not configured",
-                                "datasets": "not configured"}
+                                "datasets": "not configured", "market": MARKET_STATUS}
     assert info["tier"] == "act"  # stdio: local user
     assert info["version"]
     assert info["freshness"]["live_documents"] == 4
@@ -366,7 +367,7 @@ async def test_without_a_vault_only_server_info_is_mounted():
         names = [t.name for t in await c.list_tools()]
         templates = await c.list_resource_templates()
         info = (await c.call_tool("server_info", {})).data
-    assert names == ["server_info"]
+    assert sorted(names) == sorted(["server_info", *MARKET_TOOLS])
     assert templates == []
     assert info["toolsets"]["vault"] == "not configured" and info["freshness"] is None
 

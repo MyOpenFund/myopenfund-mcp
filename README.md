@@ -84,10 +84,17 @@ nothing listens on the network.
 The assistant resolves the companies (`companies_resolve`), reads their capital expenditure and debt
 (`companies_fundamentals`, `companies_facts`), gets the date each annual report became public
 (`companies_filings`, the `accepted_utc` of each 10-K is the event date), and quotes the reports
-(`companies_fetch_filings`, then `companies_search_filings` and `companies_read_filing`). Share prices are
-not in this server: they come from the market-data toolset, which is not part of this server yet, so the
-"how did the shares perform" part needs another source of prices; the event dates are what this server
-gives it.
+(`companies_fetch_filings`, then `companies_search_filings` and `companies_read_filing`). For "how the
+shares performed", `market_prices` gives their daily prices or a total-return index around each event date,
+fetched live with your own key (step 4 below).
+
+**4. Share prices (optional).** Add the `market` extra and your own free Tiingo key (from tiingo.com: the
+free plan has a deep daily history, 50 requests an hour and 1,000 a day). In the `mcpServers` block above,
+`--from` becomes `myopenfund-mcp[companies,filings,market] @ git+https://github.com/MyOpenFund/myopenfund-mcp`
+and `env` gains `"TIINGO_API_KEY": "<your key>"`. The key stays in the server's process: it is never a tool
+argument, never logged and never shown. Prices you fetch with your own key and read yourself are your own
+data; see [Market prices](#market-prices) for the limits (a deployment that serves several people is
+different).
 
 ### What is fetched, and where it is kept
 
@@ -234,8 +241,8 @@ the ones the CI tested:
   list only; the `locked` job also runs `scripts/check_constraints.py --build`, which reads every build
   requirement (this package's, and each git dependency's at its pinned commit) and fails when one is not
   pinned in the file at a version its specifier allows.
-- **Git dependencies** (`vault-query`, `open-data-store`, `company-corpus`, `myopenfund-rag-engine`): pinned by full
-  commit in `pyproject.toml`, as before.
+- **Git dependencies** (`vault-query`, `myopenfund-open-data-store`, `company-corpus`, `myopenfund-rag-engine`,
+  `myopenfund-market-data`): pinned by full commit in `pyproject.toml`, as before.
 
 The `install` service passes both files of the same commit as URLs (the same `<commit>` three times):
 
@@ -822,6 +829,16 @@ them `0700` for its own uid). Configuration:
 - **CSV.** `datasets_export_csv` takes the same arguments as `datasets_read_asof`; decimals are written
   exactly (a column's decimals share the widest scale, so `1.5` can appear as `1.500000`). With no rows, the
   header alone if `columns` is given, else an empty string.
+- **Restricted sources.** `datasets_read_asof` and `datasets_export_csv` drop the rows of a restricted
+  source (`source_code`: `massive`, `tiingo`, `private_history`, `manual`) unless the calling client is listed for
+  it in `MOF_MARKET_RESTRICTED_ALLOW` (none by default, none over stdio), before paging: they never reach a
+  page, `returned`, a cursor or the CSV. The market datasets (`prices`, `corporate_actions`,
+  `instrument_identifiers`, ...) are read strictly, like market-data reads them: a source the registry does
+  not declare is dropped too (so without the `[market]` extra, which declares the sources, no market row is
+  served). Other datasets, and datasets without a `source_code` column, are unchanged. The sources of
+  `MOF_MARKET_TOOL_ONLY_SOURCES` (default `private_history,manual`: their rows hold private tokens and labels, or an operator's own symbols) are never
+  served by these tools, whatever the allow-list: only `market_prices` serves them, by `instrument_id`. `datasets_list`'s
+  `rows_estimate` still counts every row of a table.
 - **Time budget, and a store read over SMB.** One call, all its store reads together, gets
   `MOF_COMPANIES_QUERY_TIMEOUT_S` seconds (default 20) and then answers `[timeout]`. The default is sized
   for the NAS, where the server runs next to the store and reads `lake/` from local disk. Read over SMB
@@ -829,6 +846,84 @@ them `0700` for its own uid). Configuration:
   warm, so the default fails cold calls. A deployment that reads the store over SMB (or another network
   share) should raise `MOF_COMPANIES_QUERY_TIMEOUT_S`, e.g. to 90; the client's own tool-call timeout must
   then be longer than that too.
+
+### Market prices
+
+`market_prices` (namespace `market`) is mounted whenever the `[market]` extra is installed, with no setting
+needed (`pip install ".[market]"`; it pins market-data and open-data-store 0.2.0 by commit, so git must be
+available). Without the extra the server starts without the tool (`server_info` reports
+`"market": "not installed"`), unless `MOF_MARKET_SOURCE` asks for `store` or `live`, which refuses to start.
+Reading the store (mode `store`, or `auto` with a store) also needs the `[companies]` extra and
+`MOF_COMPANIES_CATALOG`: the market datasets live in the same store as the datasets tools. The tool calls
+market-data's Python API (`market_data.api.prices`), the same code path as a notebook: nothing is computed
+here.
+
+| Tool | What it does |
+|---|---|
+| `market_prices` | Daily prices of up to `MOF_MARKET_MAX_INSTRUMENTS` instruments from `start` to `end` (ISO dates, inclusive), `adjust` `raw` (close, volume, currency) or `total_return` (an index based 1.0 on the first session of the range with a price). `instruments`: tickers, live or from the store; FIGIs, CIKs and `mof:` instrument ids resolve through the store only (a live source takes tickers: a CIK, a `mof:` id or a `source:symbol` is never sent to it, `[market_unknown_instrument]`; a FIGI goes as typed and the provider answers). `source`: a provider code to read from (`tiingo`, `massive`, `private_history`, `manual`, ...); live fetches take `tiingo` (default) or `massive`. `mode`: `auto`, `store` or `live` (omitted = `MOF_MARKET_SOURCE`). |
+
+- **Where each input is read.** `store` reads the store only (the same store as the datasets tools,
+  `MOF_COMPANIES_CATALOG`), never a live source; `live` fetches only and never reads the store; `auto` reads
+  the store when it holds the input over the range (at least one row this client may read), else fetches
+  live, with a `reason`: `no_store`, `not_in_store`, `store_no_data`, `store_source_restricted` or
+  `store_unavailable`. Every row carries `source` (`store` or `live`), `reason` when `auto` went live, and
+  `source_code` (the provider of that price); `inputs` says where each input was read. The store is read in
+  one call for all the inputs (one more for a total return, to name each session's provider).
+- **Several sources on one instrument.** When two sources this client may read both price a session (the
+  private history and a daily provider, or Massive and Tiingo), the first of `MOF_MARKET_PRECEDENCE` wins
+  (default `private_history,massive,tiingo`): one series, each row naming its `source_code`. Sources this
+  client may not read are dropped from the order, never used; readable sources the setting leaves out come
+  after it, alphabetically. `source` reads one source only. Two series of one source that disagree on a
+  session are `[invalid_argument]`: pass `source`.
+- **No labels in stored rows.** Stored rows carry `instrument_id` only: never a ticker, a provider symbol or
+  a private-history label. Live rows also carry `input` (your own words). A live source is sent your inputs
+  as typed: do not type a private-history label or token in a live call (`auto` reads the store first, so a
+  name the store resolves for you stays there). Inputs that only the store resolves by their form (a `mof:`
+  id, a `source:symbol`, a CIK) are never sent: `[market_unknown_instrument]`. A client not allowed the live
+  source gets `[market_source_restricted]` first, whatever the inputs.
+- **Keys.** A live fetch reads the key from the server's environment (`TIINGO_API_KEY`, `MASSIVE_API_KEY`):
+  over stdio it is your own process, so your own key. A key is never a tool argument and never echoed:
+  `[market_key_missing]` names the variable to set.
+- **Quota files.** The live adapters remember the requests they sent (Tiingo's hourly, daily and monthly
+  budgets, Massive's spacing) in small files under `MOF_MARKET_STATE_DIR` (market-data's variable; `off`
+  keeps none), else the user cache folder (`~/.cache/myopenfund/market-data` on Linux). Keep that folder between runs so
+  the budgets hold across restarts; a container needs it on a volume.
+- **Restricted sources** (licences that forbid sharing: `massive`, `tiingo`, `private_history`, `manual`).
+  Stored rows of a restricted source are served only to a client listed for it in
+  `MOF_MARKET_RESTRICTED_ALLOW`: none by default, and none over stdio (the store's rows are not yours). A
+  live fetch over stdio uses your own key: your own data, not gated. Over HTTP a live fetch uses the
+  deployment's key, and serving it to someone is redistribution: only the sources the client is listed for,
+  else `[market_source_restricted]`. The same per-client list filters `datasets_read_asof` and
+  `datasets_export_csv` (above).
+- **The agents' token never gets a restricted source.** The guard is by client id: the allow-list may never
+  name a client of `MOF_MARKET_NO_RESTRICTED_CLIENTS` (default `agents`). It must name the client id of the
+  agents' real token: if their token was made with `myopenfund-mcp hash-token agent-1`, set
+  `MOF_MARKET_NO_RESTRICTED_CLIENTS=agent-1`. The server logs one warning at start when no client of
+  `MOF_MCP_TOKENS` is one of them (the guard then protects no token).
+- **Bounds.** More than `MOF_MARKET_MAX_INSTRUMENTS` instruments is `[too_many_instruments]`; more than
+  `MOF_MARKET_MAX_ROWS` rows, or a result above `MOF_MCP_MAX_RESULT_CHARS`, is `[result_too_large]`: refused,
+  never cut. Store reads get `MOF_COMPANIES_QUERY_TIMEOUT_S`, live fetches `MOF_MARKET_LIVE_TIMEOUT_S`.
+- **Live fetches spend the key's quota, and never wait past the call's budget.** At most
+  `MOF_MARKET_LIVE_CONCURRENCY` (default 1) run at once; one more is answered `[market_busy]` at once, never
+  queued. When the provider's budget asks the fetch to wait longer than the time left of
+  `MOF_MARKET_LIVE_TIMEOUT_S` (Tiingo's free plan allows 50 requests in any hour: the 51st waits until the
+  oldest is an hour old; a `Retry-After`), the call answers `[limit_exceeded]` at once with the wait in
+  seconds, without sending the request: ask again after it. Tiingo's daily (1,000 requests) and monthly (500 distinct symbols) caps
+  are `[limit_exceeded]` too. A fetch that runs past `MOF_MARKET_LIVE_TIMEOUT_S` all the same (a slow answer)
+  answers `[timeout]`, but its worker thread cannot be stopped: it may go on and finish its fetch (the quota
+  is spent, the rows are dropped), and it keeps its slot until it ends, so calls meanwhile are
+  `[market_busy]`.
+- **Massive's free plan** allows 5 requests a minute and about two years of history: a start before its
+  window is `[invalid_argument]` before any request (use `tiingo` for older prices), and a request outside
+  the plan (HTTP 403) is `[limit_exceeded]`. A raw fetch is about one request per instrument, and a total
+  return through Massive pages through every dividend and split of the range. With the defaults
+  (`MOF_MARKET_MAX_INSTRUMENTS=10`, `MOF_MARKET_LIVE_TIMEOUT_S=60`), ten Massive instruments do not fit the
+  budget (the sixth request would wait past it: `[limit_exceeded]`): ask for at most about 5 per call, or
+  raise `MOF_MARKET_LIVE_TIMEOUT_S` (and the client's own tool-call timeout).
+- **Private-history and manual rows** (`MOF_MARKET_TOOL_ONLY_SOURCES`, default `private_history,manual`) are
+  served by `market_prices` only, keyed by `instrument_id`: the dataset tools never serve them, whatever the
+  allow-list. The setting replaces its default (list every source to keep), and an unknown code refuses to
+  start.
 
 ## Errors
 
@@ -839,12 +934,12 @@ branch on the code and show the message.
 |---|---|---|
 | `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a `doc_type` filter or grouping without `corpus` (the message lists each corpus's codes: ask the user which corpus, or infer it), a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id` (in that `corpus`, when one is given: omit `corpus` to look in every corpus). | Find ids with `vault_search_documents`. |
-| `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`). | Narrow the filters. |
+| `timeout` | The vault query or the company store read exceeded its time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`); for `market_prices`, the store read (`MOF_COMPANIES_QUERY_TIMEOUT_S`) or a live fetch that answered too slowly (`MOF_MARKET_LIVE_TIMEOUT_S`: the fetch may still finish and spend its quota). | Narrow the filters. |
 | `schema_outdated` | The vault database lacks a column or table the pinned vault-query reads: the vault is older than this server (see Minimum vault schema under [Tools](#tools)). | Deploy the vault (and run its ingestion) first; check the deployment. |
-| `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query). | Retry later; check the deployment. |
+| `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query); for `market_prices`, the store in `store` mode, or the live source failed (the log names the class only). | Retry later; check the deployment. |
 | `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free), `internal_error` (the search failed with an error the server does not expect; the log names its class). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `internal_error`, retry and report it if it lasts; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
-| `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. | Ask for at most the maximum the message names. |
-| `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS`. Results are refused, never silently cut. | Ask for a smaller `limit` (`rag_search` names the largest that fits). |
+| `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`. For `market_prices`, the live source's budget: a wait longer than the time left of `MOF_MARKET_LIVE_TIMEOUT_S` (the message gives it in seconds), Tiingo's daily or monthly cap, or a Massive request outside its plan (HTTP 403). | Ask for at most the maximum the message names; for market prices, ask again after the wait, or for fewer instruments. |
+| `result_too_large` | The result exceeds `MOF_MCP_MAX_RESULT_CHARS` (for `market_prices`, also `MOF_MARKET_MAX_ROWS` rows). Results are refused, never silently cut. | Ask for a smaller `limit` (`rag_search` names the largest that fits). |
 | `ambiguous_company` | A company reference matches several companies. | Pick a candidate from the message and pass its CIK. |
 | `unknown_company` | No company matches the reference. | Use `companies_resolve`. |
 | `unknown_concept` | A concept key is not in the catalogue. | The message lists valid keys. |
@@ -852,6 +947,13 @@ branch on the code and show the message.
 | `unknown_dataset` | No dataset with that name. | Names come from `datasets_list`. |
 | `unknown_column` | A filter or column is not in the dataset. | Columns come from `datasets_describe`. |
 | `too_many_companies` | More companies than `MOF_COMPANIES_MAX_COMPANIES`. | Split the request. |
+| `too_many_instruments` | More instruments than `MOF_MARKET_MAX_INSTRUMENTS` in `market_prices`. | Split the request. |
+| `market_key_missing` | A live fetch has no key for its source in the server's environment, or the source refused it. The message names the variable (`TIINGO_API_KEY`, `MASSIVE_API_KEY`), never a value. | Set the variable (your own key) and restart. |
+| `market_source_restricted` | A restricted source this client may not read: from the store (`source=`), or live over HTTP (the deployment's key). | Omit `source`, or ask the operator (`MOF_MARKET_RESTRICTED_ALLOW`). |
+| `market_unknown_instrument` | Nothing this client may read names the input (store), the live source knows no such symbol, or an input only the store resolves by its form (a CIK, a `mof:` id, a `source:symbol`) was to go live. Inputs are listed as you wrote them. | Pass a ticker; check the symbol. |
+| `market_ambiguous_instrument` | An input names several instruments in the store. | Pass a FIGI or an instrument id. |
+| `market_busy` | `MOF_MARKET_LIVE_CONCURRENCY` live fetches are already running (an abandoned, timed-out one included until it ends). Answered at once, never queued. | Retry in a moment. |
+| `market_no_data` | No price in the range: from the `source=` asked for, or from the live source. | Widen the range or try another source. |
 
 Arguments that do not match a tool's input schema (wrong type, string too long, e.g. an over-long company
 id) are rejected by the MCP framework before a tool runs, without a `[code]`. An unexpected internal failure reaches the client as a generic error
@@ -979,6 +1081,15 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_FILINGS_DEFAULT_FORMS` | `10-K` | Comma-separated form types fetched when the caller names none. |
 | `MOF_CHUNK_MAX_TOKENS` | `480` | Largest passage of the local filings index, in tokens (16-8192). |
 | `MOF_CHUNK_OVERLAP_TOKENS` | `32` | Tokens shared by neighbouring passages (0-2048, below `MOF_CHUNK_MAX_TOKENS`). |
+| `MOF_MARKET_SOURCE` | `auto` | Where `market_prices` reads when a call gives no `mode`: `auto` (the store when it holds the rows, else a live fetch), `store` (needs `MOF_COMPANIES_CATALOG` and the `[companies]` extra) or `live`. `store` or `live` without the `[market]` extra refuses to start. |
+| `MOF_MARKET_RESTRICTED_ALLOW` | unset | `client:source\|source,...`: the restricted sources (licences that forbid sharing: `massive`, `tiingo`, `private_history`, `manual`) whose stored rows each client of `MOF_MCP_TOKENS` may read. Unset = none, for every client and over stdio. Each source must be a restricted code of the installed source registry (needs the `[market]` extra). The list applies to HTTP tokens only: over stdio there is no client, so stored restricted rows are never served, and a live fetch uses your own key and is your own data: not gated. A client of `MOF_MARKET_NO_RESTRICTED_CLIENTS` is refused. Errors name the entry by position only. |
+| `MOF_MARKET_NO_RESTRICTED_CLIENTS` | `agents` | Client ids (comma-separated) that `MOF_MARKET_RESTRICTED_ALLOW` may never name: the agents' token never gets restricted sources (it may post publicly). Compared without regard to case (`Agents` is refused too). An empty value keeps the default; a value holding no id (`,`) is refused. The guard is by client id: set it to the client id of the agents' real token (e.g. `agent-1`); the server logs one warning at start when no client of `MOF_MCP_TOKENS` is one of these ids. |
+| `MOF_MARKET_TOOL_ONLY_SOURCES` | `private_history,manual` | Source codes (comma-separated, the registry's format) whose rows `datasets_read_asof` / `datasets_export_csv` never serve, whatever `MOF_MARKET_RESTRICTED_ALLOW`: they reach an allowed client only through `market_prices`, keyed by `instrument_id`. A value **replaces** the default: list every source to keep (`tiingo` alone re-opens `private_history` and `manual` to allowed clients). Each code must be a source of the installed registry (needs the `[market]` extra): an unknown code (a typo) refuses to start. A value holding no code (`,`) is refused. |
+| `MOF_MARKET_PRECEDENCE` | `private_history,massive,tiingo` | The order in which `market_prices` takes a session's price from the store when several sources the client may read have one: the first with a row wins per instrument and session, so one series spans the private history, then a daily provider. Codes the client may not read are dropped from the order (never passed); readable sources the list leaves out come after it, alphabetically. `source=` in a call still reads one source only. A value **replaces** the default; each code must be a source of the installed registry (an unknown code refuses to start). |
+| `MOF_MARKET_LIVE_CONCURRENCY` | `1` | Live market-data fetches running at once (1-16); one more is `[market_busy]`, never queued. A timed-out fetch keeps its slot until its thread ends. |
+| `MOF_MARKET_MAX_INSTRUMENTS` | `10` | Instruments per `market_prices` call (1-100); more is refused. |
+| `MOF_MARKET_MAX_ROWS` | `5000` | Rows per `market_prices` result (1-1000000); more is refused, never cut (`MOF_MCP_MAX_RESULT_CHARS` applies too). |
+| `MOF_MARKET_LIVE_TIMEOUT_S` | `60` | Time budget of one live market-data fetch, in seconds (1-3600); then `[timeout]`. A wait the provider's budget asks for beyond the time left is `[limit_exceeded]` at once, never slept. |
 
 Read by `compose.example.yaml` only, not by the server: `MOF_MCP_BIND_ADDR` (host address the port is
 published on, default `127.0.0.1`), `MOF_MCP_BIND_PORT` (default `8000`), `MOF_VAULT_DOCKER_NETWORK` (the
@@ -1019,7 +1130,7 @@ MOF_MCP_IT_OLLAMA_URL=http://127.0.0.1:11434 MOF_MCP_IT_OLLAMA_MODEL=qwen3:4b \
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[vault,companies,rag,filings,dev]"
+.venv/bin/pip install -e ".[vault,companies,rag,filings,market,dev]"
 .venv/bin/ruff check .
 .venv/bin/python -m pytest -q
 ```

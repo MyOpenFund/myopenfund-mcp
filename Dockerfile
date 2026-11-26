@@ -12,7 +12,8 @@ ENV PATH=/opt/venv/bin:$PATH
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE constraints.txt build-constraints.txt ./
 COPY src ./src
-# Toolset extras installed in the image, comma-separated: vault (default), companies, rag.
+# Toolset extras installed in the image, comma-separated: vault (default), companies, rag, market (market_prices;
+# put MOF_MARKET_STATE_DIR, market-data's quota files, on a volume).
 ARG MOF_EXTRAS=vault
 # -c constraints.txt: every PyPI runtime dependency at the exact version the CI tested; --build-constraint:
 # the build backends of this package and of the git dependencies, built from source (README, "Pinned versions").

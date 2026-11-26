@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from extras import MARKET_STATUS, MARKET_TOOLS
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
@@ -110,7 +111,7 @@ def clock(monkeypatch):
 async def test_the_tool_is_namespaced_read_only_and_described_for_a_model(backend):
     async with _client(backend) as c:
         tools = {t.name: t for t in await c.list_tools()}
-    assert set(tools) == {"rag_search", "server_info"}
+    assert set(tools) == {"rag_search", "server_info"} | MARKET_TOOLS
     tool = tools["rag_search"]
     assert tool.annotations.read_only_hint is True
     for needle in ("YYYY-MM-DD", "inclusive", "does not write an answer", "counted from 1", "citation",
@@ -1935,7 +1936,7 @@ async def test_without_rag_settings_the_toolset_is_not_mounted():
     async with Client(build_server(Settings())) as c:
         names = [t.name for t in await c.list_tools()]
         info = (await c.call_tool("server_info", {})).data
-    assert names == ["server_info"]
+    assert sorted(names) == sorted(["server_info", *MARKET_TOOLS])
     assert info["toolsets"]["rag"] == "not configured" and "rag" not in info
 
 
@@ -1943,7 +1944,7 @@ async def test_server_info_lists_the_rag_toolset_and_nothing_secret(backend):
     async with _client(backend, rag_default_limit=3, rag_max_limit=7) as c:
         info = (await c.call_tool("server_info", {})).data
     assert info["toolsets"] == {"vault": "not configured", "rag": "enabled", "companies": "not configured",
-                                "datasets": "not configured"}
+                                "datasets": "not configured", "market": MARKET_STATUS}
     assert info["rag"] == {"status": "ready", "collection": COLLECTION, "model": MODEL,
                            "engine_version": backend_module.ENGINE_VERSION, "source_codes": SOURCE_CODES,
                            "doc_types": DOC_TYPES, "languages": ["en", "ja"], "default_limit": 3, "max_limit": 7}

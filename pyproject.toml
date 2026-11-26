@@ -14,7 +14,9 @@ dependencies = ["fastmcp>=4.1.4,<5"]
 [project.optional-dependencies]
 vault = ["vault-query @ git+https://github.com/MyOpenFund/vault@d3c44970a0827b2563073a1dc0a82093a63ac496#subdirectory=query"]
 companies = [
-  "open-data-store[reader] @ git+https://github.com/MyOpenFund/open-data-store@7a86987908c177a3f38e285b828cc03ed40f6f8b",
+  # open-data-store 0.2.0 (source registry, filter_sources): the distribution is myopenfund-open-data-store
+  # from this commit on. Same distribution and commit as [market]. Switch to >=0.2.0 once on PyPI.
+  "myopenfund-open-data-store[reader] @ git+https://github.com/MyOpenFund/open-data-store@6b5d399fccd7f13e668fc77bb77c1869a7812141",
   # company-corpus[live]: live SEC fetching (no-vault mode). Tracks branch feat/live-sec until it merges: bump to the merge commit.
   "company-corpus[live] @ git+https://github.com/MyOpenFund/company-corpus@8effb61a8437ebf2e734cf5fd559d63608747c4d",
 ]
@@ -25,6 +27,13 @@ rag = ["myopenfund-rag-engine[onnx] @ git+https://github.com/MyOpenFund/rag-engi
 # [filings]: the local filings index (no-vault mode). The distribution is myopenfund-rag-engine from this
 # commit on. Tracks branch feat/local-index until it merges: bump to the merge commit.
 filings = ["myopenfund-rag-engine[local,graph] @ git+https://github.com/MyOpenFund/rag-engine@ce5a745a9e0b4a6a96c6b21d79aa0b7b1e7cc0e7"]
+# [market]: the market_prices tool (market-data's Python API) and the restricted-source registry its
+# entry point declares. The reader extra of open-data-store reads the store (server profile).
+# Pinned by commit until market-data and open-data-store 0.2.0 are on PyPI: then switch to >=.
+market = [
+  "myopenfund-market-data @ git+https://github.com/MyOpenFund/market-data@050141271b94ac92c30f8528b55042de0290a596",
+  "myopenfund-open-data-store[reader] @ git+https://github.com/MyOpenFund/open-data-store@6b5d399fccd7f13e668fc77bb77c1869a7812141",
+]
 dev = ["pytest>=8.3", "ruff>=0.6"]
 
 [project.scripts]

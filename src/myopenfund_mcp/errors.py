@@ -26,6 +26,14 @@ NOT_FETCHED = "not_fetched"
 INDEX_NOT_READY = "index_not_ready"
 INDEX_UNAVAILABLE = "index_unavailable"
 NO_FACTS = "no_facts"
+# market_prices (market-data spec §10, §13)
+MARKET_KEY_MISSING = "market_key_missing"
+MARKET_SOURCE_RESTRICTED = "market_source_restricted"
+MARKET_UNKNOWN_INSTRUMENT = "market_unknown_instrument"
+MARKET_AMBIGUOUS_INSTRUMENT = "market_ambiguous_instrument"
+MARKET_NO_DATA = "market_no_data"
+MARKET_BUSY = "market_busy"
+TOO_MANY_INSTRUMENTS = "too_many_instruments"
 
 
 def tool_error(code: str, message: str) -> ToolError:

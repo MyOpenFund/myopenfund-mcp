@@ -1,4 +1,9 @@
-"""The `datasets` toolset: what the store holds and structured as-of reads (no free SQL)."""
+"""The `datasets` toolset: what the store holds and structured as-of reads (no free SQL).
+
+Rows of a restricted source (market-data spec §13) are served only to a client of
+MOF_MARKET_RESTRICTED_ALLOW that lists it (`auth.allowed_restricted_for`; none over stdio): the store
+adapter drops the others before paging, so they reach no page, count, cursor or CSV. The sources of
+MOF_MARKET_TOOL_ONLY_SOURCES (default private_history) are never served here, whatever the allow-list."""
 from __future__ import annotations
 
 import datetime as dt
@@ -7,7 +12,7 @@ from typing import Annotated
 from fastmcp import FastMCP
 from pydantic import Field
 
-from ..auth import tier_check
+from ..auth import allowed_restricted_for, caller_client_id, tier_check
 from ..config import Settings
 from ..paging import MAX_OFFSET, cap_result, clamp_limit, decode_cursor, encode_cursor
 from .common import AS_OF_DESCRIPTION, READ_ONLY, parse_as_of, rows_to_utc, store_call
@@ -49,9 +54,11 @@ def build_datasets_toolset(store, settings: Settings, *, auth_enabled: bool) -> 
         row only says whether a next page exists (no total count: it would scan)."""
         page, offset = clamp_limit(limit, settings), decode_cursor(cursor)
         when = parse_as_of(as_of)
+        allowed = allowed_restricted_for(caller_client_id(auth_enabled=auth_enabled), settings)
         rows = await store_call(store.read, settings=settings, dataset=dataset, as_of=when,
                                 filters=filters or None, columns=columns or None,
-                                limit=offset + page + 1, vintages=vintages)
+                                limit=offset + page + 1, vintages=vintages, allowed_restricted=allowed,
+                                denied_sources=frozenset(settings.market_tool_only_sources))
         chunk, more = rows[offset:offset + page], len(rows) > offset + page
         end = offset + len(chunk)
         return when, rows_to_utc(chunk), (encode_cursor(end) if more and end <= MAX_OFFSET else None)

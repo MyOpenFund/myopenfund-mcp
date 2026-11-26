@@ -13,6 +13,7 @@ import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 
 class ConfigError(ValueError):
@@ -26,6 +27,9 @@ Q4_RULES = ("ytd9", "sum_of_quarters")
 RAG_DATE_FILTER_MODES = ("auto", "interval", "legacy")
 COMPANIES_SOURCES = ("auto", "store", "sec")  # MOF_COMPANIES_SOURCE: auto = the store when configured, else SEC
 CACHE_MODES = ("on", "off")  # MOF_CACHE
+# MOF_MARKET_SOURCE: where market_prices reads (MCP chantier 3 Q9): auto = the store when it holds the rows,
+# else a live fetch with the caller's own key | store | live
+MARKET_SOURCES = ("auto", "store", "live")
 # rag-engine's ONNX execution providers (OnnxEmbedder `provider`); written out, like the modes above.
 ONNX_PROVIDERS = ("cpu", "coreml")
 #: Largest MOF_SEC_MAX_RPS: SEC's fair-access limit is 10 requests per second.
@@ -166,6 +170,81 @@ def _check_rag_host(host: str) -> None:
     if _HOST.fullmatch(host) is None:
         raise ConfigError(f"{name} must be a host name or an address, without scheme, port or path "
                           "(the port is MOF_RAG_QDRANT_PORT, TLS is MOF_RAG_QDRANT_HTTPS)")
+
+
+#: Default MOF_MARKET_NO_RESTRICTED_CLIENTS: the agents' client (spec §13: it may post publicly).
+NO_RESTRICTED_CLIENTS = ("agents",)
+
+
+def _no_restricted_clients(env: Mapping[str, str]) -> tuple[str, ...]:
+    """MOF_MARKET_NO_RESTRICTED_CLIENTS: client ids, comma-separated, without duplicates, in order. An id is
+    never echoed (a token pasted here must not reach a log): errors name the entry by position."""
+    raw = _get(env, "MOF_MARKET_NO_RESTRICTED_CLIENTS")
+    if raw is None:
+        return NO_RESTRICTED_CLIENTS
+    from . import auth  # auth imports this module (and fastmcp): only when the variable is set
+    ids = [item.strip() for item in raw.split(",") if item.strip()]
+    if not ids:  # "," would otherwise disable the guard silently
+        raise ConfigError("MOF_MARKET_NO_RESTRICTED_CLIENTS is set but holds no client id: give at least one "
+                          "(an empty value keeps the default, agents)")
+    for position, client in enumerate(ids, start=1):
+        if not auth.is_valid_client_id(client):
+            raise ConfigError(f"MOF_MARKET_NO_RESTRICTED_CLIENTS entry {position}: a client id is 1-32 "
+                              "characters of A-Z a-z 0-9 _ . -")
+    return tuple(dict.fromkeys(ids))
+
+
+#: Default MOF_MARKET_TOOL_ONLY_SOURCES: sources whose rows only market_prices serves (instrument_id only):
+#: the private export's rows hold private tokens and labels, manual rows an operator's own symbols
+#: (market-data spec §9.3, §13).
+TOOL_ONLY_SOURCES = ("private_history", "manual")
+#: Default MOF_MARKET_PRECEDENCE: the order in which market_prices takes a session's price when several
+#: sources a client may read have one (the private history, then the daily providers: market-data spec §9).
+MARKET_PRECEDENCE = ("private_history", "massive", "tiingo")
+_SOURCE_CODE = re.compile(r"[a-z][a-z0-9_]{0,62}")  # open-data-store's source-code rule, written out
+
+
+def _source_codes(env: Mapping[str, str], name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """A list of source codes: comma-separated, without duplicates, in order. A set value REPLACES the
+    default; each code must be in the registry's code format and a source of the installed registry (a typo
+    is refused, never ignored: that needs the [market] extra). Unset = the default, without importing the
+    registry. Errors name the entry by position."""
+    raw = _get(env, name)
+    if raw is None:
+        return default
+    codes = [item.strip() for item in raw.split(",") if item.strip()]
+    if not codes:
+        raise ConfigError(f"{name} is set but holds no source code (an empty value keeps the default, "
+                          f"{','.join(default)})")
+    for position, code in enumerate(codes, start=1):
+        if not _SOURCE_CODE.fullmatch(code):
+            raise ConfigError(f"{name} entry {position}: a source code is 1-63 characters of a-z 0-9 _, "
+                              "starting with a letter")
+    from . import auth  # auth imports this module
+
+    known = auth.registered_sources(name)
+    for position, code in enumerate(codes, start=1):
+        if code not in known:
+            raise ConfigError(f"{name} entry {position}: not a source of the registry (the installed source "
+                              "plugins)")
+    return tuple(dict.fromkeys(codes))
+
+
+def _restricted_allow(env: Mapping[str, str], never: tuple[str, ...]) -> Mapping[str, frozenset[str]]:
+    """MOF_MARKET_RESTRICTED_ALLOW, checked against the clients of MOF_MCP_TOKENS, the restricted codes of
+    the source registry and the clients that never get one (`never`). Unset = empty without importing the
+    [market] extra."""
+    spec = _get(env, "MOF_MARKET_RESTRICTED_ALLOW")
+    if spec is None:
+        return {}
+    from . import auth  # auth imports this module
+
+    tokens = _get(env, "MOF_MCP_TOKENS")
+    if tokens is None:
+        raise ConfigError("MOF_MARKET_RESTRICTED_ALLOW names clients of MOF_MCP_TOKENS, which is not set: "
+                          "without tokens no client can be given restricted sources")
+    client_ids = frozenset(e.client_id for e in auth.parse_tokens(tokens))
+    return auth.parse_restricted_allow(spec, client_ids, auth.registered_restricted_sources(), frozenset(never))
 
 
 @dataclass(frozen=True)
@@ -309,6 +388,30 @@ class Settings:
     filings_default_forms: tuple[str, ...] = ("10-K",)
     chunk_max_tokens: int = 480  # MOF_CHUNK_MAX_TOKENS: largest passage, in tokens
     chunk_overlap_tokens: int = 32  # MOF_CHUNK_OVERLAP_TOKENS: tokens shared by neighbouring passages
+    market_source: str = "auto"  # MOF_MARKET_SOURCE: auto | store | live
+    # MOF_MARKET_RESTRICTED_ALLOW: client:src1|src2,... restricted sources whose stored rows each client of
+    # MOF_MCP_TOKENS may read (auth.allowed_restricted_for); default none; kept out of repr. A read-only
+    # mapping (a dict given in code is copied into one): no runtime code can widen the gate.
+    market_restricted_allow: Mapping[str, frozenset[str]] = field(
+        default_factory=lambda: MappingProxyType({}), repr=False)
+    # MOF_MARKET_NO_RESTRICTED_CLIENTS: clients the allow-list may never name (spec §13: the agents' token)
+    market_no_restricted_clients: tuple[str, ...] = NO_RESTRICTED_CLIENTS
+    market_max_instruments: int = 10  # MOF_MARKET_MAX_INSTRUMENTS: instruments per market_prices call
+    market_max_rows: int = 5000  # MOF_MARKET_MAX_ROWS: rows per market_prices result (refused above, never cut)
+    market_live_timeout_s: int = 60  # MOF_MARKET_LIVE_TIMEOUT_S: time budget of a live market-data fetch
+    # MOF_MARKET_LIVE_CONCURRENCY: live fetches running at once (an abandoned one keeps its slot until it ends);
+    # one more is answered [market_busy], never queued
+    market_live_concurrency: int = 1
+    # MOF_MARKET_TOOL_ONLY_SOURCES: sources whose rows the dataset tools never serve, whatever the allow-list
+    market_tool_only_sources: tuple[str, ...] = field(default=TOOL_ONLY_SOURCES, repr=False)
+    # MOF_MARKET_PRECEDENCE: the first of these sources with a price wins a session (market_prices, store)
+    market_precedence: tuple[str, ...] = field(default=MARKET_PRECEDENCE, repr=False)
+
+    def __post_init__(self) -> None:
+        allow = self.market_restricted_allow
+        if not isinstance(allow, MappingProxyType):
+            object.__setattr__(self, "market_restricted_allow",
+                               MappingProxyType({k: frozenset(v) for k, v in dict(allow).items()}))
 
     def cache_path(self) -> str:
         """The cache folder: MOF_CACHE_DIR, or the platform default (ConfigError when there is none)."""
@@ -320,6 +423,7 @@ class Settings:
         transport = _get(env, "MOF_MCP_TRANSPORT") or "stdio"
         if transport not in ("stdio", "http"):
             raise ConfigError(f"MOF_MCP_TRANSPORT must be 'stdio' or 'http', got {transport!r}")
+        no_restricted = _no_restricted_clients(env)
         settings = cls(
             transport=transport,
             host=_get(env, "MOF_MCP_HOST") or "127.0.0.1",
@@ -396,7 +500,22 @@ class Settings:
             filings_default_forms=_forms(_get(env, "MOF_FILINGS_DEFAULT_FORMS") or "10-K"),
             chunk_max_tokens=_int(env, "MOF_CHUNK_MAX_TOKENS", 480, minimum=16, maximum=8192),
             chunk_overlap_tokens=_int(env, "MOF_CHUNK_OVERLAP_TOKENS", 32, minimum=0, maximum=2048),
+            market_source=_get(env, "MOF_MARKET_SOURCE") or "auto",
+            market_restricted_allow=_restricted_allow(env, no_restricted),
+            market_no_restricted_clients=no_restricted,
+            market_max_instruments=_int(env, "MOF_MARKET_MAX_INSTRUMENTS", 10, maximum=100),
+            market_max_rows=_int(env, "MOF_MARKET_MAX_ROWS", 5000, maximum=1_000_000),
+            market_live_timeout_s=_int(env, "MOF_MARKET_LIVE_TIMEOUT_S", 60, maximum=3600),
+            market_live_concurrency=_int(env, "MOF_MARKET_LIVE_CONCURRENCY", 1, maximum=16),
+            market_tool_only_sources=_source_codes(env, "MOF_MARKET_TOOL_ONLY_SOURCES", TOOL_ONLY_SOURCES),
+            market_precedence=_source_codes(env, "MOF_MARKET_PRECEDENCE", MARKET_PRECEDENCE),
         )
+        if settings.market_source not in MARKET_SOURCES:
+            raise ConfigError(f"MOF_MARKET_SOURCE must be one of {', '.join(MARKET_SOURCES)}, "
+                              f"got {settings.market_source!r}")
+        if settings.market_source == "store" and not settings.companies_catalog:
+            raise ConfigError("MOF_MARKET_SOURCE=store requires MOF_COMPANIES_CATALOG "
+                              "(and MOF_COMPANIES_DATA_ROOT): market prices are read from the same store")
         if settings.companies_source not in COMPANIES_SOURCES:
             raise ConfigError(f"MOF_COMPANIES_SOURCE must be one of {', '.join(COMPANIES_SOURCES)}, "
                               f"got {settings.companies_source!r}")
