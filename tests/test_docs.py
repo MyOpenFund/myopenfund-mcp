@@ -15,8 +15,21 @@ def test_config_reads_variables():
 @pytest.mark.parametrize("doc", [".env.example", "README.md"])
 def test_every_server_variable_is_documented(doc):
     text = (ROOT / doc).read_text()
-    missing = [name for name in SERVER_VARS if name not in text]
+    # whole names: MOF_CACHE must not be satisfied by a mention of MOF_CACHE_DIR
+    mentioned = set(re.findall(r"\bMOF_[A-Z0-9_]+\b", text))
+    missing = [name for name in SERVER_VARS if name not in mentioned]
     assert missing == []
+
+
+def test_readme_has_the_no_infrastructure_section():
+    text = (ROOT / "README.md").read_text()
+    heading = "## Try it at home, without any infrastructure"
+    assert text.count(heading) == 1
+    assert text.count("## Contents") == 1
+    section = text.split(heading, 1)[1].split("\n## Quick start", 1)[0]
+    for needle in ("MOF_SEC_CONTACT", "mcpServers", "myopenfund-mcp warm", "MOF_CACHE=off", "1.1 GB",
+                   "uvx --from", "companies_search_filings", "companies_filings"):
+        assert needle in section, needle
 
 
 ENV_EXAMPLE = (ROOT / ".env.example").read_text()
@@ -44,7 +57,29 @@ FIELDS = {
     "MOF_RAG_CHECK_RETRY_S": "rag_check_retry_s", "MOF_RAG_DESCRIPTION_NOTES": "rag_description_notes",
     "MOF_RAG_DATE_FILTER_MODE": "rag_date_filter_mode", "MOF_RAG_DATE_FILTER_REFRESH_S": "rag_date_filter_refresh_s",
     "MOF_RAG_DATE_FILTER_RETRY_S": "rag_date_filter_retry_s",
+    "MOF_SEC_CONTACT": "sec_contact", "MOF_SEC_MAX_RPS": "sec_max_rps", "MOF_SEC_TIMEOUT_S": "sec_timeout_s",
+    "MOF_SEC_RETRIES": "sec_retries", "MOF_SEC_CALL_BUDGET_S": "sec_call_budget_s",
+    "MOF_SEC_POSITIONS_LOOKBACK_Y": "sec_positions_lookback_y", "MOF_SEC_MEMO_COMPANIES": "sec_memo_companies",
+    "MOF_SEC_FAILURE_TTL_S": "sec_failure_ttl_s", "MOF_SEC_POSITIONS_DONOR_DEPTH": "sec_positions_donor_depth",
+    "MOF_SEC_TTM_LOOKBACK_M": "sec_ttm_lookback_m", "MOF_SEC_FRESHNESS_BUDGET_S": "sec_freshness_budget_s",
+    "MOF_COMPANIES_SOURCE": "companies_source", "MOF_CACHE": "cache", "MOF_CACHE_DIR": "cache_dir",
+    "MOF_CACHE_MAX_GB": "cache_max_gb", "MOF_CACHE_EVICT_TO": "cache_evict_to",
+    "MOF_CACHE_TMP_GRACE_S": "cache_tmp_grace_s", "MOF_CACHE_TTL_SUBMISSIONS_H": "cache_ttl_submissions_h",
+    "MOF_CACHE_TTL_COMPANYFACTS_H": "cache_ttl_companyfacts_h", "MOF_FILINGS_MAX_DOCS": "filings_max_docs",
+    "MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "filings_search_default_limit",
+    "MOF_FILINGS_SEARCH_MAX_LIMIT": "filings_search_max_limit",
+    "MOF_FILINGS_SEARCH_MAX_DOCS": "filings_search_max_docs",
+    "MOF_FILINGS_READ_MAX_CHARS": "filings_read_max_chars",
+    "MOF_FILINGS_NOT_READY_LISTED": "filings_not_ready_listed",
+    "MOF_INDEX_WORKERS": "index_workers", "MOF_INDEX_CLOSE_TIMEOUT_S": "index_close_timeout_s",
+    "MOF_INDEX_BATCH_SIZE": "index_batch_size", "MOF_INDEX_FIRST_BATCHES": "index_first_batches",
+    "MOF_INDEX_FETCH_AHEAD": "index_fetch_ahead",
+    "MOF_WARM_POLL_INTERVAL_S": "warm_poll_interval_s", "MOF_WARM_STALL_S": "warm_stall_s", "MOF_RAG_ONNX_PROVIDER": "rag_onnx_provider",
+    "MOF_SEARCH_RRF_K": "search_rrf_k", "MOF_SEARCH_CANDIDATES": "search_candidates",
+    "MOF_SEARCH_EIGENMIND": "search_eigenmind", "MOF_FILINGS_DEFAULT_FORMS": "filings_default_forms",
+    "MOF_CHUNK_MAX_TOKENS": "chunk_max_tokens", "MOF_CHUNK_OVERLAP_TOKENS": "chunk_overlap_tokens",
 }
+
 COMMENTED = re.findall(r"^# (MOF_[A-Z0-9_]+)=(\S+(?: \w+=\S+)*)$", ENV_EXAMPLE, re.MULTILINE)
 
 
@@ -67,7 +102,9 @@ def test_env_example_defaults_match_settings(name, value):
     from myopenfund_mcp.config import Settings
 
     default = getattr(Settings(), FIELDS[name])
-    if default is None or default == "":  # no default: the example shows a placeholder value
+    if isinstance(default, tuple):
+        assert value == ",".join(default)
+    elif default is None or default == "":  # no default: the example shows a placeholder value
         assert "<" in value, f"{name} has no default; its example must be a <placeholder>"
     elif isinstance(default, bool):  # written as the server reads it: true / false
         assert value == str(default).lower()

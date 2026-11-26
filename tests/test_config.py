@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from myopenfund_mcp.config import ConfigError, Settings
@@ -276,3 +278,156 @@ def test_rag_https_reads_the_usual_booleans(raw, expected):
 def test_rag_tuning_variables_alone_do_not_configure_the_toolset():
     s = Settings.from_env({"MOF_RAG_MAX_LIMIT": "30", "MOF_RAG_MODEL_CACHE": "/models"})
     assert s.rag_qdrant_host is None and s.rag_max_limit == 30
+
+
+# --- no-vault mode (live SEC, local filings index) ------------------------------------------------------
+def test_no_vault_defaults():
+    s = Settings.from_env({})
+    assert s.sec_contact is None and s.companies_source == "auto"
+    assert (s.sec_max_rps, s.sec_timeout_s, s.sec_retries, s.sec_call_budget_s) == (5.0, 30, 4, 50)
+    assert (s.sec_positions_lookback_y, s.sec_memo_companies, s.sec_failure_ttl_s) == (5, 50, 60)
+    assert (s.sec_positions_donor_depth, s.sec_ttm_lookback_m) == (4, 20)
+    assert (s.cache, s.cache_max_gb) == ("on", 20)
+    assert (s.cache_evict_to, s.cache_tmp_grace_s) == (0.9, 3600)
+    assert s.cache_dir is None and s.cache_path().endswith("myopenfund-mcp")
+    assert (s.cache_ttl_submissions_h, s.cache_ttl_companyfacts_h) == (24, 24)
+    assert (s.filings_max_docs, s.index_workers, s.rag_onnx_provider) == (40, 1, "cpu")
+    assert (s.filings_search_default_limit, s.filings_search_max_limit) == (8, 20)
+    assert (s.filings_search_max_docs, s.filings_not_ready_listed) == (40, 10)
+    assert (s.search_rrf_k, s.search_candidates, s.search_eigenmind) == (60, 50, False)
+    assert s.filings_default_forms == ("10-K",)
+    assert (s.chunk_max_tokens, s.chunk_overlap_tokens) == (480, 32)
+
+
+def test_cache_dir_default_follows_the_platform(monkeypatch, tmp_path):
+    from myopenfund_mcp import config
+
+    monkeypatch.setattr(config.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert config.default_cache_dir() == str(tmp_path / "myopenfund-mcp")
+    monkeypatch.setattr(config.sys, "platform", "darwin")
+    assert config.default_cache_dir().endswith("Library/Caches/myopenfund-mcp")
+    monkeypatch.setattr(config.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert config.default_cache_dir() == str(tmp_path / "myopenfund-mcp")
+
+
+def test_cache_dir_override_and_cache_off():
+    s = Settings.from_env({"MOF_CACHE_DIR": "/data/c", "MOF_CACHE": "off"})
+    assert (s.cache_dir, s.cache) == ("/data/c", "off")
+
+
+def test_sources_and_their_requirements():
+    assert Settings.from_env({"MOF_COMPANIES_SOURCE": "auto"}).companies_source == "auto"
+    with pytest.raises(ConfigError, match="MOF_COMPANIES_CATALOG"):
+        Settings.from_env({"MOF_COMPANIES_SOURCE": "store"})
+    with pytest.raises(ConfigError, match="MOF_SEC_CONTACT"):
+        Settings.from_env({"MOF_COMPANIES_SOURCE": "sec"})
+    assert Settings.from_env({"MOF_COMPANIES_SOURCE": "sec", "MOF_SEC_CONTACT": "a@b.c"}).sec_contact == "a@b.c"
+    s = Settings.from_env({"MOF_COMPANIES_SOURCE": "store", "MOF_COMPANIES_CATALOG": "postgres:x",
+                           "MOF_COMPANIES_DATA_ROOT": "/d"})
+    assert s.companies_source == "store"
+
+
+def test_contact_is_never_shown_or_echoed():
+    secret = "someone.private@example.org"
+    s = Settings.from_env({"MOF_SEC_CONTACT": secret})
+    assert secret not in repr(s)
+    with pytest.raises(ConfigError) as err:
+        Settings.from_env({"MOF_SEC_CONTACT": secret, "MOF_SEC_MAX_RPS": "11"})
+    assert secret not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"MOF_SEC_MAX_RPS": "11"}, {"MOF_SEC_MAX_RPS": "0"}, {"MOF_SEC_MAX_RPS": "-1"},
+        {"MOF_SEC_MAX_RPS": "fast"}, {"MOF_SEC_MAX_RPS": "nan"}, {"MOF_SEC_MAX_RPS": "inf"},
+        {"MOF_COMPANIES_SOURCE": "web"}, {"MOF_CACHE": "maybe"}, {"MOF_RAG_ONNX_PROVIDER": "tpu"},
+        {"MOF_SEC_TIMEOUT_S": "0"}, {"MOF_SEC_RETRIES": "-1"}, {"MOF_SEC_CALL_BUDGET_S": "0"},
+        {"MOF_CACHE_MAX_GB": "0"}, {"MOF_CACHE_EVICT_TO": "0"}, {"MOF_CACHE_EVICT_TO": "1.1"},
+        {"MOF_CACHE_TMP_GRACE_S": "59"}, {"MOF_CACHE_TTL_SUBMISSIONS_H": "0"}, {"MOF_FILINGS_MAX_DOCS": "0"},
+        {"MOF_INDEX_WORKERS": "0"}, {"MOF_SEARCH_RRF_K": "0"}, {"MOF_SEARCH_CANDIDATES": "0"},
+        {"MOF_SEARCH_EIGENMIND": "perhaps"}, {"MOF_FILINGS_DEFAULT_FORMS": ","},
+        {"MOF_CHUNK_MAX_TOKENS": "0"}, {"MOF_CHUNK_OVERLAP_TOKENS": "480"},
+        {"MOF_CACHE_DIR": "relative/dir"}, {"MOF_CACHE_DIR": "~/cache"},
+        {"MOF_SEC_CONTACT": "a@b.c\r\nX: y"}, {"MOF_SEC_CONTACT": "\u00e9@b.c"},
+        {"MOF_SEC_CONTACT": "a" * 201}, {"MOF_SEC_MAX_RPS": "10.5"}, {"MOF_SEC_TIMEOUT_S": "601"},
+        {"MOF_SEC_RETRIES": "21"}, {"MOF_SEC_CALL_BUDGET_S": "3601"}, {"MOF_CACHE_MAX_GB": "100001"},
+        {"MOF_SEC_POSITIONS_LOOKBACK_Y": "0"}, {"MOF_SEC_POSITIONS_LOOKBACK_Y": "51"},
+        {"MOF_SEC_MEMO_COMPANIES": "0"}, {"MOF_SEC_MEMO_COMPANIES": "10001"},
+        {"MOF_SEC_FAILURE_TTL_S": "0"}, {"MOF_SEC_FAILURE_TTL_S": "3601"},
+        {"MOF_SEC_POSITIONS_DONOR_DEPTH": "-1"}, {"MOF_SEC_POSITIONS_DONOR_DEPTH": "41"},
+        {"MOF_SEC_TTM_LOOKBACK_M": "-1"}, {"MOF_SEC_TTM_LOOKBACK_M": "121"},
+        {"MOF_CACHE_TTL_COMPANYFACTS_H": "0"}, {"MOF_CACHE_TTL_COMPANYFACTS_H": "8761"},
+        {"MOF_CACHE_TTL_SUBMISSIONS_H": "8761"}, {"MOF_FILINGS_MAX_DOCS": "1001"}, {"MOF_INDEX_WORKERS": "33"}, {"MOF_INDEX_CLOSE_TIMEOUT_S": "3601"},
+        {"MOF_SEARCH_RRF_K": "1001"}, {"MOF_SEARCH_CANDIDATES": "1001"}, {"MOF_CHUNK_MAX_TOKENS": "8193"},
+        {"MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "0"}, {"MOF_FILINGS_SEARCH_MAX_LIMIT": "1001"},
+        {"MOF_FILINGS_SEARCH_MAX_DOCS": "0"}, {"MOF_FILINGS_NOT_READY_LISTED": "1001"},
+        {"MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "21"},
+        {"MOF_INDEX_BATCH_SIZE": "0"}, {"MOF_INDEX_BATCH_SIZE": "1025"}, {"MOF_INDEX_FIRST_BATCHES": "-1"},
+        {"MOF_INDEX_FIRST_BATCHES": "101"}, {"MOF_INDEX_FETCH_AHEAD": "0"}, {"MOF_INDEX_FETCH_AHEAD": "1001"},
+    ],
+)
+def test_bad_no_vault_values_are_refused(env):
+    with pytest.raises(ConfigError, match=next(iter(env))):
+        Settings.from_env(env)
+
+
+def test_rps_is_a_float_up_to_ten_and_retries_may_be_zero():
+    assert Settings.from_env({"MOF_SEC_MAX_RPS": "2.5"}).sec_max_rps == 2.5
+    assert Settings.from_env({"MOF_SEC_MAX_RPS": "10"}).sec_max_rps == 10.0
+    assert Settings.from_env({"MOF_SEC_RETRIES": "0"}).sec_retries == 0
+    assert Settings.from_env({"MOF_SEARCH_EIGENMIND": "true"}).search_eigenmind is True
+
+
+def test_indexing_order_settings():
+    default = Settings.from_env({})
+    assert (default.index_batch_size, default.index_first_batches, default.index_fetch_ahead) == (32, 1, 40)
+    # every document of one fetch call can be cut ahead: none waits for another's remainder
+    assert default.index_fetch_ahead >= default.filings_max_docs
+    assert Settings().index_fetch_ahead >= Settings().filings_max_docs
+    assert default.index_close_timeout_s == 30  # one batch (8-12 s on 4 CPU) fits
+    got = Settings.from_env({"MOF_INDEX_BATCH_SIZE": "8", "MOF_INDEX_FIRST_BATCHES": "0", "MOF_INDEX_FETCH_AHEAD": "3"})
+    assert (got.index_batch_size, got.index_first_batches, got.index_fetch_ahead) == (8, 0, 3)
+
+
+def test_default_cache_dir_ignores_a_relative_base_and_names_a_missing_home(monkeypatch, tmp_path):
+    from myopenfund_mcp import config
+
+    monkeypatch.setattr(config.sys, "platform", "linux")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", "rel")
+    assert config.default_cache_dir() == str(tmp_path / ".cache" / "myopenfund-mcp")
+    monkeypatch.setattr(config.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", "rel")
+    assert config.default_cache_dir().endswith("myopenfund-mcp") and os.path.isabs(config.default_cache_dir())
+    monkeypatch.setattr(config.os.path, "expanduser", lambda p: p)  # no home directory
+    with pytest.raises(ConfigError, match="MOF_CACHE_DIR"):
+        config.default_cache_dir()
+
+
+def test_an_unusable_default_cache_dir_stops_no_deployment_that_never_asked_for_it(monkeypatch):
+    from myopenfund_mcp import config
+
+    monkeypatch.setattr(config.os.path, "expanduser", lambda p: p)
+    s = Settings.from_env({})  # vault-only: starts
+    with pytest.raises(ConfigError, match="MOF_CACHE_DIR"):
+        s.cache_path()
+
+
+def test_contact_error_never_echoes_the_value():
+    with pytest.raises(ConfigError) as err:
+        Settings.from_env({"MOF_SEC_CONTACT": "secret\u00e9@b.c"})
+    assert "secret" not in str(err.value)
+
+
+def test_forms_are_normalised_and_cache_is_case_insensitive():
+    s = Settings.from_env({"MOF_FILINGS_DEFAULT_FORMS": " 10-k, 10-Q ,10-K", "MOF_CACHE": "OFF"})
+    assert s.filings_default_forms == ("10-K", "10-Q") and s.cache == "off"
+
+
+def test_source_sec_with_a_catalogue_set_still_needs_the_contact():
+    with pytest.raises(ConfigError, match="MOF_SEC_CONTACT"):
+        Settings.from_env({"MOF_COMPANIES_SOURCE": "sec", "MOF_COMPANIES_CATALOG": "postgres:x",
+                           "MOF_COMPANIES_DATA_ROOT": "/d"})

@@ -1,4 +1,6 @@
-"""The only module that imports open-data-store and company-corpus (layer rule: public interfaces only).
+"""The store adapter. With ``companies/live.py`` (the live SEC source) and ``live/sec.py`` (the SEC
+client), the only modules that import open-data-store and company-corpus (layer rule: public
+interfaces only).
 
 Blocking (DuckDB): the tools call it in a worker thread under a time budget. One open-data-store
 ``Store`` per process, opened lazily and reopened after a backend failure (``Store.read_asof``
@@ -25,12 +27,40 @@ from __future__ import annotations
 import math
 import re
 import threading
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 from functools import cache
 from pathlib import Path
 
 from ..config import Q4_RULES
+
+
+@cache
+def _config():
+    from company_corpus.config import Config
+
+    return Config()
+
+
+def covered_forms() -> tuple[str, ...]:
+    """The forms the store's ``filings`` dataset holds: company-corpus's ``store_report_forms`` (a
+    producer setting; ``/A`` variants listed), in its order. Any other form is not in the store."""
+    return tuple(f.upper() for f in _config().store_report_forms)
+
+
+def fallback_acceptance(filed: date) -> datetime:
+    """The acceptance time company-corpus gives a filing EDGAR dated without one: the filing date at
+    ``store_known_at_fallback_time`` in ``store_known_at_fallback_tz`` (23:59:59 New York by default), in
+    UTC. A row whose ``accepted_utc`` equals it is flagged ``accepted_is_fallback``.
+
+    Residual: company-corpus caps the fallback at the producer's run time, so a store row written by a
+    same-day run holds that earlier time, which is not this value: it is not flagged until the next
+    producer run rewrites it, and its time is an upper bound (the filing was accepted by then)."""
+    from zoneinfo import ZoneInfo
+
+    c = _config()
+    return datetime.combine(filed, time.fromisoformat(c.store_known_at_fallback_time),
+                            ZoneInfo(c.store_known_at_fallback_tz)).astimezone(UTC)
 
 
 class StoreUnknownDataset(LookupError):
@@ -373,11 +403,13 @@ class CompaniesStore:
     def describe(self, dataset: str) -> dict:
         return self._run(lambda s: s.describe(dataset))
 
-    def concept_rows(self, cik: str, as_of: datetime) -> tuple[list[dict], list[dict]]:
+    def concept_rows(self, cik: str, as_of: datetime, *, period_from: date | None = None,
+                     period_to: date | None = None) -> tuple[list[dict], list[dict]]:
         """``(selection_rows, vintages)`` for one issuer: company-corpus's concept selection on
         its ``fundamentals`` vintages and ``filing_statements`` knowable at ``as_of``, and those
         vintages (``summaries`` needs them for publication dates). ``([], [])`` without
-        fundamentals."""
+        fundamentals. ``period_from``/``period_to`` are accepted and ignored (the live source
+        fetches positions for that period; the store holds them all already)."""
         from company_corpus.concepts.selection import run_selection
 
         if not isinstance(cik, str) or not cik:
@@ -398,6 +430,66 @@ class CompaniesStore:
             return selected, facts.to_pylist()
 
         return self._run(go)
+
+    def known_filings(self, cik: str, *, dataset: str = "filings") -> list[dict]:
+        """``[{"filing_ref", "known_at"}]``: each filing of the issuer in ``dataset`` (``filings``, or
+        ``fundamentals`` when the store has no ``filings``: the filings its facts came from) with its
+        latest ``known_at``, as known now; aggregated in Arrow (one row per filing, never one per
+        fact). ``[]`` while the dataset is not published."""
+        if dataset not in ("filings", "fundamentals"):
+            raise StoreBadArgument("known_filings reads 'filings' or 'fundamentals'")
+        if not isinstance(cik, str) or not cik:
+            raise StoreBadArgument("cik must be a non-empty string")
+
+        def go(s):
+            if not self._is_published(s, dataset):
+                return []
+            t = s.read_asof(dataset, filters={"entity_scheme": ["cik"], "entity_value": [cik]},
+                            columns=["filing_ref", "known_at"])
+            t = t.filter(t["filing_ref"].is_valid()).group_by("filing_ref").aggregate([("known_at", "max")])
+            return [{"filing_ref": r["filing_ref"], "known_at": r["known_at_max"]} for r in t.to_pylist()]
+
+        return self._run(go)
+
+    def filings(self, cik: str, *, forms=None, period_from: date | None = None,
+                period_to: date | None = None, as_of: datetime | None = None) -> list:
+        """The issuer's filings in the ``filings`` dataset as company-corpus ``FilingRef`` (the live source's
+        shape), newest accepted first, as known at ``as_of`` (default now). ``accepted`` is
+        ``known_at`` when it is the publication time (``published``), else the fallback acceptance (see
+        :func:`fallback_acceptance`; company-corpus itself writes the fallback into ``known_at`` for a
+        filing EDGAR dated without a time, so the two are told apart by value). ``forms`` and the ``report_date`` window follow ``list_filings`` (a ``/A`` form matches
+        its base form; a filing without a report date is excluded when a bound is set); ``url`` and
+        ``doc_id`` are built as company-corpus builds them. ``[]`` while the dataset is not published."""
+        from collections import Counter
+
+        from company_corpus.live.filings import ARCHIVES, FilingRef, cik_to_path_int, source_doc_id
+
+        rows = self.read("filings", as_of=as_of or datetime.now(UTC), limit=None, columns=None,
+                         filters={"entity_scheme": ["cik"], "entity_value": [cik]})
+        wanted = {f.upper() for f in forms} if forms is not None else None
+        refs, seen = [], set()
+        for r in rows:
+            accn, form = r["filing_ref"], r["form"]
+            if accn in seen:
+                continue
+            upper = form.upper()
+            if wanted is not None and upper not in wanted and upper.removesuffix("/A") not in wanted:
+                continue
+            report = r["report_date"]
+            if (period_from or period_to) and report is None:
+                continue
+            if (period_from and report < period_from) or (period_to and report > period_to):
+                continue
+            seen.add(accn)
+            filed, known = r["valid_date"], r["known_at"]
+            accepted = known.astimezone(UTC) if r["known_at_kind"] == "published" else fallback_acceptance(filed)
+            refs.append(FilingRef(
+                cik=cik, accession=accn, form=form, report_date=report, filed=filed, accepted=accepted,
+                primary_document=None,
+                url=ARCHIVES.format(cik_int=cik_to_path_int(cik), acc_nodash=accn.replace("-", "")),
+                doc_id=r["source_doc_id"] or source_doc_id(cik, form, accn, frozenset(), Counter())))
+        refs.sort(key=lambda f: (f.accepted, f.accession), reverse=True)
+        return refs
 
     def summaries(self, cik: str, name: str, rows: list[dict], vintages: list[dict] | None) -> list:
         """company-corpus period summaries (values, ratios, TTM) of ``concept_rows``' output.

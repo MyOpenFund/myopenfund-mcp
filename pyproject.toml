@@ -27,10 +27,14 @@ dependencies = ["fastmcp>=4.1.4,<5"]
 vault = ["myopenfund-vault-query>=0.1.0,<0.2"]
 companies = [
   "myopenfund-open-data-store[reader]>=0.1.0,<0.2",
-  "myopenfund-company-corpus>=0.1.0,<0.2",
+  # [live]: live SEC fetching (no-vault mode), new in company-corpus 0.2.0.
+  "myopenfund-company-corpus[live]>=0.2.0,<0.3",
 ]
 # [onnx]: queries are embedded on the ONNX runtime (CPU), without PyTorch.
-rag = ["myopenfund-rag-engine[onnx]>=0.1.0,<0.2"]
+# Same range as [filings]: the two extras resolve one myopenfund-rag-engine release.
+rag = ["myopenfund-rag-engine[onnx]>=0.2.0,<0.3"]
+# [filings]: the local filings index (no-vault mode), new in rag-engine 0.2.0. [local] brings [onnx].
+filings = ["myopenfund-rag-engine[local,graph]>=0.2.0,<0.3"]
 dev = ["pytest>=8.3", "ruff>=0.6", "pyyaml>=6"]
 
 [project.urls]
@@ -54,10 +58,11 @@ packages = ["src/myopenfund_mcp"]
 
 [tool.pytest.ini_options]
 markers = [
-  "integration: needs a real vault database (MOF_MCP_IT_DATABASE_URL), a real company store (MOF_MCP_IT_COMPANIES_CATALOG + MOF_MCP_IT_COMPANIES_DATA_ROOT) or a throwaway Qdrant (MOF_MCP_IT_QDRANT_URL)",
+  "integration: needs a real vault database (MOF_MCP_IT_DATABASE_URL), a real company store (MOF_MCP_IT_COMPANIES_CATALOG + MOF_MCP_IT_COMPANIES_DATA_ROOT), a throwaway Qdrant (MOF_MCP_IT_QDRANT_URL) or SEC (MOF_SEC_CONTACT)",
   "llm: needs a local Ollama (MOF_MCP_IT_OLLAMA_URL)",
+  "models: downloads the embedding model and reads SEC (MOF_SEC_CONTACT)",
 ]
-addopts = "-m 'not integration and not llm'"
+addopts = "-m 'not integration and not llm and not models'"
 
 [tool.ruff]
 line-length = 110

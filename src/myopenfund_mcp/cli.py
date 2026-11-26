@@ -1,7 +1,8 @@
-"""`myopenfund-mcp serve` (default) and `myopenfund-mcp hash-token`."""
+"""`myopenfund-mcp serve` (default), `myopenfund-mcp hash-token` and `myopenfund-mcp warm`."""
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
 import secrets
 import sys
@@ -9,6 +10,7 @@ import sys
 from .auth import hash_token, is_valid_client_id
 from .config import ConfigError, Settings
 from .server import build_server
+from .warm import EXIT_USAGE, run_warm
 
 log = logging.getLogger("myopenfund_mcp.cli")
 
@@ -31,7 +33,41 @@ def _parser() -> argparse.ArgumentParser:
     hash_cmd.add_argument("client_id", help="1-32 characters of A-Z a-z 0-9 _ . -")
     hash_cmd.add_argument("--tier", choices=["read", "act"], default="act",
                           help="read: read-only tools; act: every tool (default)")
+    warm_cmd = sub.add_parser(
+        "warm", help="fetch facts and filings ahead of any question and index them to ready",
+        description="Fetch the facts and the filings of the companies over a window and index every "
+                    "document to ready in the cache, so later questions are answered from it. Progress "
+                    "on stderr. Exit 0 all ready, 1 a failure, 2 bad arguments or no MOF_SEC_CONTACT, "
+                    "130 interrupted. Run it again to resume: documents already ready are skipped.")
+    warm_cmd.add_argument("--companies", required=True,
+                          help="comma-separated tickers, CIKs or names (at most MOF_COMPANIES_MAX_COMPANIES)")
+    warm_cmd.add_argument("--forms", default=None,
+                          help="comma-separated forms, e.g. 10-K,10-Q (default MOF_FILINGS_DEFAULT_FORMS)")
+    warm_cmd.add_argument("--since", required=True, type=_date, help="report period end on or after, YYYY-MM-DD")
+    warm_cmd.add_argument("--until", type=_date, default=None,
+                          help="report period end on or before, YYYY-MM-DD (default: no limit)")
+    warm_cmd.add_argument("--poll-interval", type=float, default=None, metavar="SECONDS",
+                          help="seconds between two looks at the progress (default MOF_WARM_POLL_INTERVAL_S)")
     return parser
+
+
+def _date(raw: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a date YYYY-MM-DD: {raw!r}") from None
+
+
+def _warm(args) -> int:
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        settings = Settings.from_env()
+    except ConfigError as exc:
+        print(f"myopenfund-mcp: configuration error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    return run_warm(settings, companies=args.companies, forms=args.forms, since=args.since,
+                    until=args.until, poll_interval_s=args.poll_interval)
 
 
 def _hash_token(client_id: str, tier: str) -> int:
@@ -74,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "hash-token":
         return _hash_token(args.client_id, args.tier)
+    if args.command == "warm":
+        return _warm(args)
     return _serve()
 
 

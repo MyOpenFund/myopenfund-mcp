@@ -21,8 +21,9 @@ BLOB = "https://github.com/MyOpenFund/myopenfund-mcp/blob/main/"
 # extra -> the sibling distributions (with their own extras) it names; the ranges are checked by rule
 SIBLINGS = {
     "vault": [("myopenfund-vault-query", set())],
-    "companies": [("myopenfund-open-data-store", {"reader"}), ("myopenfund-company-corpus", set())],
+    "companies": [("myopenfund-open-data-store", {"reader"}), ("myopenfund-company-corpus", {"live"})],
     "rag": [("myopenfund-rag-engine", {"onnx"})],
+    "filings": [("myopenfund-rag-engine", {"local", "graph"})],
 }
 
 

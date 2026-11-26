@@ -28,7 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tests/, for fake
 
 DEFAULT_MODEL = "qwen2.5:7b"
 MAX_ROUNDS = 5
-HTTP_TIMEOUT_S = 300  # a cold 7B model on CPU can take minutes for its first answer
+# A cold 7B model on CPU can take minutes for its first answer; a thinking model on a slow CPU
+# (4 cloud cores, ~9 tokens/s for a 4B model) needs more: MOF_MCP_IT_OLLAMA_TIMEOUT_S overrides it.
+HTTP_TIMEOUT_S = float(os.environ.get("MOF_MCP_IT_OLLAMA_TIMEOUT_S") or 300)
 QUESTION = ("How many documents does the Federal Reserve (source code 'us') have in the vault? "
             "Count only live documents, not withdrawn ones. Use the tools, then answer with the number.")
 EXPECTED = "3"
@@ -48,13 +50,19 @@ def ollama_tools(tools) -> list[dict]:
     return out
 
 
-def ollama_chat(base_url: str, model: str, *, timeout_s: float = HTTP_TIMEOUT_S) -> Chat:
-    """A Chat over POST {base_url}/api/chat (non-streaming)."""
+DEFAULT_OPTIONS = {"temperature": 0}
+
+
+def ollama_chat(base_url: str, model: str, *, timeout_s: float = HTTP_TIMEOUT_S,
+                options: dict | None = None) -> Chat:
+    """A Chat over POST {base_url}/api/chat (non-streaming). `options` are Ollama's model options
+    (temperature, seed, num_ctx...); the default is deterministic, {"temperature": 0}."""
+    chosen = dict(DEFAULT_OPTIONS if options is None else options)
     endpoint = base_url.rstrip("/") + "/api/chat"
 
     def chat(messages: list[dict], tools: list[dict]) -> dict:
         body = json.dumps({"model": model, "messages": messages, "tools": tools, "stream": False,
-                           "options": {"temperature": 0}}).encode()
+                           "options": chosen}).encode()
         req = urllib.request.Request(endpoint, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return json.loads(resp.read())["message"]

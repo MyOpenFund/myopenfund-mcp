@@ -4,7 +4,7 @@ Run it with the Python of the deployed image (3.13, linux x86_64), from the repo
 
     python3.13 scripts/update_constraints.py
 
-It installs `.[vault,companies,rag]` into a throwaway venv, freezes it, and writes every distribution
+It installs `.[vault,companies,rag,filings]` into a throwaway venv, freezes it, and writes every distribution
 except this package to constraints.txt: the MyOpenFund siblings (myopenfund-vault-query, ...) are
 ordinary PyPI pins there, resolved within the ranges of pyproject.toml. This package is built from
 source at every install, in an isolated build environment that `-c` does not reach: its
@@ -23,7 +23,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXTRAS = "vault,companies,rag"
+EXTRAS = "vault,companies,rag,filings"
 # Installed by venv/pip themselves, not by the server's requirements.
 TOOLING = {"pip", "setuptools", "wheel"}
 HEADER = """\

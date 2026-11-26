@@ -17,7 +17,7 @@ from decimal import Decimal
 
 import pyarrow as pa
 from open_data_store.config import StoreConfig
-from open_data_store.contracts.standard import ENTITY_OBSERVATIONS, FILING_STATEMENTS, FUNDAMENTALS
+from open_data_store.contracts.standard import ENTITY_OBSERVATIONS, FILING_STATEMENTS, FILINGS, FUNDAMENTALS
 from open_data_store.publisher import approve_contract, publish_pending
 from open_data_store.writer import write_batch
 
@@ -56,9 +56,26 @@ def position(cik, tag, statement, accn=AAPL_10K_2024, end=date(2024, 9, 28),
                 "source_doc_id": None}
 
 
-def seed(tmp_path) -> StoreConfig:
+def filing(cik, accn, form, report, filed, known):
+    return {"entity_scheme": "cik", "entity_value": cik, "filing_ref": accn, "form": form,
+            "report_date": report, "valid_date": filed, "known_at": _ts(known), "known_at_kind": "published", "source_code": "sec",
+            "source_doc_id": None}
+
+
+#: Apple's filings in the store's `filings` dataset (``seed(..., filings=True)``): the two 10-Ks and
+#: an 8-K after the FY2025 one
+AAPL_8K_2025 = "0000320193-25-000090"
+AAPL_FILINGS = [
+    filing(AAPL, AAPL_10K_2024, "10-K", date(2024, 9, 28), date(2024, 11, 1), "2024-11-01T20:00:00"),
+    filing(AAPL, AAPL_10K_2025, "10-K", date(2025, 9, 27), date(2025, 10, 31), "2025-10-31T20:00:00"),
+    filing(AAPL, AAPL_8K_2025, "8-K", date(2025, 11, 3), date(2025, 11, 3), "2025-11-03T21:00:00"),
+]
+
+
+def seed(tmp_path, *, filings: bool = False) -> StoreConfig:
+    """The store; with ``filings``, the ``filings`` dataset is published too (Apple's only)."""
     cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
-    for c in (ENTITY_OBSERVATIONS, FUNDAMENTALS, FILING_STATEMENTS):
+    for c in (ENTITY_OBSERVATIONS, FUNDAMENTALS, FILING_STATEMENTS, *((FILINGS,) if filings else ())):
         approve_contract(cfg, c, "test")
     land = cfg.landing
     write_batch(ENTITY_OBSERVATIONS, pa.Table.from_pylist([
@@ -103,6 +120,9 @@ def seed(tmp_path) -> StoreConfig:
         position(AAPL, "Assets", "BS"), position(AAPL, "StockholdersEquity", "BS"),
     ], schema=FILING_STATEMENTS.schema), landing_root=land, run_id="r1", producer="test",
         now=NOW)
+    if filings:
+        write_batch(FILINGS, pa.Table.from_pylist(AAPL_FILINGS, schema=FILINGS.schema), landing_root=land,
+                    run_id="r1", producer="test", now=NOW)
     rep = publish_pending(cfg, now=NOW)
     assert rep.exit_code == 0, rep
     return cfg

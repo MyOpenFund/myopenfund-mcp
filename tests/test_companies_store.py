@@ -102,6 +102,13 @@ def test_concept_rows_give_revenue_and_vintages(store):
     assert len([v for v in vint if v["original_tag"] == REV]) == 3  # restatement kept
 
 
+def test_concept_rows_take_and_ignore_a_period(store):
+    """Same signature as the live source; the store holds every position already."""
+    bounded = store.concept_rows(AAPL, LATER, period_from=date(2030, 1, 1), period_to=date(2030, 12, 31))
+    plain = store.concept_rows(AAPL, LATER)
+    assert [sorted(map(repr, part)) for part in bounded] == [sorted(map(repr, part)) for part in plain]
+
+
 def test_concept_rows_of_a_bank_without_positions(store):
     rows, vint = store.concept_rows(JPM, LATER)
     assert {r["concept"] for r in rows} >= {"revenue", "net_income"}
@@ -739,3 +746,65 @@ def test_q4_rules_match_company_corpus():
 
     from myopenfund_mcp.config import Q4_RULES
     assert Q4_RULES == CORPUS_Q4_RULES
+
+
+def test_filings_collected_known_at_falls_back_to_the_end_of_the_filing_day_in_new_york(tmp_path):
+    import datetime as dt
+    from unittest import mock
+
+    from companies_fixture import AAPL, seed
+
+    from myopenfund_mcp.companies.store import CompaniesStore
+
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    row = {"filing_ref": "0000320193-25-000001", "form": "10-K/A", "report_date": None,
+           "valid_date": dt.date(2025, 1, 15), "known_at": dt.datetime(2025, 3, 1, tzinfo=dt.UTC),
+           "known_at_kind": "collected", "source_doc_id": None}
+    try:
+        with mock.patch.object(s, "read", return_value=[row]):
+            [ref] = s.filings(AAPL, forms=["10-K"], period_from=None, period_to=None)
+            assert s.filings(AAPL, forms=["10-K"], period_from=dt.date(2020, 1, 1), period_to=None) == []
+    finally:
+        s.close()
+    assert ref.accepted == dt.datetime(2025, 1, 16, 4, 59, 59, tzinfo=dt.UTC)
+    assert ref.url == "https://www.sec.gov/Archives/edgar/data/320193/000032019325000001"
+    assert ref.doc_id
+
+
+def test_filings_store_and_live_agree_on_url_doc_id_and_acceptance(tmp_path):
+    """The store row is what company-corpus's producer writes (filings_rows, manifest-style source_doc_id),
+    the live ref comes from the submissions: the two sources must agree on every accession."""
+    import datetime as dt
+    from unittest import mock
+
+    from companies_fixture import AAPL, seed
+    from company_corpus.config import Config
+    from company_corpus.live.filings import fetch_submissions
+    from company_corpus.opendata.filings import filings_rows
+    from live_fixture import FakeSec
+    from test_companies_live import _settings
+
+    from myopenfund_mcp.companies.live import LiveSource
+    from myopenfund_mcp.companies.store import CompaniesStore
+
+    now = dt.datetime(2026, 11, 25, tzinfo=dt.UTC)
+    produced = filings_rows(AAPL, fetch_submissions(AAPL, FakeSec(), max_age_s=None, now=now),
+                            manifest_doc_ids=frozenset(), config=Config(), now=now).rows
+    assert produced and all(r["source_doc_id"] for r in produced)
+    live = LiveSource(FakeSec(), _settings())
+    cfg = seed(tmp_path, filings=True)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    try:
+        lrefs = {r.accession: r for r in live.filings(AAPL, forms=None, period_from=None, period_to=None)}
+        with mock.patch.object(s, "read", return_value=produced):
+            srefs = {r.accession: r for r in s.filings(AAPL, forms=None, period_from=None, period_to=None)}
+    finally:
+        s.close()
+        live.close()
+    assert set(srefs) == {r["filing_ref"] for r in produced} <= set(lrefs)
+    for accn, sref in srefs.items():
+        lref = lrefs[accn]
+        assert (sref.url, sref.doc_id, sref.accepted, sref.filed, sref.report_date, sref.form) == (
+            lref.url, lref.doc_id, lref.accepted, lref.filed, lref.report_date, lref.form)
+    assert srefs["0000320193-24-000123"].accepted == dt.datetime(2024, 11, 1, 20, 6, 22, tzinfo=dt.UTC)

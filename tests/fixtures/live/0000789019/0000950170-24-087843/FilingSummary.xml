@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FilingSummary>
+  <Version>3.24.2</Version>
+  <ProcessingTime />
+  <ReportFormat>Html</ReportFormat>
+  <ContextCount>412</ContextCount>
+  <ElementCount>903</ElementCount>
+  <EntityCount>1</EntityCount>
+  <FootnotesReported>false</FootnotesReported>
+  <SegmentCount>184</SegmentCount>
+  <ScenarioCount>0</ScenarioCount>
+  <TuplesReported>false</TuplesReported>
+  <UnitCount>6</UnitCount>
+  <MyReports>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R1.htm</HtmlFileName>
+      <LongName>100000 - Document - Cover Page</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/CoverPage</Role>
+      <ShortName>Cover Page</ShortName>
+      <MenuCategory>Cover</MenuCategory>
+      <Position>1</Position>
+    </Report>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R2.htm</HtmlFileName>
+      <LongName>100010 - Statement - INCOME STATEMENTS</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/IncomeStatements</Role>
+      <ShortName>INCOME STATEMENTS</ShortName>
+      <MenuCategory>Statements</MenuCategory>
+      <Position>2</Position>
+    </Report>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R3.htm</HtmlFileName>
+      <LongName>100020 - Statement - COMPREHENSIVE INCOME STATEMENTS</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/ComprehensiveIncomeStatements</Role>
+      <ShortName>COMPREHENSIVE INCOME STATEMENTS</ShortName>
+      <MenuCategory>Statements</MenuCategory>
+      <Position>3</Position>
+    </Report>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R4.htm</HtmlFileName>
+      <LongName>100030 - Statement - BALANCE SHEETS</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/BalanceSheets</Role>
+      <ShortName>BALANCE SHEETS</ShortName>
+      <MenuCategory>Statements</MenuCategory>
+      <Position>4</Position>
+    </Report>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R5.htm</HtmlFileName>
+      <LongName>100035 - Statement - BALANCE SHEETS (Parenthetical)</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/BalanceSheetsParenthetical</Role>
+      <ShortName>BALANCE SHEETS (Parenthetical)</ShortName>
+      <MenuCategory>Statements</MenuCategory>
+      <Position>5</Position>
+    </Report>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R6.htm</HtmlFileName>
+      <LongName>100040 - Statement - CASH FLOWS STATEMENTS</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/CashFlowsStatements</Role>
+      <ShortName>CASH FLOWS STATEMENTS</ShortName>
+      <MenuCategory>Statements</MenuCategory>
+      <Position>6</Position>
+    </Report>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R7.htm</HtmlFileName>
+      <LongName>100050 - Statement - STOCKHOLDERS' EQUITY STATEMENTS</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/StockholdersEquityStatements</Role>
+      <ShortName>STOCKHOLDERS' EQUITY STATEMENTS</ShortName>
+      <MenuCategory>Statements</MenuCategory>
+      <Position>7</Position>
+    </Report>
+    <Report instance="msft-10k_20240630.htm">
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <HtmlFileName>R45.htm</HtmlFileName>
+      <LongName>9954505 - Disclosure - REVENUE - Additional Information (Details)</LongName>
+      <ReportType>Sheet</ReportType>
+      <Role>http://www.microsoft.com/role/RevenueAdditionalInformationDetails</Role>
+      <ShortName>REVENUE - Additional Information (Details)</ShortName>
+      <MenuCategory>Details</MenuCategory>
+      <Position>45</Position>
+      <ParentRole>http://www.microsoft.com/role/Revenue</ParentRole>
+    </Report>
+    <Report>
+      <IsDefault>false</IsDefault>
+      <HasEmbeddedReports>false</HasEmbeddedReports>
+      <LongName>All Reports</LongName>
+      <ReportType>Book</ReportType>
+      <ShortName>All Reports</ShortName>
+      <Position>46</Position>
+    </Report>
+  </MyReports>
+  <InputFiles>
+    <File doctype="10-K" original="msft-10k_20240630.htm">msft-10k_20240630.htm</File>
+    <File>msft-20240630.xsd</File>
+    <File>msft-20240630_cal.xml</File>
+    <File>msft-20240630_def.xml</File>
+    <File>msft-20240630_lab.xml</File>
+    <File>msft-20240630_pre.xml</File>
+  </InputFiles>
+  <SupplementalFiles />
+  <BaseTaxonomies>
+    <BaseTaxonomy items="1">http://fasb.org/us-gaap/2024</BaseTaxonomy>
+  </BaseTaxonomies>
+  <HasPresentationLinkbase>true</HasPresentationLinkbase>
+  <HasCalculationLinkbase>true</HasCalculationLinkbase>
+</FilingSummary>
