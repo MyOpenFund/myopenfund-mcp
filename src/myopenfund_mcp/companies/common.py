@@ -149,6 +149,6 @@ def coded(exc: BaseException) -> ToolError:
     code = sec_error_code(exc)
     if code is not None:
         log.warning("SEC call failed (%s)", type(exc).__name__)
-        return tool_error(code, SEC_MESSAGES[code])
+        return tool_error(code, SEC_MESSAGES.get(code, LIVE_BACKEND_MESSAGE))
     log.warning("store call failed (%s)", type(exc).__name__)  # StoreBackendError and anything else
     return tool_error(BACKEND_UNAVAILABLE, BACKEND_MESSAGE)

@@ -583,6 +583,24 @@ async def test_live_errors_are_coded_and_never_hold_the_contact(index, tool, cap
     assert SENTINEL not in msg and SENTINEL not in caplog.text
 
 
+@pytest.mark.parametrize("tool", ["companies_facts", "companies_fundamentals"])
+async def test_an_unclassified_live_failure_names_sec_not_the_store(tool, caplog):
+    """C3b-m5: a raw error from below the live source (an HTTP error of a positions fetch) on a live
+    route is [backend_unavailable] about SEC, never "the company data store cannot be read"."""
+    from urllib.error import HTTPError
+
+    from source_fakes import APPLE, FakeLive
+
+    from myopenfund_mcp.companies.common import BACKEND_MESSAGE, LIVE_BACKEND_MESSAGE
+
+    raw = HTTPError(f"https://www.sec.gov/x?ua={SENTINEL}", 500, "Server Error", {}, None)
+    method = "read:fundamentals" if tool == "companies_facts" else "concept_rows"
+    msg = await _routed_error(None, FakeLive(fail={method: raw}), tool, {"companies": [APPLE]})
+    assert msg.startswith("[backend_unavailable]") and LIVE_BACKEND_MESSAGE in msg
+    assert BACKEND_MESSAGE not in msg and "store" not in msg
+    assert "HTTPError" in caplog.text and SENTINEL not in msg and SENTINEL not in caplog.text
+
+
 async def test_results_and_server_info_never_hold_the_contact(caplog):
     from source_fakes import FakeLive, FakeStore
 
@@ -1089,3 +1107,4 @@ async def test_filings_live_fallback_is_capped_at_now():
     row = res["rows"][0]
     assert row["accepted_is_fallback"] is True
     assert dt.datetime.fromisoformat(row["accepted_utc"]) <= dt.datetime.now(dt.UTC)
+

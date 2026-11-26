@@ -901,3 +901,40 @@ def test_a_filing_without_positions_files_stays_blind(make):
     assert any(u.startswith(_folder(MSFT, MSFT_Q25)) for u in sec.urls())
     q = [r for r in rows if r["concept"] == "revenue" and r["valid_date"] == date(2024, 9, 30)]
     assert q[0]["location"] == "inferred"
+
+
+class _PositionsHttpError(FakeSec):
+    """SEC answers a non-2xx status (SecHttpError, e.g. 403 without the undeclared-tool page) for the
+    files of one filing's folder."""
+
+    def __init__(self, folder: str):
+        super().__init__()
+        self.folder = folder
+
+    def get_bytes(self, url, *, max_age_s=None):
+        from company_corpus.live.sec import SecHttpError
+
+        if url.startswith(self.folder):
+            with self._lock:
+                self.calls.append((url, max_age_s))
+            raise SecHttpError(403, "403 for this file")
+        return super().get_bytes(url, max_age_s=max_age_s)
+
+
+def test_an_http_error_on_one_filings_positions_leaves_it_blind_not_the_build(make, caplog):
+    """Like company-corpus's issuer_tables: SecHttpError concerns that filing only (SecUnavailable
+    still fails the build, above)."""
+    sec = _PositionsHttpError(_folder(MSFT, MSFT_Q25))
+    rows, _ = make(sec, sec_ttm_lookback_m=0).concept_rows(MSFT, LATER, **_MSFT_PERIOD)
+    q = [r for r in rows if r["concept"] == "revenue" and r["valid_date"] == date(2024, 9, 30)]
+    assert q[0]["location"] == "inferred"
+    assert "SecHttpError" in caplog.text
+
+
+def test_sec_http_error_is_coded_with_the_live_message():
+    from company_corpus.live.sec import SecHttpError
+
+    from myopenfund_mcp.companies.common import LIVE_BACKEND_MESSAGE, coded
+
+    err = coded(SecHttpError(401, "401 for https://www.sec.gov/x"))
+    assert str(err) == f"[backend_unavailable] {LIVE_BACKEND_MESSAGE}"

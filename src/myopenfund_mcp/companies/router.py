@@ -61,7 +61,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
-from .live import LiveClosed, sec_error_code
+from ..errors import SEC_CONTACT_MISSING, SEC_REFUSED, SEC_UNAVAILABLE
+from .live import LiveClosed, LiveDataError, NoFacts, Warming, sec_error_code
 from .store import StoreBadArgument, StoreUnknownDataset
 
 log = logging.getLogger("myopenfund_mcp.companies")
@@ -93,6 +94,25 @@ class LiveNotConfigured(RuntimeError):
     def __init__(self, cik: str, reason: str):
         super().__init__(f"CIK {cik} needs SEC ({reason}) and no SEC contact is configured")
         self.cik, self.reason = cik, reason
+
+
+#: Codes that mean SEC itself is out of reach (not one file's answer): the router stops asking for a while.
+_SEC_DOWN = (SEC_CONTACT_MISSING, SEC_REFUSED, SEC_UNAVAILABLE)
+#: Exceptions of a live call that already carry their own code (`companies.common.coded`).
+_CLASSIFIED = (LiveDataError, LiveClosed, Warming, NoFacts, LiveNotConfigured, StoreBadArgument, StoreUnknownDataset)
+
+
+def _live(fn, /, *args, **kwargs):
+    """``fn(*args, **kwargs)`` on the live source. An unclassified failure (a raw HTTP or parsing
+    error from below) becomes ``LiveDataError``, so its code and message name SEC, never the store;
+    only its class is logged (C3b-m5)."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        if isinstance(exc, _CLASSIFIED) or sec_error_code(exc) is not None:
+            raise
+        log.warning("companies: live SEC call failed (%s)", type(exc).__name__)
+        raise LiveDataError(f"a live SEC call failed ({type(exc).__name__})") from None
 
 
 def _store_failure(exc: BaseException) -> bool:
@@ -255,7 +275,7 @@ class SourceRouter:
                 log.warning(
                     "companies: SEC freshness check failed, answering from the store (%s)", type(exc).__name__
                 )
-                if sec_error_code(exc) is not None or isinstance(exc, LiveClosed):  # SEC itself
+                if sec_error_code(exc) in _SEC_DOWN or isinstance(exc, LiveClosed):  # SEC itself
                     with self._lock:
                         self._sec_down_until = self._clock() + self._failure_ttl_s
                     break
@@ -361,7 +381,7 @@ class SourceRouter:
             kwargs.pop("as_of", None)
         if budget_s is not None and method in _BUDGETED:
             kwargs["budget_s"] = budget_s
-        return route, getattr(self.live, method)(**kwargs)
+        return route, _live(getattr(self.live, method), **kwargs)
 
     def _on_store(self, method: str, kwargs: dict):
         if method == "concept_rows":
@@ -378,14 +398,14 @@ class SourceRouter:
         if self.mode == "store" or (self.mode == "auto" and self.live is None):
             return self.store.entities(), None
         if self.mode == "sec" or self.store is None:
-            return self.live.entities(), None
+            return _live(self.live.entities), None
         try:
             stored = self.store.entities()
         except Exception as exc:  # noqa: BLE001 -- a store outage leaves the live resolver
             log.warning("companies: store entities failed, resolving from SEC (%s)", type(exc).__name__)
-            return self.live.entities(), None
+            return _live(self.live.entities), None
         try:
-            live = self.live.entities()
+            live = _live(self.live.entities)
         except Exception as exc:  # noqa: BLE001 -- an SEC outage leaves the store's companies
             log.warning("companies: SEC resolver failed, resolving from the store (%s)", type(exc).__name__)
             return stored, exc
@@ -423,7 +443,7 @@ class SourceRouter:
         ciks = list(dict.fromkeys((filters or {}).get("entity_value") or []))
         if not ciks:
             src = self.store if self.mode != "sec" and self.store is not None else self.live
-            return src.read(filters=filters, **kwargs)
+            return src.read(filters=filters, **kwargs) if src is self.store else _live(src.read, filters=filters, **kwargs)
         routes = self.plan(ciks, as_of)
         held = [c for c in ciks if routes[c].source == STORE]
         rows: list[dict] = []
@@ -463,11 +483,11 @@ class SourceRouter:
 
     def latest_filing(self, cik: str, **kwargs):
         """SEC's newest filing of the CIK (the live source's; None without one)."""
-        return None if self.live is None else self.live.latest_filing(cik, **kwargs)
+        return None if self.live is None else _live(self.live.latest_filing, cik, **kwargs)
 
     def filings(self, cik: str, **kwargs) -> list:
         """SEC's filings of the CIK (the live source's; ``[]`` without one)."""
-        return [] if self.live is None else self.live.filings(cik, **kwargs)
+        return [] if self.live is None else _live(self.live.filings, cik, **kwargs)
 
     def close(self) -> None:
         """Stop the freshness-check threads (queued checks are dropped); the sources are closed by

@@ -59,6 +59,7 @@ no message names it.
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import threading
 import time
@@ -70,7 +71,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
 from ..config import Q4_RULES, Settings
-from ..errors import SEC_CONTACT_MISSING, SEC_REFUSED, SEC_UNAVAILABLE
+from ..errors import BACKEND_UNAVAILABLE, SEC_CONTACT_MISSING, SEC_REFUSED, SEC_UNAVAILABLE
 from .store import (
     StoreBadArgument,
     StoreUnknownDataset,
@@ -78,6 +79,8 @@ from .store import (
     _concept_catalog,
     _metric_catalog,
 )
+
+log = logging.getLogger("myopenfund_mcp.companies")
 
 #: Requests company-corpus's ``filing_positions`` makes per filing (index.json, FilingSummary.xml,
 #: the presentation linkbase): a progress estimate only, for :class:`Warming`.
@@ -115,15 +118,18 @@ class LiveClosed(RuntimeError):
 
 def sec_error_code(exc: BaseException) -> str | None:
     """The tool error code of company-corpus's SEC errors (``SecContactMissing``, ``SecRefused``,
-    ``SecUnavailable``); None for any other exception, or without company-corpus."""
+    ``SecUnavailable``; ``SecHttpError``, another non-2xx answer for one file, is
+    ``backend_unavailable`` with the live message, and does not mean SEC is down); None for any other
+    exception, or without company-corpus."""
     try:
-        from company_corpus.live.sec import SecContactMissing, SecRefused, SecUnavailable
+        from company_corpus.live.sec import SecContactMissing, SecHttpError, SecRefused, SecUnavailable
     except ImportError:
         return None
     for cls, code in (
         (SecContactMissing, SEC_CONTACT_MISSING),
         (SecRefused, SEC_REFUSED),
         (SecUnavailable, SEC_UNAVAILABLE),
+        (SecHttpError, BACKEND_UNAVAILABLE),
     ):
         if isinstance(exc, cls):
             return code
@@ -483,7 +489,7 @@ class LiveSource:
         from company_corpus.live.filings import list_filings
         from company_corpus.live.issuer import POSITIONS_FORMS
         from company_corpus.live.positions import filing_positions
-        from company_corpus.live.sec import SecNotFound
+        from company_corpus.live.sec import SecHttpError, SecNotFound
         from company_corpus.opendata.statements import statement_rows
         from company_corpus.opendata.submissions import acceptance_times
 
@@ -497,7 +503,10 @@ class LiveSource:
             try:
                 with _data_faults():
                     found.extend(filing_positions(ref, counting))
-            except SecNotFound:  # guard: filing_positions already maps 404s to []; SecUnavailable propagates
+            except (SecNotFound, SecHttpError) as exc:
+                # this filing stays blind (as company-corpus's issuer_tables counts it); a 404 is mapped
+                # to [] by filing_positions already (guard); SecUnavailable propagates: the build fails
+                log.warning("companies: positions of one filing could not be read (%s)", type(exc).__name__)
                 continue
         if found:
             found.sort(key=lambda r: (r["accn"], r["statement"], r["tag"]))  # issuer_tables' order
