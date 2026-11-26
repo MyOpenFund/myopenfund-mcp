@@ -69,6 +69,7 @@ FIELDS = {
     "MOF_FILINGS_SEARCH_DEFAULT_LIMIT": "filings_search_default_limit",
     "MOF_FILINGS_SEARCH_MAX_LIMIT": "filings_search_max_limit",
     "MOF_FILINGS_SEARCH_MAX_DOCS": "filings_search_max_docs",
+    "MOF_FILINGS_READ_MAX_CHARS": "filings_read_max_chars",
     "MOF_FILINGS_NOT_READY_LISTED": "filings_not_ready_listed",
     "MOF_INDEX_WORKERS": "index_workers", "MOF_INDEX_CLOSE_TIMEOUT_S": "index_close_timeout_s",
     "MOF_INDEX_BATCH_SIZE": "index_batch_size", "MOF_INDEX_FIRST_BATCHES": "index_first_batches",

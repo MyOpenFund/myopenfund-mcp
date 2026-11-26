@@ -1129,6 +1129,20 @@ def test_fill_never_exceeds_the_budget_with_the_next_fields(tmp_path):
             assert returned == "".join(r[2] for r in rows)
 
 
+def test_a_read_page_is_bounded_by_the_read_setting_below_the_result_cap(tmp_path):
+    """MOF_FILINGS_READ_MAX_CHARS bounds one page even when the result cap is far larger (an MCP
+    client such as Claude Code refuses results of ~25k tokens); `more` gives the rest."""
+    rows = [(n, "Item 7", f"word{n} " * 400) for n in range(40)]  # ~100k characters in all
+    base = {"doc_id": DOC, "section": None, "chunks": [], "more": False, "next_chunk_id": None, "next_offset": 0}
+    settings = Settings(cache_dir=str(tmp_path), max_result_chars=200_000, filings_read_max_chars=5_000)
+    result = {**base, "chunks": []}
+    FilingsIndexer(settings, sec=object())._fill(result, iter(rows), 0)
+    assert result_chars(result) <= 5_000
+    assert result["more"] is True and result["next_chunk_id"] is not None
+    default = Settings(cache_dir=str(tmp_path))
+    assert default.filings_read_max_chars == 40_000 <= default.max_result_chars
+
+
 def test_chunk_id_without_around_reads_forward(tmp_path):
     indexer = make(tmp_path, GatedEmbedder(batch_size=8))
     try:

@@ -1022,7 +1022,7 @@ class FilingsIndexer:
     def _fill(self, result: dict[str, Any], rows: Iterable[tuple], offset: int) -> None:
         """Append chunks of `rows` to `result` while its size (as the tools count it), `more` and
         `next_*` included, stays within the budget; `next_*` point at the first text not returned."""
-        budget = self._settings.max_result_chars
+        budget = min(self._settings.filings_read_max_chars, self._settings.max_result_chars)
         chunks: list[dict[str, Any]] = result["chunks"]
         size = result_chars(result)
         pending: dict[str, Any] | None = None  # the first entry that did not fit

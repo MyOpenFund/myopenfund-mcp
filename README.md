@@ -1046,6 +1046,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_FILINGS_SEARCH_DEFAULT_LIMIT` | `8` | Passages `companies_search_filings` returns when the caller gives no `limit`; at most `MOF_FILINGS_SEARCH_MAX_LIMIT`. |
 | `MOF_FILINGS_SEARCH_MAX_LIMIT` | `20` | Largest `limit` a caller may ask `companies_search_filings` for (1-1000); a larger one is refused with `[limit_exceeded]`. |
 | `MOF_FILINGS_SEARCH_MAX_DOCS` | `40` | Fetched filings a `companies_search_filings` call without `companies` may cover (1-10000); with more fetched, the call is refused with `[invalid_argument]` asking for `companies`. |
+| `MOF_FILINGS_READ_MAX_CHARS` | `40000` | Characters in one `companies_read_filing` page (min 1000, also capped by `MOF_MCP_MAX_RESULT_CHARS`); `more` and `next_chunk_id` / `next_offset` give the next page. Kept well under MCP clients' result limits (Claude Code refuses about 25k tokens). |
 | `MOF_FILINGS_NOT_READY_LISTED` | `10` | Not-yet-ready documents listed in a search result (`not_ready`, 0-1000); `not_ready_total` counts them all. |
 | `MOF_INDEX_WORKERS` | `1` | Embedding workers of the filings indexer: batches embedded in parallel, one per document (1-32). One more thread fetches and cuts the documents ahead of them. |
 | `MOF_INDEX_BATCH_SIZE` | `32` | Passages embedded and added to the index in one step (1-1024), the unit of the indexing order (rag-engine's ONNX batch size; about 8-12 s on 4 CPU cores). |

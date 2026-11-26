@@ -289,6 +289,9 @@ class Settings:
     filings_search_max_limit: int = 20
     # MOF_FILINGS_SEARCH_MAX_DOCS: fetched filings a search without `companies` may cover (more: pass companies)
     filings_search_max_docs: int = 40
+    # MOF_FILINGS_READ_MAX_CHARS: one companies_read_filing page (more pages follow next_chunk_id); kept
+    # well under MCP clients' result limits (Claude Code refuses ~25k tokens); capped by MOF_MCP_MAX_RESULT_CHARS
+    filings_read_max_chars: int = 40_000
     # MOF_FILINGS_NOT_READY_LISTED: not-yet-ready documents listed in a search result (the rest are counted)
     filings_not_ready_listed: int = 10
     index_workers: int = 1  # MOF_INDEX_WORKERS: batches of passages embedded in parallel (one per document)
@@ -397,6 +400,7 @@ class Settings:
             filings_search_default_limit=_int(env, "MOF_FILINGS_SEARCH_DEFAULT_LIMIT", 8, maximum=1000),
             filings_search_max_limit=_int(env, "MOF_FILINGS_SEARCH_MAX_LIMIT", 20, maximum=1000),
             filings_search_max_docs=_int(env, "MOF_FILINGS_SEARCH_MAX_DOCS", 40, maximum=10000),
+            filings_read_max_chars=_int(env, "MOF_FILINGS_READ_MAX_CHARS", 40_000, minimum=1_000),
             filings_not_ready_listed=_int(env, "MOF_FILINGS_NOT_READY_LISTED", 10, minimum=0, maximum=1000),
             index_workers=_int(env, "MOF_INDEX_WORKERS", 1, maximum=32),
             index_batch_size=_int(env, "MOF_INDEX_BATCH_SIZE", 32, maximum=1024),
