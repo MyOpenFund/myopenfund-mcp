@@ -737,6 +737,17 @@ async def test_end_to_end_on_the_real_indexer(tmp_path):
         indexer.close()
 
 
+async def test_a_document_error_is_shown_bounded_and_masked():
+    """I5: a status recorded by an earlier build kept the first line of the message: shown by its class."""
+    leaky = status(MSFT_K24, "failed")
+    leaky.error = f"OSError: [Errno 13] /home/someone/.cache/x for {SENTINEL.upper()} " + "x" * 5000
+    kept = status(MSFT_K23, "failed")
+    kept.error = "SecUnavailable: SEC stayed unreachable or throttled; fetch again later"
+    res = await _call(FakeIndexer([leaky, kept]), "companies_fetch_filings", {"companies": ["MSFT"]})
+    errors = {d["doc_id"]: d["error"] for d in res["documents"]}
+    assert errors == {MSFT_K24.doc_id: "OSError", MSFT_K23.doc_id: kept.error}
+
+
 # --- fix round 1 -------------------------------------------------------------------------------------
 
 

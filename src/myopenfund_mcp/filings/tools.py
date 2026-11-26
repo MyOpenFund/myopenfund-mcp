@@ -62,6 +62,7 @@ from .indexer import (
     SectionNotFound,
     chunk_id,
     filing_doc_id,
+    public_error,
     title_company,
 )
 
@@ -194,7 +195,9 @@ def _check_companies(companies: list[str], settings: Settings) -> None:
 
 
 def _status_row(status: DocStatus, names: dict[str, str]) -> dict:
-    return {"company": names.get(status.cik), **status.to_dict()}
+    """A document's status as the tools show it; its `error` bounded and masked (`public_error`:
+    a record of an earlier build may hold a message's first line)."""
+    return {"company": names.get(status.cik), **status.to_dict(), "error": public_error(status.error)}
 
 
 def _not_ready_message(matched: list[DocStatus]) -> str:

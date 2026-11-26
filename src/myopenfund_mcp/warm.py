@@ -242,8 +242,10 @@ class Warmer:
         if not refs:
             self.say("no filing of these forms in this window")
         failed = [s for s in statuses if s.state == "failed"]
+        if failed:
+            from .filings.indexer import public_error
         for s in failed:
-            self.say(f"failed {s.doc_id} ({s.form} {s.filed}): {s.error or 'no detail'}")
+            self.say(f"failed {s.doc_id} ({s.form} {s.filed}): {public_error(s.error) or 'no detail'}")
         for s in self.stalled:
             self.say(f"stuck {s.doc_id} ({s.form} {s.filed}): {s.state}, {s.chunks_done} chunk(s) done")
         for step in self.failed_steps:

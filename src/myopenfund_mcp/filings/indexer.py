@@ -63,8 +63,10 @@ whose record was not written) the document's points and chunks are removed and i
 first call that needs it; when another process holds it, every method raises `IndexUnavailable`
 (naming the lock), and a later call tries again. Nothing else of the server depends on it.
 
-**Errors.** A document that fails is marked `failed` with `<ExceptionType>: <first line of the
-message>` (the SEC contact is never written) and the worker continues with the next one. Log lines
+**Errors.** A document that fails is marked `failed` with a bounded, fixed text: `<ExceptionType>:
+<what happened>` for the known failures (not HTML, too large, no primary document, no text, SEC
+refusing, unreachable or answering 404 / an HTTP error), the exception type alone otherwise; never
+the exception's message (a path, a URL, the SEC contact). The other documents go on. Log lines
 carry exception type names only.
 
 `close()` stops the threads after their current step (the model load, the fetch, the chunking or a
@@ -81,6 +83,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import tempfile
 import threading
@@ -369,12 +372,46 @@ def _batches(
     return first + [run for run in runs if sections[run[0]] not in priority]
 
 
-def _short_error(exc: BaseException, contact: str | None) -> str:
-    lines = str(exc).strip().splitlines()
-    text = f"{type(exc).__name__}: {lines[0]}" if lines else type(exc).__name__
-    if contact:
-        text = text.replace(contact, "<contact>")
-    return text
+#: The text recorded for a failed document, per exception class (ruling I5): fixed, so that no
+#: message (a path, a URL with credentials, the SEC contact, a long page) reaches the status record,
+#: the tools or `warm`. Any other class is recorded by its name only.
+_ERROR_TEXTS: dict[str, str] = {
+    "NoText": "no text to index in the primary document",
+    "UnsupportedDocument": "the primary document is not an HTML file",
+    "DocumentTooLarge": "the primary document is larger than the conversion limit",
+    "PrimaryDocumentNotFound": "the filing index lists no HTML document of the filing's form",
+    "MarkItDownUnavailable": "MarkItDown is not installed (the [filings] extra)",
+    "SecContactMissing": "no SEC contact (MOF_SEC_CONTACT)",
+    "SecRefused": "SEC refused the request as an undeclared automated tool (check MOF_SEC_CONTACT)",
+    "SecUnavailable": "SEC stayed unreachable or throttled; fetch again later",
+    "SecNotFound": "SEC answered 404 for a file of the filing",
+    "SecHttpError": "SEC answered an HTTP error for a file of the filing",
+}
+_ERROR_PREFIXES = {f"{name}: {text}" for name, text in _ERROR_TEXTS.items()}
+
+
+def _short_error(exc: BaseException) -> str:
+    """The bounded, masked text of a document's failure: `<Class>: <fixed text>` for a known
+    class (nearest known base first), else the class name alone. Never the exception's message."""
+    for cls in type(exc).__mro__:
+        text = _ERROR_TEXTS.get(cls.__name__)
+        if text is not None:
+            if cls.__name__ == "SecHttpError" and isinstance(getattr(exc, "status", None), int):
+                return f"SecHttpError: SEC answered HTTP {exc.status} for a file of the filing"  # type: ignore[attr-defined]
+            return f"{cls.__name__}: {text}"
+    return type(exc).__name__
+
+
+def public_error(stored: str | None) -> str | None:
+    """A status's `error` as the tools and `warm` show it: a text this module records as it is;
+    anything else (a record written by an earlier build, which kept the first line of the message)
+    by its leading class name only."""
+    if stored is None or stored in _ERROR_PREFIXES or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", stored):
+        return stored
+    if re.fullmatch(r"SecHttpError: SEC answered HTTP \d{3} for a file of the filing", stored):
+        return stored
+    head = re.match(r"[A-Za-z_][A-Za-z0-9_]{0,80}(?=:)", stored)
+    return head.group(0) if head else "error"
 
 
 def _now() -> str:
@@ -1140,7 +1177,7 @@ class FilingsIndexer:
     def _fail(self, job: _Job, exc: BaseException) -> None:
         # Type names only: a message, or its chained context, may hold the SEC contact.
         log.warning("filing %s failed: %s", job.doc_id, type(exc).__name__)
-        self._finish(job, ("failed", _short_error(exc, self._settings.sec_contact)))
+        self._finish(job, ("failed", _short_error(exc)))
 
     # --- the workers ---------------------------------------------------------------------------
 

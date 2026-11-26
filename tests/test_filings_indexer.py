@@ -555,10 +555,89 @@ def test_failed_document_is_marked_and_the_worker_continues(tmp_path):
         wait_until(lambda: {s.state for s in indexer.status()} == {"failed", "ready"})
         failed = state_of(indexer, bad.doc_id)
         assert failed.state == "failed"
-        assert failed.error.startswith("RuntimeError: SEC refused the request")
-        assert "\n" not in failed.error
+        assert failed.error == "RuntimeError"  # an unknown class: its name only, never its message
     finally:
         indexer.close()
+
+
+SENTINEL = "Jane Sentinel jane.sentinel@example.org"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "/home/someone/.cache/myopenfund-mcp/sec/0000789019/secret.htm not readable",
+        "GET https://user:p4ssw0rd@proxy.example.com/Archives failed",
+        "x" * 5000,
+        f"refused for {SENTINEL.upper()}",
+    ],
+)
+@pytest.mark.parametrize(
+    ("exc_type", "expected"),
+    [
+        (RuntimeError, "RuntimeError"),
+        ("UnsupportedDocument", "UnsupportedDocument: the primary document is not an HTML file"),
+        ("DocumentTooLarge", "DocumentTooLarge: the primary document is larger than the conversion limit"),
+        (
+            "PrimaryDocumentNotFound",
+            "PrimaryDocumentNotFound: the filing index lists no HTML document of the filing's form",
+        ),
+        ("SecUnavailable", "SecUnavailable: SEC stayed unreachable or throttled; fetch again later"),
+        (
+            "SecRefused",
+            "SecRefused: SEC refused the request as an undeclared automated tool (check MOF_SEC_CONTACT)",
+        ),
+        ("SecNotFound", "SecNotFound: SEC answered 404 for a file of the filing"),
+    ],
+)
+def test_document_error_text_is_fixed_and_bounded(tmp_path, message, exc_type, expected):
+    """I5: the recorded error is a fixed text per known class, else the class name: no path, no
+    credential URL, no long text, no contact (whatever its case)."""
+    from company_corpus.live import documents, sec
+
+    cls = exc_type if isinstance(exc_type, type) else getattr(documents, exc_type, None) or getattr(sec, exc_type)
+
+    def loader(filing, _sec):
+        raise cls(message)
+
+    indexer = make(tmp_path, loader=loader, sec_contact=SENTINEL)
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "failed")
+        error = state_of(indexer, DOC).error
+    finally:
+        indexer.close()
+    assert error == expected
+    assert len(error) <= 120
+    for leak in ("/home", "p4ssw0rd", "xxxxx", "SENTINEL", "sentinel"):
+        assert leak not in error
+
+
+def test_sec_http_error_keeps_its_status_only(tmp_path):
+    from company_corpus.live.sec import SecHttpError
+
+    def loader(filing, _sec):
+        raise SecHttpError(401, f"401 for https://{SENTINEL}@sec.gov/x")
+
+    indexer = make(tmp_path, loader=loader)
+    try:
+        indexer.enqueue([ref()])
+        wait_until(lambda: state_of(indexer, DOC).state == "failed")
+        assert state_of(indexer, DOC).error == "SecHttpError: SEC answered HTTP 401 for a file of the filing"
+    finally:
+        indexer.close()
+
+
+def test_public_error_masks_records_of_an_earlier_build():
+    from myopenfund_mcp.filings.indexer import public_error
+
+    assert public_error(None) is None
+    assert public_error("RuntimeError") == "RuntimeError"
+    assert public_error("SecUnavailable: SEC stayed unreachable or throttled; fetch again later") == (
+        "SecUnavailable: SEC stayed unreachable or throttled; fetch again later"
+    )
+    assert public_error("OSError: [Errno 13] /home/someone/x") == "OSError"
+    assert public_error("x" * 5000) == "error"
 
 
 def test_failed_error_never_holds_the_sec_contact(tmp_path):
