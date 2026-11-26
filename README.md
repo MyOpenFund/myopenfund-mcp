@@ -1,5 +1,10 @@
 # myopenfund-mcp
 
+Created and maintained by [Marc Jeulin](https://github.com/jeulinmarc), part of [MyOpenFund](https://github.com/MyOpenFund).
+
+<!-- mcp-name: io.github.myopenfund/myopenfund-mcp -->
+<!-- mcp-name: io.github.MyOpenFund/myopenfund-mcp -->
+
 One [MCP](https://modelcontextprotocol.io) server over the MyOpenFund bricks: official documents and
 pipeline health, cited passage search over the embedded corpus, and company data.
 
@@ -17,52 +22,51 @@ stops the server at start with a clear configuration error (it never runs silent
 - Two transports, same code: **stdio** for local use, **Streamable HTTP** (bearer tokens) in a Docker image.
 - Host-agnostic: the same image runs on a laptop, on a host on a private network or on a cloud VM;
   everything deployment-specific comes from `MOF_*` environment variables.
-- Deterministic: no tool needs a hosted LLM (see [Local models](#local-models)).
+- Deterministic: no tool needs a hosted LLM (see [Local models](https://github.com/MyOpenFund/myopenfund-mcp#local-models)).
 
 ## Contents
 
-- [Try it at home, without any infrastructure](#try-it-at-home-without-any-infrastructure)
-- [Quick start (stdio)](#quick-start-stdio)
-- [HTTP deployment](#http-deployment)
-- [Deploying the rag toolset](#deploying-the-rag-toolset)
-- [Tools](#tools)
-- [Errors](#errors)
-- [Tiers and tokens](#tiers-and-tokens)
-- [Configuration and limits](#configuration-and-limits)
-- [Local models](#local-models)
-- [Roadmap](#roadmap)
-- [Development](#development)
+- [Try it at home, without any infrastructure](https://github.com/MyOpenFund/myopenfund-mcp#try-it-at-home-without-any-infrastructure)
+- [Quick start (stdio)](https://github.com/MyOpenFund/myopenfund-mcp#quick-start-stdio)
+- [HTTP deployment](https://github.com/MyOpenFund/myopenfund-mcp#http-deployment)
+- [Deploying the rag toolset](https://github.com/MyOpenFund/myopenfund-mcp#deploying-the-rag-toolset)
+- [Tools](https://github.com/MyOpenFund/myopenfund-mcp#tools)
+- [Errors](https://github.com/MyOpenFund/myopenfund-mcp#errors)
+- [Tiers and tokens](https://github.com/MyOpenFund/myopenfund-mcp#tiers-and-tokens)
+- [Configuration and limits](https://github.com/MyOpenFund/myopenfund-mcp#configuration-and-limits)
+- [Local models](https://github.com/MyOpenFund/myopenfund-mcp#local-models)
+- [Roadmap](https://github.com/MyOpenFund/myopenfund-mcp#roadmap)
+- [Development](https://github.com/MyOpenFund/myopenfund-mcp#development)
 
 ## Try it at home, without any infrastructure
 
 No database, no store, no server to run: the company tools read the SEC's public EDGAR data directly,
 keep what they fetch in a cache folder on your machine, and search the filings with a small embedding
-model that runs locally. You need Python 3.12+ (through [uv](https://docs.astral.sh/uv/)), git, an MCP
+model that runs locally. You need Python 3.12+ (through [uv](https://docs.astral.sh/uv/)), an MCP
 client, and about 2 GB of free disk space and memory for the model.
 
-**1. Install and run.** The package will be published on PyPI as `myopenfund-mcp`; once the release is out,
-this is the whole install (the MCP client runs it for you, see step 2):
+**1. Install and run.** Straight from PyPI, nothing to clone (the MCP client runs it for you, see step 2):
 
 ```bash
 uvx --from "myopenfund-mcp[companies,filings]" myopenfund-mcp serve
 ```
 
-Until the release, install from git instead (same extras, same command):
+or install it in a virtual environment:
 
 ```bash
-uvx --from "myopenfund-mcp[companies,filings] @ git+https://github.com/MyOpenFund/myopenfund-mcp" myopenfund-mcp serve
+python -m venv .venv
+.venv/bin/pip install "myopenfund-mcp[companies,filings]"
 ```
 
 **2. Add it to your assistant and give your own SEC contact.** In an MCP client that reads an `mcpServers`
-block (Claude Desktop, Claude Code's `.mcp.json`, and most others), with the git form, which applies until the release
-(afterwards use `"myopenfund-mcp[companies,filings]"` alone):
+block (Claude Desktop, Claude Code's `.mcp.json`, and most others):
 
 ```json
 {
   "mcpServers": {
     "myopenfund": {
       "command": "uvx",
-      "args": ["--from", "myopenfund-mcp[companies,filings] @ git+https://github.com/MyOpenFund/myopenfund-mcp", "myopenfund-mcp", "serve"],
+      "args": ["--from", "myopenfund-mcp[companies,filings]", "myopenfund-mcp", "serve"],
       "env": { "MOF_SEC_CONTACT": "Your Name your.email@example.com" }
     }
   }
@@ -120,7 +124,7 @@ configured, as here, everything comes from SEC. `store` reads only the store, `s
 `MOF_SEC_CONTACT`). Every row of a company tool says its `source` (`store` or `sec_live`) and, when the choice
 needs explaining, a `reason` (for example `freshness_unchecked`: SEC could not be asked, so the store's
 answer is not checked for freshness). A store is optional: if you run one, point `MOF_COMPANIES_CATALOG` and
-`MOF_COMPANIES_DATA_ROOT` at it (see [Companies and datasets](#companies-and-datasets)).
+`MOF_COMPANIES_DATA_ROOT` at it (see [Companies and datasets](https://github.com/MyOpenFund/myopenfund-mcp#companies-and-datasets)).
 
 ### How long it takes
 
@@ -159,19 +163,18 @@ tools use. Use the same `MOF_SEC_CONTACT` and the same cache folder as your assi
 
 ```bash
 export MOF_SEC_CONTACT="Your Name your.email@example.com"
-# until the release, the git form; afterwards "myopenfund-mcp[companies,filings]" alone
-uvx --from "myopenfund-mcp[companies,filings] @ git+https://github.com/MyOpenFund/myopenfund-mcp" myopenfund-mcp warm \
+uvx --from "myopenfund-mcp[companies,filings]" myopenfund-mcp warm \
   --companies MSFT,AMZN,GOOGL,META --forms 10-K,10-Q --since 2022-01-01
 ```
 
 Progress goes to stderr; run it again to resume, documents already `ready` are not fetched again. Stop
 your assistant's MCP server first, as only one process can hold the index. More in
-[Warming the cache ahead of questions](#warming-the-cache-ahead-of-questions-warm).
+[Warming the cache ahead of questions](https://github.com/MyOpenFund/myopenfund-mcp#warming-the-cache-ahead-of-questions-warm).
 
 ### Small local models
 
 A small local model (for example one served by Ollama, through an MCP-capable client) can call these
-tools; see [Local models](#local-models). Ask one question at a time, name the companies and the period,
+tools; see [Local models](https://github.com/MyOpenFund/myopenfund-mcp#local-models). Ask one question at a time, name the companies and the period,
 and check the quoted passages and figures against the `url` link of each result's `source`, as reading
 long filings and combining numbers is where small models struggle most.
 
@@ -182,14 +185,53 @@ long filings and combining numbers is where small models struggle most.
 
 Prerequisites:
 
-- Python 3.12+ and git (the `[vault]` extra installs a pinned dependency from git);
+- Python 3.12+;
 - read access to the vault database as the read-only role `vault_readonly` (never a writing role).
 
+Run it straight from PyPI, nothing to clone:
+
 ```bash
-git clone https://github.com/MyOpenFund/myopenfund-mcp.git
-cd myopenfund-mcp
+uvx --from "myopenfund-mcp[vault]" myopenfund-mcp serve
+```
+
+or install it in a virtual environment:
+
+```bash
 python -m venv .venv
-.venv/bin/pip install ".[vault]"
+.venv/bin/pip install "myopenfund-mcp[vault]"
+```
+
+The extras pick the toolsets: `[vault]` (documents and pipeline health), `[companies]` (company data:
+`pip install "myopenfund-mcp[companies]"`), `[rag]` (passage search: `pip install "myopenfund-mcp[rag]"`)
+and `[filings]` (the filing-text tools over a local index, with `[companies]`:
+`pip install "myopenfund-mcp[companies,filings]"`), combinable (`"myopenfund-mcp[vault,companies,rag,filings]"`). The server is listed in the official MCP Registry as `io.github.MyOpenFund/myopenfund-mcp`. The PyPI distribution is `myopenfund-mcp`; the
+command (`myopenfund-mcp`), the import name (`myopenfund_mcp`) and the repository name are unchanged. The
+MyOpenFund packages it builds on (`myopenfund-vault-query`, `myopenfund-open-data-store`,
+`myopenfund-company-corpus`, `myopenfund-rag-engine`) are installed from PyPI by the extras.
+
+**Migration.** If this environment installed the packages under their former names (from a clone or a git
+URL), run `pip uninstall -y vault-query open-data-store company-corpus rag-engine` before installing
+`myopenfund-mcp`: the old and the new distributions own the same import packages.
+
+**Upgrading from 0.1.0.** 0.2.0 adds the no-vault mode (see
+[Try it at home](https://github.com/MyOpenFund/myopenfund-mcp#try-it-at-home-without-any-infrastructure)):
+
+- New extra `[filings]` (the filing-text tools, `myopenfund-rag-engine[local,graph]`); `[companies]` now
+  installs `myopenfund-company-corpus[live]` (live SEC reads), and `[rag]` and `[filings]` both need
+  `myopenfund-rag-engine` 0.2. Reinstall with the extras you use, e.g.
+  `pip install -U "myopenfund-mcp[vault,companies,rag,filings]"`.
+- `MOF_SEC_CONTACT` (your name and e-mail) mounts the company tools without a store and is needed for the
+  filing-text tools. A deployment with a store and no `MOF_SEC_CONTACT` keeps reading the store only; one
+  that sets it may also ask SEC, as `MOF_COMPANIES_SOURCE` (default `auto`) decides.
+- Reading SEC writes a cache folder, `MOF_CACHE_DIR` (default under your user cache directory; in a
+  container, point it at a writable volume), holding HTTP answers, the filings index and the 1.1 GB model.
+- Still installed under the pre-PyPI names (`vault-query`, `open-data-store`, `company-corpus`,
+  `rag-engine`)? Uninstall them first, as in the migration line above.
+
+To try the latest `main` before a release (the dependencies still come from PyPI):
+
+```bash
+pip install "myopenfund-mcp @ git+https://github.com/MyOpenFund/myopenfund-mcp"
 ```
 
 Register it with your MCP client. With Claude Code:
@@ -197,7 +239,7 @@ Register it with your MCP client. With Claude Code:
 ```bash
 claude mcp add myopenfund \
   -e MOF_VAULT_DATABASE_URL='postgresql://vault_readonly:<password>@<host>:5432/documents?sslmode=verify-full' \
-  -- /path/to/myopenfund-mcp/.venv/bin/myopenfund-mcp serve
+  -- /path/to/.venv/bin/myopenfund-mcp serve
 ```
 
 Any other client: run the command `myopenfund-mcp serve` (stdio is the default transport) with the same
@@ -213,8 +255,8 @@ environment. Over stdio there is no token: the local user owns the process and g
 `MOF_MCP_TOKENS`: the HTTP server never runs unauthenticated, and refuses to start without tokens.
 
 The server speaks plain HTTP. **Network exposure and TLS are the deployment's job**, never the public
-internet by default. The repository ships a generic [`Dockerfile`](Dockerfile),
-[`compose.example.yaml`](compose.example.yaml) and [`.env.example`](.env.example); nothing host-specific
+internet by default. The repository ships a generic [`Dockerfile`](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/Dockerfile),
+[`compose.example.yaml`](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/compose.example.yaml) and [`.env.example`](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/.env.example); nothing host-specific
 lives in it.
 
 ```bash
@@ -247,52 +289,47 @@ read-only root filesystem (writable `/tmp` only), no Linux capabilities and `no-
 Every rebuild of the image and every start of the `install` service installs the same Python packages,
 the ones the CI tested:
 
-- **Base image**: `PYTHON_IMAGE` in the [`Dockerfile`](Dockerfile), a tag **and** a digest
+- **Base image**: `PYTHON_IMAGE` in the [`Dockerfile`](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/Dockerfile), a tag **and** a digest
   (`python:3.13.<patch>-slim-<debian>@sha256:...`); the variant without a built image in
   `compose.example.yaml` uses the same value. The image's Python and pip come with it.
-- **PyPI runtime dependencies**: [`constraints.txt`](constraints.txt), the exact version of every
-  dependency of `[vault,companies,rag]` on that image (fastmcp and everything below it), passed with
+- **PyPI runtime dependencies**: [`constraints.txt`](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/constraints.txt), the exact version of every
+  dependency of `[vault,companies,rag,filings]` on that image (fastmcp and everything below it), passed with
   `-c`.
-- **Build backends**: this package and its git dependencies are built from source at every install, in
-  isolated build environments that `-c` does not reach; [`build-constraints.txt`](build-constraints.txt)
-  pins their backends (hatchling, setuptools and their dependencies, plus `editables`, which hatchling
-  needs for the CI's editable install), passed with `--build-constraint`. The file records the git pins it
-  was generated from: bumping one without regenerating fails the tests. That test compares the recorded
-  list only; the `locked` job also runs `scripts/check_constraints.py --build`, which reads every build
-  requirement (this package's, and each git dependency's at its pinned commit) and fails when one is not
-  pinned in the file at a version its specifier allows.
-- **Git dependencies** (`vault-query`, `open-data-store`, `company-corpus`, `myopenfund-rag-engine`): pinned by full
-  commit in `pyproject.toml`, as before.
+- **Build backend**: this package is built from source at every install of the image, in an isolated
+  build environment that `-c` does not reach; [`build-constraints.txt`](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/build-constraints.txt) pins its
+  backend (hatchling and its dependencies, plus `editables`, which hatchling needs for the CI's editable
+  install), passed with `--build-constraint`. The `locked` job runs `scripts/check_constraints.py --build`,
+  which fails when a build requirement is not pinned in the file at a version its specifier allows.
+- **The MyOpenFund packages** (`myopenfund-vault-query`, `myopenfund-open-data-store`,
+  `myopenfund-company-corpus`, `myopenfund-rag-engine`): ordinary PyPI dependencies, capped in
+  `pyproject.toml` below their next breaking release (`>=0.m.0,<0.(m+1)`, e.g.
+  `myopenfund-rag-engine>=0.2.0,<0.3`) and pinned to one exact version in
+  `constraints.txt`.
 
-The `install` service passes both files of the same commit as URLs (the same `<commit>` three times):
+The `install` service passes both files of the release's tag as URLs and pins the package itself (the constraints files of the release's tag `v<version>`):
 
 ```
-pip install -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/constraints.txt \
-  --build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/<commit>/build-constraints.txt \
-  'myopenfund-mcp[...] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'
+pip install -c https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/v<version>/constraints.txt \
+  --build-constraint https://raw.githubusercontent.com/MyOpenFund/myopenfund-mcp/v<version>/build-constraints.txt \
+  'myopenfund-mcp[...]==<version>'
 ```
 
-so the host also needs outbound HTTPS to `raw.githubusercontent.com` at each start, besides `github.com`
-and PyPI.
+so the host also needs outbound HTTPS to `raw.githubusercontent.com` at each start, besides PyPI.
 
-Not covered: the `git` package the build stage installs with apt (a build tool, absent at runtime), file
-hashes (pins are `==` versions, not `--require-hashes`, which pip refuses next to git requirements), and,
-outside Python, the DuckDB extensions the companies toolset downloads at start and the embedding model
-(pinned by its own revision, see [Deploying the rag toolset](#deploying-the-rag-toolset)).
+Not covered: file hashes (pins are `==` versions, not `--require-hashes`) and, outside Python, the DuckDB extensions the companies toolset downloads at start and the embedding model
+(pinned by its own revision, see [Deploying the rag toolset](https://github.com/MyOpenFund/myopenfund-mcp#deploying-the-rag-toolset)).
 
 The CI runs the tests twice: floating within the ranges of `pyproject.toml` (Python 3.12 and 3.13, so a
 coming break shows early) and locked (`locked` job: the image's Python, both constraint files, then
 `scripts/check_constraints.py`, which fails when a runtime dependency of the server is missing from
 `constraints.txt` or installed at another version, e.g. a new dependency brought by a release, and when an
-extra it is asked to check does not exist, then `scripts/check_constraints.py --build`, which reads the git
-dependencies' build requirements from `raw.githubusercontent.com`). A test checks that the job's Python is
+extra it is asked to check does not exist, then `scripts/check_constraints.py --build`, which checks the build backend's pins). A test checks that the job's Python is
 the patch of `PYTHON_IMAGE`.
 
 **Upgrading** is a deliberate change in a pull request: for the base image, look up the digest of the new
 tag (`docker buildx imagetools inspect python:<tag>`) and replace `PYTHON_IMAGE` in the Dockerfile and the
 image lines of `compose.example.yaml`; for the packages, run `python3.13 scripts/update_constraints.py` (on
-linux x86_64, the image's platform; it reads the git dependencies' build requirements from GitHub at their
-pinned commits) and commit both regenerated files. The `locked` job then tests the new set.
+linux x86_64, the image's platform) and commit both regenerated files. The `locked` job then tests the new set.
 
 A client connects with its token, e.g. with Claude Code:
 
@@ -387,8 +424,8 @@ into a volume at each start of the stack.
 2. **Payload indexes, once, from the data side.** The filters and the list of valid filter values use
    Qdrant's payload indexes. Whoever owns the collection creates them, once per collection, with a key
    that can write, from an environment where `rag-engine` is installed (the ingestion's own, or any venv
-   with `pip install "myopenfund-rag-engine @ git+https://github.com/MyOpenFund/rag-engine@ce5a745a9e0b4a6a96c6b21d79aa0b7b1e7cc0e7"`,
-   the commit this server is built on). Give the host AND the port: the engine's default port is 6333.
+   with `pip install "myopenfund-rag-engine>=0.2.0,<0.3"`,
+   the range this server is built on). Give the host AND the port: the engine's default port is 6333.
    The key is typed at a prompt here too:
 
    ```bash
@@ -404,15 +441,15 @@ into a volume at each start of the stack.
    read by one scroll of the collection, in the background (up to 100,000 points; beyond that, filter
    values are no longer checked).
 
-   At this commit the engine also creates the datetime indexes on `date_start` and `date_end` (payload
+   The engine (`myopenfund-rag-engine` 0.1) also creates the datetime indexes on `date_start` and `date_end` (payload
    schema version 2). Once they exist, `auto` mode applies date bounds to the intervals (within
    `MOF_RAG_DATE_FILTER_REFRESH_S` seconds, without a restart of the MCP). That is safe before the payloads
    carry their intervals (a point without one is still found by its `date`), but a month or a year
    document is found by its whole period only once the orchestrator's `sync-metadata` has written the
-   intervals; `sync-metadata` creates the two indexes itself (see [Dates](#dates-in-rag_search)).
+   intervals; `sync-metadata` creates the two indexes itself (see [Dates](https://github.com/MyOpenFund/myopenfund-mcp#dates-in-rag_search)).
 3. **The `[rag]` extra in the install line.** With the built image: `MOF_EXTRAS=vault,rag` as a build
-   argument (`compose.example.yaml`). Without a built image: `'myopenfund-mcp[vault,rag] @ git+https://github.com/MyOpenFund/myopenfund-mcp@<commit>'`
-   in the `install` service. From a checkout: `pip install ".[vault,rag]"`. No PyTorch is installed: queries
+   argument (`compose.example.yaml`). Without a built image: `'myopenfund-mcp[vault,rag]==<version>'`
+   in the `install` service. From PyPI: `pip install "myopenfund-mcp[vault,rag]"`. No PyTorch is installed: queries
    are embedded on the ONNX runtime, on CPU. Without the extra the server refuses to start as soon as
    `MOF_RAG_QDRANT_HOST` is set.
 4. **Fill the model cache, once.** The model is about 1.1 GB. It is pinned to one revision and every file
@@ -444,7 +481,7 @@ into a volume at each start of the stack.
    - `mem_limit: 3g` or more: the process peaks at about 2 GB at every start, while the model loads, and
      stays around 1.5 GB afterwards; with a CPU limit, also set `MOF_RAG_ONNX_THREADS` to it;
    - `ORT_DISABLE_TELEMETRY=1` and `HF_HUB_OFFLINE=1` in its environment (see
-     [Outbound connections](#outbound-connections-of-the-rag-toolset));
+     [Outbound connections](https://github.com/MyOpenFund/myopenfund-mcp#outbound-connections-of-the-rag-toolset));
    - a healthcheck start period of 60 s: the port opens once the model is loaded, 5 to 7 s from a warm
      disk on 4 cores, more than 30 s when the 1.1 GB file is read from a cold disk (the image's
      `HEALTHCHECK` has it);
@@ -456,8 +493,8 @@ into a volume at each start of the stack.
 6. **The variables**, in `.env`: `MOF_RAG_QDRANT_HOST` (the host alone: `qdrant:6333` is refused),
    `MOF_RAG_QDRANT_PORT`, `MOF_RAG_QDRANT_API_KEY` (the read-only key of step 1), `MOF_RAG_COLLECTION`,
    `MOF_RAG_MODEL_CACHE=/models`; `MOF_RAG_QDRANT_HTTPS=true` when Qdrant is behind TLS; optionally
-   `MOF_RAG_DESCRIPTION_NOTES` (see [Passage search](#passage-search-rag)). The others have defaults
-   ([Configuration and limits](#configuration-and-limits)); the date settings
+   `MOF_RAG_DESCRIPTION_NOTES` (see [Passage search](https://github.com/MyOpenFund/myopenfund-mcp#passage-search-rag)). The others have defaults
+   ([Configuration and limits](https://github.com/MyOpenFund/myopenfund-mcp#configuration-and-limits)); the date settings
    (`MOF_RAG_DATE_FILTER_MODE=auto`, `MOF_RAG_DATE_FILTER_REFRESH_S=300`, `MOF_RAG_DATE_FILTER_RETRY_S=30`) need
    no value of their own.
 7. **Restart and check.**
@@ -472,7 +509,7 @@ into a volume at each start of the stack.
      the cache is incomplete, unreadable or not the pinned model.
    - `server_info`: `toolsets.rag` is `enabled`, `rag.status` is `ready`, and `rag.source_codes` /
      `rag.doc_types` list the collection's codes. If `rag.status` is `unavailable`, `rag.reason` and the log
-     say why (see [Passage search](#passage-search-rag)).
+     say why (see [Passage search](https://github.com/MyOpenFund/myopenfund-mcp#passage-search-rag)).
    - `rag_search` with a short query and one valid code, e.g. `{"query": "inflation outlook",
      "source_codes": ["<a code of rag.source_codes>"]}`: passages come back.
    - `rag_search` with the same code in the wrong case: the answer is `[invalid_argument] source_codes:
@@ -483,11 +520,11 @@ into a volume at each start of the stack.
      (`null` until `sync-metadata` has run).
 8. **Never run this repository's integration tests against a production Qdrant.**
    `tests/integration/test_real_qdrant.py` creates and deletes collections: it is for a throwaway Qdrant
-   only (see [Development](#development)).
+   only (see [Development](https://github.com/MyOpenFund/myopenfund-mcp#development)).
 
-**Redeploying a new version** (such as the one that raised the rag-engine pin to `6be21ac` and added the date
+**Redeploying a new version** (such as the one that moved to `myopenfund-rag-engine` 0.1 and added the date
 settings): the same steps, from step 3. Rebuild the image, or point the `install` service at the new
-`<commit>`; restart; check as in step 7. No new volume, no new variable to set (the date settings have
+`<version>` (and the constraints URLs of its tag `v<version>`); restart; check as in step 7. No new volume, no new variable to set (the date settings have
 defaults), and the model cache is kept: the pinned model revision did not change. Step 2 is not needed
 again for the server: the indexes the new version uses are created by the orchestrator's `sync-metadata`,
 and until they exist date bounds behave as before.
@@ -545,7 +582,7 @@ must then be installed, or the server refuses to start (`MOF_VAULT_DATABASE_URL 
 extra is not installed`). Timestamps in results are UTC: the server's database session runs with
 `timezone=UTC`, whatever the database or role default.
 
-**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0, pinned at 0.6.0 `d3c4497`, which takes `until` on run reads and breaks search sort ties by `doc_id, corpus`: documents
+**Minimum vault schema.** This server needs a vault at or after `12ffd11` (vault-query 0.5.0; this server needs `myopenfund-vault-query` `>=0.1.0,<0.2`, the former 0.6.0, which takes `until` on run reads and breaks search sort ties by `doc_id, corpus`: documents
 keyed `(corpus, doc_id)`, columns `date_precision` / `date_kind` / `entity_scheme` / `entity_value`, table
 `vocabulary`; `runs_sources.bad_content`). Deploy the vault (and run its ingestion, which applies the
 schema) before this server. Against an older schema, a tool that reads a missing column or table answers
@@ -571,7 +608,7 @@ the client's model reads the passages and cites them. Read tier.
 | `source_codes` | JSON array of source codes, exact (case matters). The valid ones: `server_info`, `rag.source_codes`. |
 | `doc_types` | JSON array of document-type codes, exact. The valid ones: `server_info`, `rag.doc_types`. |
 | `languages` | JSON array of language codes as stored, e.g. `["en"]`. The valid ones: `server_info`, `rag.languages`. |
-| `date_from`, `date_to` | Date bounds, `YYYY-MM-DD`, both inclusive. A document known only to the month or the year matches any range overlapping its period (see [Dates](#dates-in-rag_search) for when). As soon as one bound is set, a document without a date is left out, unless `include_undated` is true. |
+| `date_from`, `date_to` | Date bounds, `YYYY-MM-DD`, both inclusive. A document known only to the month or the year matches any range overlapping its period (see [Dates](https://github.com/MyOpenFund/myopenfund-mcp#dates-in-rag_search) for when). As soon as one bound is set, a document without a date is left out, unless `include_undated` is true. |
 | `include_undated` | JSON boolean, default `false`. `true`: with a date bound, also keep the documents without a date (the dated ones outside the range stay out). Without a date bound it changes nothing and is accepted. A string (`"true"`) or a number is refused. |
 | `limit` | Number of passages; default `MOF_RAG_DEFAULT_LIMIT` (8), at most `MOF_RAG_MAX_LIMIT` (20). |
 
@@ -679,7 +716,7 @@ Example call and result (text shortened):
   **one request** to Qdrant, and a call makes several: the search, before it the read of the filter
   values when it is due, the collection check after a failure, and, for a call with a date bound in
   `auto` mode, the read of the collection's payload schema when it is due (see
-  [Dates](#dates-in-rag_search)).
+  [Dates](https://github.com/MyOpenFund/myopenfund-mcp#dates-in-rag_search)).
   - A request that fails (no answer in time, connection refused, key refused, collection gone, server
     error) ends its call with `[rag_unavailable]` and the reason: a call pays for one request timeout at
     most, never for two in a row (a failed read of the filter values is not followed by a search).
@@ -705,7 +742,7 @@ Example call and result (text shortened):
     vector size, every search is refused), that check says so with `collection_mismatch`. The usual cause is a
     collection in strict mode asked to filter on a field that has no payload index (a date bound without
     the datetime index on `date`): the filter cannot be served by the collection as it is indexed. Step 2
-    of [Deploying the rag toolset](#deploying-the-rag-toolset) creates the indexes.
+    of [Deploying the rag toolset](https://github.com/MyOpenFund/myopenfund-mcp#deploying-the-rag-toolset) creates the indexes.
   - At most `MOF_RAG_MAX_CONCURRENCY` searches (4) run at once, in threads of the toolset's own: the
     calls in excess wait without holding a thread, so the other toolsets and `server_info` keep
     answering whatever Qdrant does. A call whose budget ends answers `[rag_unavailable]`: `busy` if it
@@ -810,10 +847,8 @@ The `companies_*` tools exist when a company store is configured (`MOF_COMPANIES
 `MOF_COMPANIES_DATA_ROOT`) or SEC can be read (`MOF_SEC_CONTACT`, with `MOF_COMPANIES_SOURCE` not `store`);
 the `datasets_*` tools only with a store. The filing-text tools (`companies_fetch_filings`,
 `companies_search_filings`, `companies_read_filing`) need SEC and the `[filings]` extra. The `[companies]`
-extra must be installed
-(from a checkout, `pip install ".[vault,companies]"`, or from the git URL,
-`pip install "myopenfund-mcp[companies] @ git+https://github.com/MyOpenFund/myopenfund-mcp"`; the extra pins two
-git dependencies, so git must be available). The
+extra must be installed (from PyPI, `pip install "myopenfund-mcp[vault,companies]"`; the extra installs
+`myopenfund-open-data-store` and `myopenfund-company-corpus[live]`). The
 store is read-only (as the `lake_reader` role): nothing is ever written to it. Reading SEC writes to the
 local cache folder only (`MOF_CACHE_DIR`: HTTP answers, the filings index, the model). In a hardened container, DuckDB
 downloads and loads its `ducklake` and `postgres` extensions under `$HOME/.duckdb` at each start: `HOME` must be
@@ -821,7 +856,7 @@ writable, a tmpfs holding it must allow exec (`/tmp:exec`), and the container ne
 `extensions.duckdb.org`. The process must also be able to read the store's `lake/` files (open-data-store creates
 them `0700` for its own uid). Configuration:
 `MOF_COMPANIES_CATALOG`, `MOF_COMPANIES_DATA_ROOT`, `MOF_COMPANIES_QUERY_TIMEOUT_S`,
-`MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY`, `MOF_COMPANIES_Q4_RULE` (see [Configuration and limits](#configuration-and-limits)).
+`MOF_COMPANIES_MAX_COMPANIES`, `MOF_COMPANIES_MAX_CONCURRENCY`, `MOF_COMPANIES_Q4_RULE` (see [Configuration and limits](https://github.com/MyOpenFund/myopenfund-mcp#configuration-and-limits)).
 
 | Tool | What it does |
 |---|---|
@@ -875,7 +910,7 @@ branch on the code and show the message.
 | `invalid_argument` | A bad argument: `limit` outside `[1, MOF_MCP_MAX_ROWS]`, a cursor this server did not issue, `date_from` after `date_to`, a `doc_type` filter or grouping without `corpus` (the message lists each corpus's codes: ask the user which corpus, or infer it), a value the vault database refuses (a `since` offset beyond ±15:59, a NUL character in a text argument); for companies and datasets, `period_from` after `period_to`, a filter value of the wrong type for its column, `'all'` combined with other metrics; for `rag_search`, a blank query, a string where a JSON array is expected, an empty array, a date not written `YYYY-MM-DD`, an `include_undated` that is not a JSON `true` or `false`, a filter value the collection does not hold (the message lists the valid ones). | Fix the argument; pass `next_cursor` unchanged. |
 | `not_found` | No document with that `doc_id` (in that `corpus`, when one is given: omit `corpus` to look in every corpus). For `companies_read_filing`: no stored chunk with that `chunk_id`, or no such `section` in the document (the message lists its sections). | Find ids with `vault_search_documents`; for a filing, take `doc_id` and `chunk_id` from `companies_search_filings`. |
 | `timeout` | The vault query, the company store read or the SEC requests exceeded the call's time budget (`MOF_MCP_QUERY_TIMEOUT_S` / `MOF_COMPANIES_QUERY_TIMEOUT_S`, plus `MOF_SEC_CALL_BUDGET_S` when SEC is read). A `companies_fetch_filings` timeout says whether the documents may already be queued. | Narrow the filters; for SEC, call again (the cache keeps what was read). |
-| `schema_outdated` | The vault database lacks a column or table the pinned vault-query reads: the vault is older than this server (see Minimum vault schema under [Tools](#tools)). | Deploy the vault (and run its ingestion) first; check the deployment. |
+| `schema_outdated` | The vault database lacks a column or table the pinned vault-query reads: the vault is older than this server (see Minimum vault schema under [Tools](https://github.com/MyOpenFund/myopenfund-mcp#tools)). | Deploy the vault (and run its ingestion) first; check the deployment. |
 | `backend_unavailable` | The vault database or the company data store is unreachable (or refused the query); on a company read from SEC, an SEC answer that cannot be read (the message then names SEC, not the store); for the filings tools, an unexpected failure of the local index. | Retry later; check the deployment. |
 | `rag_unavailable` | `rag_search` cannot answer. The message starts with a reason: `qdrant_unreachable` (connection refused, or no answer within `MOF_RAG_QDRANT_TIMEOUT`; also the answer given at once while a failed collection check is remembered), `qdrant_auth` (API key refused), `qdrant_error` (another error from Qdrant), `collection_missing`, `collection_mismatch` (vector size or distance), `model_unavailable`, `model_integrity`, `search_refused` (Qdrant refused this one search, most often a filter on a field without a payload index: the other searches are served), `timeout` (the call's own budget, `MOF_RAG_CALL_TIMEOUT_S`, ended while its search was running), `busy` (it ended before one of the `MOF_RAG_MAX_CONCURRENCY` slots was free), `internal_error` (the search failed with an error the server does not expect; the log names its class). It never holds the host, the key, Qdrant's response or the engine's own error text. | Retry later for `qdrant_unreachable`, `qdrant_error`, `timeout` and `busy`; for `internal_error`, retry and report it if it lasts; for `search_refused`, retry with fewer filters (without the date bounds first); the others need the deployment fixed. |
 | `limit_exceeded` | `rag_search` was asked for more passages than `MOF_RAG_MAX_LIMIT`; `companies_search_filings` for more than `MOF_FILINGS_SEARCH_MAX_LIMIT`; `companies_fetch_filings` matched more filings than `MOF_FILINGS_MAX_DOCS`. | Ask for at most the maximum the message names; narrow `forms` or the period, or fetch fewer companies at once. |
@@ -900,7 +935,7 @@ Arguments that do not match a tool's input schema (wrong type, string too long, 
 id) are rejected by the MCP framework before a tool runs, without a `[code]`. An unexpected internal failure reaches the client as a generic error
 without details (they may hold connection strings); the server log has the rest. `rag_search` is the
 exception: every error of its search is answered with a coded `[rag_unavailable]` reason, so nothing of
-an exception reaches the framework (see Privacy in [Passage search](#passage-search-rag)). Over HTTP, a missing or
+an exception reaches the framework (see Privacy in [Passage search](https://github.com/MyOpenFund/myopenfund-mcp#passage-search-rag)). Over HTTP, a missing or
 unknown token is rejected with HTTP `401` before any tool runs.
 
 ## Tiers and tokens
@@ -945,7 +980,7 @@ for `MOF_WARM_STALL_S` it lists the stuck documents and exits 1. If the filings 
 
 ## Configuration and limits
 
-Environment variables only (a `.env` file in a deployment); see [`.env.example`](.env.example). An unset
+Environment variables only (a `.env` file in a deployment); see [`.env.example`](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/.env.example). An unset
 or empty variable takes its default; a bad value stops the server at start, naming the variable.
 
 | Variable | Default | Meaning |
@@ -984,8 +1019,8 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_RAG_MAX_LIMIT` | `20` | Largest `limit` a caller may ask `rag_search` for (1-1000); a larger one is refused with `[limit_exceeded]`. |
 | `MOF_RAG_CODES_TTL_S` | `300` | Seconds the collection's filter values (source codes, doc types, languages) are kept before being read again (1-86400). |
 | `MOF_RAG_CODES_RETRY_S` | `5` | Least seconds between two reads of the filter values that the TTL did not ask for: the read made before a value is refused, and the retry after a failed read (1-3600). |
-| `MOF_RAG_DESCRIPTION_NOTES` | unset | One line of text appended to the description of `rag_search`: what the collection holds, what its codes mean (at most 1500 characters). See [Passage search](#passage-search-rag) for a suggested value. |
-| `MOF_RAG_DATE_FILTER_MODE` | `auto` | How a date bound of `rag_search` is applied (rag-engine's `date_filter_mode`): `auto` (the intervals on a collection where `date_start` and `date_end` both have a datetime index, the `date` field elsewhere), `interval` (always the intervals; a collection in strict mode without the two indexes refuses it: `search_refused`) or `legacy` (always the `date` field). Lower case, exactly. See [Dates](#dates-in-rag_search). |
+| `MOF_RAG_DESCRIPTION_NOTES` | unset | One line of text appended to the description of `rag_search`: what the collection holds, what its codes mean (at most 1500 characters). See [Passage search](https://github.com/MyOpenFund/myopenfund-mcp#passage-search-rag) for a suggested value. |
+| `MOF_RAG_DATE_FILTER_MODE` | `auto` | How a date bound of `rag_search` is applied (rag-engine's `date_filter_mode`): `auto` (the intervals on a collection where `date_start` and `date_end` both have a datetime index, the `date` field elsewhere), `interval` (always the intervals; a collection in strict mode without the two indexes refuses it: `search_refused`) or `legacy` (always the `date` field). Lower case, exactly. See [Dates](https://github.com/MyOpenFund/myopenfund-mcp#dates-in-rag_search). |
 | `MOF_RAG_DATE_FILTER_REFRESH_S` | `300` | `auto` mode: seconds the collection's answer (are the two indexes there?) is kept before a date-bounded call reads it again (0-86400; `0` reads it before every date-bounded search). The longest the server takes to use the intervals once the indexes exist, without a restart. |
 | `MOF_RAG_DATE_FILTER_RETRY_S` | `30` | `auto` mode: seconds before a collection whose answer could not be read is read again (1-3600). Meanwhile date-bounded calls use the last answer read, or `legacy` when none was. Such a failure refuses no call and is not remembered as an outage. |
 | `MOF_COMPANIES_SOURCE` | `auto` | Where `companies_*` read each company: `auto` (per company, for the call's `as_of`: the store when it holds the company, SEC's latest report filing accepted by then and the statement positions of SEC's latest 10-K/10-Q/20-F/40-F accepted by then; else SEC; each row says `source` and, when relevant, `reason`; when SEC cannot be asked (no contact, or SEC down) store companies are served with `reason: freshness_unchecked`; without a store, SEC only and no `datasets_*` tools), `store` (needs `MOF_COMPANIES_CATALOG`) or `sec` (needs `MOF_SEC_CONTACT`). The companies toolset is mounted when a store or a contact is configured. Needs the `[companies]` extra, which now also installs `markitdown` and `magika` (document conversion for live filings). |
@@ -1014,7 +1049,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_FILINGS_NOT_READY_LISTED` | `10` | Not-yet-ready documents listed in a search result (`not_ready`, 0-1000); `not_ready_total` counts them all. |
 | `MOF_INDEX_WORKERS` | `1` | Embedding workers of the filings indexer: batches embedded in parallel, one per document (1-32). One more thread fetches and cuts the documents ahead of them. |
 | `MOF_INDEX_BATCH_SIZE` | `32` | Passages embedded and added to the index in one step (1-1024), the unit of the indexing order (rag-engine's ONNX batch size; about 8-12 s on 4 CPU cores). |
-| `MOF_INDEX_FIRST_BATCHES` | `1` | Batches of the MD&A (Item 7) of each company's newest queued document indexed in the first round, one company after the other, before any other work (0-100; 0 = no first round: document by document). See [How long it takes](#how-long-it-takes). |
+| `MOF_INDEX_FIRST_BATCHES` | `1` | Batches of the MD&A (Item 7) of each company's newest queued document indexed in the first round, one company after the other, before any other work (0-100; 0 = no first round: document by document). See [How long it takes](https://github.com/MyOpenFund/myopenfund-mcp#how-long-it-takes). |
 | `MOF_INDEX_FETCH_AHEAD` | `40` | Documents fetched and cut ahead of the embedding, at most (1-1000; a few MB of memory each). A company's newest queued document is fetched ahead whatever the count. Keep it at least `MOF_FILINGS_MAX_DOCS`: beyond the bound, documents cut later get their MD&A after the remainders of the documents already cut. |
 | `MOF_INDEX_CLOSE_TIMEOUT_S` | `30` | Seconds the server waits at shutdown for the indexing step in progress (a batch, a download, the model load), 0-3600; one batch takes about 8-12 s on 4 CPU cores. Past it the index is released; the document is resumed (`partial`) next time. |
 | `MOF_WARM_POLL_INTERVAL_S` | `5.0` | Seconds `myopenfund-mcp warm` waits between two looks at the SEC fetch (still warming) and at the indexing progress (above 0, at most 3600); `--poll-interval` overrides it. |
@@ -1071,6 +1106,22 @@ python -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
+**Working across repos**
+
+Clone the repos side by side and install a sibling editable over the PyPI version in this environment:
+`pip install -e ../vault/query` (or `../open-data-store`, `../company-corpus`, `../rag-engine`). A change here
+that needs an unreleased sibling version waits for that sibling's release before its PR merges.
+
+**How to release**
+
+Bump `__version__` in `src/myopenfund_mcp/__init__.py` in a PR (the version is read from there). Run `pip install -e .` again locally so the installed metadata follows. After the PR merges, go to Actions, then release, then Run workflow: pick the `main` branch and target `pypi`. Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `v<version>` and the GitHub Release itself.
+It fails before publishing if it is not run on the default branch or if that tag already exists. Target `testpypi` is a rehearsal: it publishes to TestPyPI and creates no tag and no release.
+Pushing a tag `v<version>` by hand still works: the workflow checks that the tag equals the package version and is on the default branch, then publishes and attaches the files to the Release.
+After the PyPI release the workflow also updates the MCP Registry listing (`server.json`, whose versions must equal `__version__`); to back-fill a version already on PyPI, go to Actions, then mcp-registry, then Run workflow on `main`.
+Publishing the same version to the registry twice may be rejected; bump the version for a new listing.
+If PyPI got the package but the tag or the Release is missing, re-run the failed `github-release` job from Actions; do not push the tag by hand (the re-run would fail at the PyPI upload).
+A Dependabot PR that raises a sibling's cap needs the range in `pyproject.toml` edited and the constraints regenerated (`python3.13 scripts/update_constraints.py`); never merge it as a single pin.
+
 The default test run needs no database, network or model. Opt-in suites (`integration`, `models`, `llm`)
 are excluded by default and run with an explicit marker:
 
@@ -1079,11 +1130,11 @@ are excluded by default and run with an explicit marker:
 - `pytest -m integration tests/integration/test_real_qdrant.py`: `rag_search` against a **throwaway** Qdrant (never a production one: the test creates and deletes collections), with `MOF_MCP_IT_QDRANT_URL` set (e.g. `http://127.0.0.1:6333`). The test creates, seeds (through rag-engine, with its model-free `FakeEmbedder`) and deletes collections named `mof-mcp-it-*`. Optional, for a Qdrant with keys: `MOF_MCP_IT_QDRANT_API_KEY` (can write) and `MOF_MCP_IT_QDRANT_READ_ONLY_API_KEY` (given to the server).
 - `pytest -m integration tests/integration/test_no_vault_real.py`: the companies tools against the real SEC (no store), with `MOF_SEC_CONTACT` set: quarterly capex and total debt of the scenario's five companies since 2022, and values checked by hand against their 10-K text. `pytest -m models` on the same file indexes real 10-Ks (downloads the embedding model once, before any timing, unless `MOF_MCP_IT_MODELS_DIR` points at a folder holding it): the first quotable passage of each company within `MOF_MCP_IT_FIRST_PASSAGE_S` (default 120 s) of `companies_fetch_filings`, each company fetched alone and the five fetched in one call, and a French question over the Microsoft FY2024 10-K finding its Item 7 (optional: `MOF_MCP_IT_CACHE_DIR`, `MOF_MCP_IT_INDEX_TIMEOUT_S`, default 1800; set `MOF_RAG_ONNX_PROVIDER=coreml` to measure a Mac's accelerator).
 - `pytest -m integration tests/integration/test_store_vs_live.py`: the same companies read from a real store and from SEC live, at the same `as_of`, with `MOF_MCP_IT_COMPANIES_CATALOG`, `MOF_MCP_IT_COMPANIES_DATA_ROOT` and `MOF_SEC_CONTACT` set: at least `MOF_MCP_IT_PARITY_MIN_SHARE` (default 0.99) of the rows equal, every difference printed (optional: `MOF_MCP_IT_PARITY_COMPANIES`, `MOF_MCP_IT_PARITY_AS_OF`, default 2025-06-30, `MOF_MCP_IT_PARITY_FROM`, default 2022-01-01, `MOF_MCP_IT_COMPANIES_TIMEOUT_S`, `MOF_MCP_IT_CACHE_DIR`).
-- `pytest -m llm`: scripted sessions with a local model, with `MOF_MCP_IT_OLLAMA_URL` set (optional: `MOF_MCP_IT_OLLAMA_MODEL`, default `qwen3:4b` for the scenario test; `MOF_MCP_IT_OLLAMA_TIMEOUT_S`, default 300 s per model answer, to raise on a slow CPU; see [Local models](#local-models)).
+- `pytest -m llm`: scripted sessions with a local model, with `MOF_MCP_IT_OLLAMA_URL` set (optional: `MOF_MCP_IT_OLLAMA_MODEL`, default `qwen3:4b` for the scenario test; `MOF_MCP_IT_OLLAMA_TIMEOUT_S`, default 300 s per model answer, to raise on a slow CPU; see [Local models](https://github.com/MyOpenFund/myopenfund-mcp#local-models)).
 
 Build the image with `docker build -t myopenfund-mcp .`; `docker run --rm myopenfund-mcp myopenfund-mcp
 --help` lists the commands.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/MyOpenFund/myopenfund-mcp/blob/main/LICENSE). Copyright (c) 2026 Marc Jeulin.

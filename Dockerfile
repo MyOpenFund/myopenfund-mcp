@@ -2,11 +2,8 @@
 # Pinned base image: tag AND digest, so a rebuild never picks up another Python or Debian silently.
 # Changing it is a deliberate bump (README, "Pinned versions"): same value in compose.example.yaml.
 ARG PYTHON_IMAGE=python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
-# Build stage: git is needed only to fetch the pinned git dependencies of the extras, never at runtime.
+# Build stage: a venv holding this package and the extras, copied to the final image.
 FROM ${PYTHON_IMAGE} AS build
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git \
- && rm -rf /var/lib/apt/lists/*
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 WORKDIR /src
@@ -14,8 +11,8 @@ COPY pyproject.toml README.md LICENSE constraints.txt build-constraints.txt ./
 COPY src ./src
 # Toolset extras installed in the image, comma-separated: vault (default), companies, rag.
 ARG MOF_EXTRAS=vault
-# -c constraints.txt: every PyPI runtime dependency at the exact version the CI tested; --build-constraint:
-# the build backends of this package and of the git dependencies, built from source (README, "Pinned versions").
+# -c constraints.txt: every PyPI runtime dependency (the MyOpenFund siblings included) at the exact version
+# the CI tested; --build-constraint: the build backend of this package, built from source (README, "Pinned versions").
 RUN pip install --no-cache-dir -c constraints.txt --build-constraint build-constraints.txt ".[${MOF_EXTRAS}]"
 
 FROM ${PYTHON_IMAGE}

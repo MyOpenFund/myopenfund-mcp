@@ -5,15 +5,12 @@
 
 
 Walks the installed requirement tree of myopenfund-mcp[extras] (markers evaluated for this interpreter)
-and fails when a PyPI dependency is not listed in constraints.txt or is installed at another version.
+and fails when a dependency is not listed in constraints.txt or is installed at another version.
 `pip install -c` already refuses a listed package at another version; what it cannot see is a NEW
-dependency (a release that adds one), which would float. Git dependencies are pinned by commit in
-pyproject.toml and only walked through. Dev tools (pytest, ruff) are not part of the tree and float.
+dependency (a release that adds one), which would float. Dev tools (pytest, ruff) are not part of the tree and float.
 
-`--build` checks build-constraints.txt instead: every `[build-system] requires` of this package and of
-each git dependency at its pinned commit (read from GitHub, as scripts/update_constraints.py does) must
-be pinned there, at a version its specifier allows. A git dependency bumped to a commit that wants
-another backend, or a newer one, fails here instead of floating in the isolated build environment.
+`--build` checks build-constraints.txt instead: every `[build-system] requires` of this package must be
+pinned there, at a version its specifier allows, so the isolated build environment never floats.
 """
 from __future__ import annotations
 
@@ -41,10 +38,6 @@ def read_constraints(path: Path) -> dict[str, str]:
             raise SystemExit(f"constraints.txt: not an exact pin: {line!r}")
         pins[canonicalize_name(name)] = version.strip()
     return pins
-
-
-def is_direct_url(dist: metadata.Distribution) -> bool:
-    return dist.read_text("direct_url.json") is not None
 
 
 def walk(root: str, extras: set[str], get=metadata.distribution) -> dict[str, metadata.Distribution]:
@@ -82,10 +75,11 @@ def walk(root: str, extras: set[str], get=metadata.distribution) -> dict[str, me
 
 
 def check(pins: dict[str, str], tree: dict[str, metadata.Distribution]) -> list[str]:
-    """One line per dependency of the tree missing from the pins or installed at another version."""
+    """One line per dependency of the tree missing from the pins or installed at another version. This
+    package itself is not pinned (it is the project, installed from the checkout)."""
     problems = []
     for name, dist in sorted(tree.items()):
-        if name == canonicalize_name(SELF) or is_direct_url(dist):
+        if name == canonicalize_name(SELF):
             continue
         if name not in pins:
             problems.append(f"{name} {dist.version}: not in constraints.txt")
