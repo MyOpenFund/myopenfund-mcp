@@ -19,9 +19,10 @@ gives each session's provider). When several sources the caller may read price o
 MOF_MARKET_PRECEDENCE wins (codes the caller may not read are dropped from it; readable ones it leaves out
 come after it, alphabetically); ``source`` reads one source only.
 
-A live source is sent tickers only: a ``mof:`` instrument id, a ``source:symbol`` string, a CIK, or a label
-the store holds for a source of MOF_MARKET_TOOL_ONLY_SOURCES (a private label or token) is refused with
-``[market_unknown_instrument]`` before any provider request.
+A live fetch never reads the store. An input only the store resolves by its form (a ``mof:`` instrument
+id, a ``source:symbol`` string, a CIK) is refused with ``[market_unknown_instrument]`` before any provider
+request; any other name goes to the provider as typed. A client not allowed the live source gets
+``[market_source_restricted]`` first, whatever the names (no answer depends on what the store holds).
 
 Every row carries ``source`` (store or live), ``reason`` when ``auto`` went live, and ``source_code`` (the
 provider of that price). Stored rows carry ``instrument_id`` only, never a label, a private_history token
@@ -103,7 +104,6 @@ _SOURCE_CODE = re.compile(r"[a-z][a-z0-9_]{0,62}")  # open-data-store's source-c
 _CIK = re.compile(r"[0-9]+")
 #: the adapters' own text when a retry would wait longer than ``max_wait_s`` (numbers only)
 _ADAPTER_WAIT = re.compile(r"asked to wait ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?) s, beyond max_wait_s")
-_IDENTIFIERS = "instrument_identifiers"  # open-data-store's market contract of the identifier mapping
 _LISTED = 20  # inputs quoted in a message
 TOOLSET = "the market toolset (market_prices)"  # what a registry error names
 ANNOTATIONS = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
@@ -170,33 +170,8 @@ def precedence_for(settings: Settings, allowed: frozenset[str], restricted: froz
     return (*listed, *sorted(readable - set(listed)))
 
 
-def _named_privately(s, labels: list[str], codes: tuple[str, ...]) -> set[str]:
-    """The ``labels`` an identifier of the sources ``codes`` holds (case aside, a CIK zero-padded), or a
-    ``source_symbol`` token of theirs: names that only the store may resolve, never sent to a live source.
-    Read on the open ``Store`` ``s``, never served."""
-    if not labels or not codes:
-        return set()
-    from open_data_store.reader.api import UnknownDataset
-
-    try:
-        if not s.is_published(_IDENTIFIERS):
-            return set()
-    except UnknownDataset:
-        return set()
-    table = s.read_asof(_IDENTIFIERS, filters={"source_code": sorted(codes)}, columns=["id_scheme", "id_value"])
-    held: set[str] = set()
-    for scheme, value in zip(table["id_scheme"].to_pylist(), table["id_value"].to_pylist(), strict=True):
-        if value is None:
-            continue
-        held.add(value.upper())
-        if scheme == "source_symbol":
-            held.add(value.partition(":")[2].upper())
-    return {label for label in labels
-            if label.upper() in held or (_CIK.fullmatch(label) and label.zfill(10) in held)}
-
-
-def _store_answers(store, labels, start, end, source, adjust, allowed, precedence, how, private) -> dict:
-    """One store call: ``{"table", "raw", "failed": {input: kind}, "private": set, "refusal"}``.
+def _store_answers(store, labels, start, end, source, adjust, allowed, precedence, how) -> dict:
+    """One store call: ``{"table", "raw", "failed": {input: kind}, "refusal"}``.
 
     All the inputs are read in one market-data call (one more, raw, for a total return: each session's
     provider). An error naming some inputs (unknown, no data from ``source``) sets them aside and the others
@@ -204,8 +179,7 @@ def _store_answers(store, labels, start, end, source, adjust, allowed, precedenc
     input or a conflict refuses the call (the caller's to fix, whatever the mode). In ``auto``, when fewer
     instruments come back than inputs remain (two inputs naming one instrument, or one without a row in the
     range), each remaining input is read alone to know which has no row: the server profile keys its rows
-    by instrument_id only. ``private``: tool-only source codes whose labels never go live
-    (`_named_privately`, for the inputs set aside in ``auto``)."""
+    by instrument_id only."""
 
     def go(s):
         kw = {"source": source, "profile": "server", "store": s, "allowed_restricted": allowed,
@@ -234,9 +208,7 @@ def _store_answers(store, labels, start, end, source, adjust, allowed, precedenc
                     one = api.prices([label], start, end, adjust="raw", **kw)
                     if not one.num_rows:
                         failed[label] = "no_data"
-        gone = [label for label in labels if label in failed]
-        return {"table": table, "raw": raw, "failed": failed, "refusal": None,
-                "private": _named_privately(s, gone, private) if how != STORE else set()}
+        return {"table": table, "raw": raw, "failed": failed, "refusal": None}
 
     return store.call(go)
 
@@ -435,23 +407,10 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
     ``adapter_factory``: tests only. Reads the source registry once (a ConfigError if it is broken)."""
     restricted = registered_restricted_sources(TOOLSET)
     registered = registered_sources(TOOLSET)
-    private = tuple(settings.market_tool_only_sources)
     factory = adapter_factory or _live_adapter
     slots = _LiveSlots(settings.market_live_concurrency)
     mk = FastMCP("market", mask_error_details=True)
     read = tier_check("read", auth_enabled=auth_enabled)
-
-    async def held_privately(labels: list[str]) -> set[str]:
-        """Live mode: which inputs the store holds for a tool-only source (they never go live). A store that
-        cannot answer refuses none: a live fetch never needs it (logged, the class only)."""
-        if store is None:
-            return set()
-        try:
-            return await _off_loop(partial(store.call, lambda s: _named_privately(s, labels, private)),
-                                   settings.companies_query_timeout_s)
-        except Exception as exc:  # noqa: BLE001 -- its text is never forwarded
-            log.warning("market: store check of live inputs failed (%s)", type(exc).__name__)
-            return set()
 
     @mk.tool(name="prices", auth=read, annotations=ANNOTATIONS)
     async def market_prices(
@@ -490,15 +449,14 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
 
         routes: dict[str, str | None] = {}  # input -> live reason (None: mode live); absent: the store
         rows: list[dict] = []
-        held: set[str] | None = None  # inputs the store holds for a tool-only source (None: not checked)
         if how == LIVE:
             routes = dict.fromkeys(labels)
         elif store is None:
-            routes, held = dict.fromkeys(labels, NO_STORE), set()
+            routes = dict.fromkeys(labels, NO_STORE)
         else:
             allowed = allowed_restricted_for(client, settings)
             order = None if source else precedence_for(settings, allowed, restricted, registered)
-            fn = partial(_store_answers, store, labels, first, last, source, adjust, allowed, order, how, private)
+            fn = partial(_store_answers, store, labels, first, last, source, adjust, allowed, order, how)
             try:
                 answers = await _off_loop(fn, settings.companies_query_timeout_s)
             except Exception as exc:  # noqa: BLE001 -- the store failed: its text is never forwarded
@@ -506,9 +464,8 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
                 if how == STORE:
                     raise (exc if _is_timeout(exc) else _store_refusal(STORE_UNAVAILABLE, labels, source)) from None
                 answers = {"table": None, "raw": None, "failed": dict.fromkeys(labels, "unavailable"),
-                           "refusal": None, "private": set()}
+                           "refusal": None}
             routes, rows = _route(answers, labels, how, source)
-            held = answers["private"]
 
         if routes:
             live_labels = list(routes)
@@ -518,6 +475,11 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
                     raise tool_error(INVALID_ARGUMENT, f"this server has no market store, and live fetches take "
                                                        f"source {' or '.join(api.LIVE_SOURCES)}")
                 raise _store_refusal(reason, [k for k, v in routes.items() if v == reason], source)
+            if live_code in restricted and live_code not in live_restricted_for(client, settings, restricted):
+                # first, whatever the names: no answer of a client not allowed live depends on them
+                raise tool_error(MARKET_SOURCE_RESTRICTED,
+                                 f"a live fetch from {live_code} uses this server's key: serving it is "
+                                 "redistribution, and this client is not allowed it (MOF_MARKET_RESTRICTED_ALLOW)")
             ciks = [label for label in live_labels if _CIK.fullmatch(label)]
             if ciks:
                 raise tool_error(MARKET_UNKNOWN_INSTRUMENT,
@@ -528,15 +490,6 @@ def build_market_toolset(store, settings: Settings, *, auth_enabled: bool,
                 raise tool_error(MARKET_UNKNOWN_INSTRUMENT,
                                  f"{_listed(only_store)}: an instrument id or a source:symbol names an instrument "
                                  "through the store only; live sources take tickers")
-            if held is None:
-                held = await held_privately(live_labels)
-            hidden = [label for label in live_labels if label in held]
-            if hidden:  # a private label or token: the store's answer, never a provider request
-                raise _store_refusal("unknown", hidden, source)
-            if live_code in restricted and live_code not in live_restricted_for(client, settings, restricted):
-                raise tool_error(MARKET_SOURCE_RESTRICTED,
-                                 f"a live fetch from {live_code} uses this server's key: serving it is "
-                                 "redistribution, and this client is not allowed it (MOF_MARKET_RESTRICTED_ALLOW)")
             budget = _Budget(settings.market_live_timeout_s,
                              default_max_wait_s=(tiingo if live_code == tiingo.SOURCE_CODE
                                                  else massive).DEFAULT_MAX_WAIT_S)

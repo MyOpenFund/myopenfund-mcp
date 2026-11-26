@@ -860,10 +860,10 @@ here.
 
 | Tool | What it does |
 |---|---|
-| `market_prices` | Daily prices of up to `MOF_MARKET_MAX_INSTRUMENTS` instruments from `start` to `end` (ISO dates, inclusive), `adjust` `raw` (close, volume, currency) or `total_return` (an index based 1.0 on the first session of the range with a price). `instruments`: tickers, live or from the store; FIGIs, CIKs and `mof:` instrument ids resolve through the store only (a live source takes tickers: it is never sent one of them, nor a `source:symbol`, and answers `[market_unknown_instrument]`). `source`: a provider code to read from (`tiingo`, `massive`, `private_history`, `manual`, ...); live fetches take `tiingo` (default) or `massive`. `mode`: `auto`, `store` or `live` (omitted = `MOF_MARKET_SOURCE`). |
+| `market_prices` | Daily prices of up to `MOF_MARKET_MAX_INSTRUMENTS` instruments from `start` to `end` (ISO dates, inclusive), `adjust` `raw` (close, volume, currency) or `total_return` (an index based 1.0 on the first session of the range with a price). `instruments`: tickers, live or from the store; FIGIs, CIKs and `mof:` instrument ids resolve through the store only (a live source takes tickers: a CIK, a `mof:` id or a `source:symbol` is never sent to it, `[market_unknown_instrument]`; a FIGI goes as typed and the provider answers). `source`: a provider code to read from (`tiingo`, `massive`, `private_history`, `manual`, ...); live fetches take `tiingo` (default) or `massive`. `mode`: `auto`, `store` or `live` (omitted = `MOF_MARKET_SOURCE`). |
 
 - **Where each input is read.** `store` reads the store only (the same store as the datasets tools,
-  `MOF_COMPANIES_CATALOG`), never a live source; `live` fetches only, never the store's prices; `auto` reads
+  `MOF_COMPANIES_CATALOG`), never a live source; `live` fetches only and never reads the store; `auto` reads
   the store when it holds the input over the range (at least one row this client may read), else fetches
   live, with a `reason`: `no_store`, `not_in_store`, `store_no_data`, `store_source_restricted` or
   `store_unavailable`. Every row carries `source` (`store` or `live`), `reason` when `auto` went live, and
@@ -876,9 +876,11 @@ here.
   after it, alphabetically. `source` reads one source only. Two series of one source that disagree on a
   session are `[invalid_argument]`: pass `source`.
 - **No labels in stored rows.** Stored rows carry `instrument_id` only: never a ticker, a provider symbol or
-  a private-history label. Live rows also carry `input` (your own words). A label or token the store holds
-  for a source of `MOF_MARKET_TOOL_ONLY_SOURCES` (your private history's) is never sent to a live source,
-  even when this client may not read it from the store: it is `[market_unknown_instrument]`.
+  a private-history label. Live rows also carry `input` (your own words). A live source is sent your inputs
+  as typed: do not type a private-history label or token in a live call (`auto` reads the store first, so a
+  name the store resolves for you stays there). Inputs that only the store resolves by their form (a `mof:`
+  id, a `source:symbol`, a CIK) are never sent: `[market_unknown_instrument]`. A client not allowed the live
+  source gets `[market_source_restricted]` first, whatever the inputs.
 - **Keys.** A live fetch reads the key from the server's environment (`TIINGO_API_KEY`, `MASSIVE_API_KEY`):
   over stdio it is your own process, so your own key. A key is never a tool argument and never echoed:
   `[market_key_missing]` names the variable to set.
@@ -948,7 +950,7 @@ branch on the code and show the message.
 | `too_many_instruments` | More instruments than `MOF_MARKET_MAX_INSTRUMENTS` in `market_prices`. | Split the request. |
 | `market_key_missing` | A live fetch has no key for its source in the server's environment, or the source refused it. The message names the variable (`TIINGO_API_KEY`, `MASSIVE_API_KEY`), never a value. | Set the variable (your own key) and restart. |
 | `market_source_restricted` | A restricted source this client may not read: from the store (`source=`), or live over HTTP (the deployment's key). | Omit `source`, or ask the operator (`MOF_MARKET_RESTRICTED_ALLOW`). |
-| `market_unknown_instrument` | Nothing this client may read names the input (store), the live source knows no such symbol, or an input only the store resolves (a FIGI the store does not hold for this client, a CIK, a `mof:` id, a `source:symbol`, a private label) was to go live. Inputs are listed as you wrote them. | Pass a ticker; check the symbol. |
+| `market_unknown_instrument` | Nothing this client may read names the input (store), the live source knows no such symbol, or an input only the store resolves by its form (a CIK, a `mof:` id, a `source:symbol`) was to go live. Inputs are listed as you wrote them. | Pass a ticker; check the symbol. |
 | `market_ambiguous_instrument` | An input names several instruments in the store. | Pass a FIGI or an instrument id. |
 | `market_busy` | `MOF_MARKET_LIVE_CONCURRENCY` live fetches are already running (an abandoned, timed-out one included until it ends). Answered at once, never queued. | Retry in a moment. |
 | `market_no_data` | No price in the range: from the `source=` asked for, or from the live source. | Widen the range or try another source. |

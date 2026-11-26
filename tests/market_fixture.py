@@ -12,7 +12,9 @@ Adversarial on purpose:
 - ``seed_market(overlap=True)`` adds a massive series of I1 overlapping tiingo's on the last three sessions,
   at other closes: two sources a client may both read, on one instrument (MOF_MARKET_PRECEDENCE decides);
 - ``seed_market(conflict=True)`` adds a second tiingo series of I1 (``tiingo:AAZ``) with another close on
-  the first session: two series of one source disagree, which no precedence resolves.
+  the first session: two series of one source disagree, which no precedence resolves;
+- ``seed_market(public_alias=True)``: the private history also names I2 by ``BBB``, a public ticker the fake
+  live source serves.
 """
 from __future__ import annotations
 
@@ -62,7 +64,8 @@ def _ident(instrument: str, scheme: str, value: str, source: str) -> dict:
 MASSIVE_CLOSES = (500.0, 501.0, 502.0)
 
 
-def seed_market(tmp_path, *, overlap: bool = False, conflict: bool = False) -> StoreConfig:
+def seed_market(tmp_path, *, overlap: bool = False, conflict: bool = False,
+                public_alias: bool = False) -> StoreConfig:
     cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
     for contract in MARKET_CONTRACTS:
         approve_contract(cfg, contract, "test")
@@ -91,6 +94,8 @@ def seed_market(tmp_path, *, overlap: bool = False, conflict: bool = False) -> S
         ids.append(_ident(I1, "source_symbol", "massive:AAA", "massive"))
     if conflict:
         ids.append(_ident(I1, "source_symbol", "tiingo:AAZ", "tiingo"))
+    if public_alias:
+        ids.append(_ident(I2, "ticker", "BBB", "private_history"))
     for contract, rows in ((PRICES, prices), (CORPORATE_ACTIONS, [dividend]), (INSTRUMENT_IDENTIFIERS, ids)):
         write_batch(contract, pa.Table.from_pylist(rows, schema=contract.schema), landing_root=cfg.landing,
                     run_id="t", producer="test")

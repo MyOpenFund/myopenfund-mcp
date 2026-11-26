@@ -484,18 +484,71 @@ async def test_live_refuses_store_only_names_before_any_request(label):
     assert requests == []
 
 
-@pytest.mark.parametrize("mode", ["auto", "live"])
-async def test_a_private_label_is_never_sent_to_a_live_source(market_store, mode):
+async def test_store_only_forms_are_refused_live_whatever_the_store(market_store):
     requests: list = []
     async with _client(store=market_store, requests=requests) as c:
-        with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\]") as err:
-            await _call(c, instruments=["AAA", PRIV_LABEL], mode=mode)
-        with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\]"):
-            await _call(c, instruments=[PRIV_TOKEN], mode=mode)  # the private token typed as is
-        ok = await _call(c, instruments=["AAA"], mode=mode)  # an open label still goes live
-    assert requests and all(PRIV_LABEL not in str(r.url) and PRIV_TOKEN not in str(r.url) for r in requests)
-    assert len(requests) == 1 and ok["returned"] == 5
-    assert PRIV_TOKEN not in str(err.value)
+        for label in (I2, f"private_history:{PRIV_TOKEN}", CIK1):
+            for mode in ("live", "auto"):
+                with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\]"):
+                    await _call(c, instruments=["BBB", label], mode=mode)
+    assert requests == []
+
+
+async def test_live_never_reads_the_store(market_store):
+    """Mode live sends any other name to the provider as typed: no store read decides it (Ruling 111)."""
+    requests: list = []
+    reads: list = []
+
+    def boom(fn):
+        reads.append(fn)
+        raise AssertionError("mode live read the store")
+
+    market_store.call = boom
+    async with _client(store=market_store, requests=requests) as c:
+        with pytest.raises(ToolError, match=r"^\[market_unknown_instrument\].*tiingo knows no such symbol"):
+            await _call(c, instruments=[PRIV_LABEL], mode="live")
+        out = await _call(c, instruments=["BBB"], mode="live")
+    assert out["returned"] == 5 and len(requests) == 2 and reads == []
+
+
+@pytest.mark.parametrize("mode", ["live", "auto"])
+async def test_a_client_not_allowed_live_gets_one_answer_whatever_the_name(tmp_path, mode):
+    """No oracle on the private history: the same error for a private label, a private token and a random
+    name, for a client allowed nothing and for the agents' client (Ruling 111)."""
+    cfg = seed_market(tmp_path)
+    store = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    port = free_port()
+    tokens = (f"plain:{hash_token(NOTEBOOK_TOKEN)}:read,agents:{hash_token(AGENTS_TOKEN)}:read")
+    server = build_server(Settings(transport="http", port=port, tokens=tokens), companies_store=store,
+                          market_adapter=_factory(requests := []))
+    try:
+        with serve(server, port) as url:
+            for token in (NOTEBOOK_TOKEN, AGENTS_TOKEN):
+                async with Client(url, auth=token) as c:
+                    answers = set()
+                    for name in (PRIV_LABEL, PRIV_LABEL.lower(), PRIV_TOKEN, "ZZZNOPE", "BBB"):
+                        with pytest.raises(ToolError) as err:
+                            await _call(c, instruments=[name], mode=mode)
+                        answers.add(str(err.value))
+                    assert len(answers) == 1, answers
+                    assert next(iter(answers)).startswith("[market_source_restricted]")
+    finally:
+        store.close()
+    assert requests == []
+
+
+@pytest.mark.parametrize("mode", ["live", "auto"])
+async def test_a_public_ticker_the_private_history_also_names_goes_live(tmp_path, mode):
+    cfg = seed_market(tmp_path, public_alias=True)
+    store = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    requests: list = []
+    try:
+        async with _client(store=store, requests=requests) as c:
+            out = await _call(c, instruments=["BBB"], mode=mode)
+    finally:
+        store.close()
+    assert len(requests) == 1 and out["returned"] == 5
+    assert {r["source"] for r in out["rows"]} == {"live"} and {r["input"] for r in out["rows"]} == {"BBB"}
 
 
 # --- live waits never outlast the call's budget -----------------------------------------------------
