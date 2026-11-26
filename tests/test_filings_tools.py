@@ -29,6 +29,7 @@ from myopenfund_mcp.filings.indexer import (
     SearchResult,
     SectionNotFound,
     StatusResult,
+    filing_doc_id,
     filing_title,
 )
 from myopenfund_mcp.server import build_server
@@ -72,7 +73,7 @@ APPLE_K24 = filing(APPLE, "0000320193-24-000123", filed=dt.date(2024, 11, 1), re
 
 def status(ref: FilingRef, state: str = "queued", done: int = 0, total: int | None = None) -> DocStatus:
     return DocStatus(
-        doc_id=ref.doc_id,
+        doc_id=filing_doc_id(ref),
         cik=ref.cik,
         form=ref.form,
         accession=ref.accession,
@@ -137,8 +138,8 @@ class FakeIndexer:
             self.companies[r.cik] = ((names or {}).get(r.cik), list((tickers or {}).get(r.cik) or []))
         out = EnqueueResult()
         for r in refs:
-            self.docs.setdefault(r.doc_id, status(r))
-            out.append(self.docs[r.doc_id])
+            self.docs.setdefault(filing_doc_id(r), status(r))
+            out.append(self.docs[filing_doc_id(r)])
         out.model_download = self.download
         return out
 
@@ -790,7 +791,7 @@ async def test_search_by_fetched_cik_name_or_ticker_works_with_sec_down():
     live = FakeLive(fail={"entities": SecUnavailable("down")})
     docs = [status(MSFT_K24, "ready", 5, 5), status(APPLE_K24, "ready", 3, 3)]
     companies = {MSFT: ("MICROSOFT CORP", ["MSFT"]), APPLE: ("Apple Inc.", ["AAPL"])}
-    for query in ("789019", MSFT, "msft", "microsoft"):
+    for query in ("789019", MSFT, "msft", "microsoft  corp"):
         indexer = FakeIndexer(docs, hits=[hit(MSFT_K24, 0), hit(APPLE_K24, 1)], companies=companies)
         res = await _call(
             indexer, "companies_search_filings", {"query": "capex", "companies": [query]}, live=live
@@ -808,13 +809,15 @@ async def test_search_by_fetched_cik_name_or_ticker_works_with_sec_down():
     )
     assert msg.startswith("[not_fetched]")
     # a name not fetched falls back to SEC, whose failure is coded
-    msg = await _error(
-        FakeIndexer(docs, companies=companies),
-        "companies_search_filings",
-        {"query": "capex", "companies": ["JPMORGAN"]},
-        live=live,
-    )
-    assert msg.startswith("[sec_unavailable]")
+    # a name not fetched, or a mere part of a fetched name, falls back to SEC, whose failure is coded
+    for query in ("JPMORGAN", "microsoft"):
+        msg = await _error(
+            FakeIndexer(docs, companies=companies),
+            "companies_search_filings",
+            {"query": "capex", "companies": [query]},
+            live=live,
+        )
+        assert msg.startswith("[sec_unavailable]"), query
 
 
 async def test_fetch_records_names_and_tickers_for_local_resolution():
@@ -831,11 +834,11 @@ async def test_fetch_records_names_and_tickers_for_local_resolution():
 
 async def test_ambiguous_among_fetched_companies():
     docs = [status(MSFT_K24, "ready", 5, 5), status(APPLE_K24, "ready", 3, 3)]
-    companies = {MSFT: ("MICROSOFT CORP", []), APPLE: ("APPLE CORP", [])}
+    companies = {MSFT: ("ACME CORP", []), APPLE: ("Acme  Corp", [])}  # two fetched with one exact name
     msg = await _error(
         FakeIndexer(docs, companies=companies),
         "companies_search_filings",
-        {"query": "capex", "companies": ["corp"]},
+        {"query": "capex", "companies": ["acme corp"]},
     )
     assert msg.startswith("[ambiguous_company]") and MSFT in msg and APPLE in msg
 

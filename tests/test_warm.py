@@ -312,3 +312,17 @@ def test_a_locked_index_says_to_stop_the_other_process(rig, capsys):
     assert cli.main(ARGS) == 1
     err = capsys.readouterr().err
     assert "another process holds the filings index" in err and SENTINEL not in err
+
+
+def test_refs_without_their_own_doc_id_are_waited_for_by_the_indexed_id(rig, capsys):
+    """warm waits on `filing_doc_id(ref)`, the id the indexer records, not `ref.doc_id` (None here)."""
+    import dataclasses
+
+    from myopenfund_mcp.filings.indexer import filing_doc_id
+
+    refs = [dataclasses.replace(r, doc_id=None) for r in (MSFT_K24, MSFT_K23)]
+    rig.live.refs = {MSFT: refs}
+    assert cli.main(ARGS) == 0
+    asked = [kw["doc_ids"] for m, kw in rig.indexer.calls if m == "status"]
+    assert asked and all(ids == [filing_doc_id(r) for r in refs] for ids in asked)
+    assert "[warm] 2/2 documents ready" in capsys.readouterr().err

@@ -7,8 +7,9 @@
 
 Two servers over the same tools: one in `store` mode, one in `sec` mode (live). For each company, the
 `companies_fundamentals` rows (concepts and every metric) as known at the same `as_of` are compared by
-(kind, key, period end, frequency, ttm). A difference is a row whose value differs or that one side
-only has; every difference is printed with both sides' tag and location. Criterion: at least
+(kind, key, period end, frequency, ttm), a key held by two rows of one side being an error. A
+difference is a row whose value, `original_tag` or `filing_ref` differs, or that one side only has;
+every difference is printed with both sides' tag, location and filing. Criterion: at least
 MOF_MCP_IT_PARITY_MIN_SHARE of the rows equal (default 0.99, the spec's parity threshold), every
 difference listed.
 
@@ -102,7 +103,23 @@ def _key(r: dict) -> tuple:
 def _side(r: dict | None) -> str:
     if r is None:
         return "absent"
-    return f"{r['value']} ({r.get('original_tag') or 'metric'}, {r.get('location') or '-'})"
+    return (f"{r['value']} ({r.get('original_tag') or 'metric'}, {r.get('location') or '-'}, "
+            f"{r.get('filing_ref') or '-'})")
+
+
+def _by_key(company: str, side: str, rows: list[dict]) -> dict[tuple, dict]:
+    """Rows by `_key`; a key seen twice would hide a row from the comparison: refused."""
+    out: dict[tuple, dict] = {}
+    for r in rows:
+        k = _key(r)
+        assert k not in out, f"{company} {side}: two rows for {k}: {_side(out[k])} and {_side(r)}"
+        out[k] = r
+    return out
+
+
+def _same(a: dict, b: dict) -> bool:
+    """Equal value, from the same tag and the same filing (a metric has neither: value only)."""
+    return all(a.get(f) == b.get(f) for f in ("value", "original_tag", "filing_ref"))
 
 
 async def test_store_and_live_agree(cache_dir):
@@ -114,11 +131,11 @@ async def test_store_and_live_agree(cache_dir):
             s_rows, l_rows = await _rows(store, company), await _rows(live, company)
             assert {r["source"] for r in s_rows} <= {"store"} and {r["source"] for r in l_rows} <= {"sec_live"}
             assert s_rows, f"{company}: the store has no row as of {AS_OF}"
-            s_by, l_by = {_key(r): r for r in s_rows}, {_key(r): r for r in l_rows}
+            s_by, l_by = _by_key(company, "store", s_rows), _by_key(company, "live", l_rows)
             n_eq = 0
             for k in sorted(set(s_by) | set(l_by)):
                 a, b = s_by.get(k), l_by.get(k)
-                if a is not None and b is not None and a["value"] == b["value"]:
+                if a is not None and b is not None and _same(a, b):
                     n_eq += 1
                 else:
                     differences.append(f"{company} {k}: store {_side(a)} | live {_side(b)}")

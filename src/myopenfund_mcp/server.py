@@ -76,7 +76,11 @@ def _close(owned: list) -> None:
 def build_server(settings: Settings, *, vault_reader=None, companies_store=None, companies_live=None,
                  rag_backend=None, filings_indexer=None) -> FastMCP:
     """``companies_store`` / ``companies_live`` / ``filings_indexer``: injected sources (tests); the server
-    closes only the ones it builds itself: at shutdown, or at once when a later step refuses to start."""
+    closes only the ones it builds itself: at shutdown, or at once when a later step refuses to start.
+
+    One lifespan per server object: the sources it builds are closed when its first lifespan ends (the
+    filings indexer then refuses calls), so run (or enter as a client) each returned server once, and
+    call ``build_server`` again for another run."""
     owned: list = []
     try:
         return _build_server(settings, owned, vault_reader=vault_reader, companies_store=companies_store,

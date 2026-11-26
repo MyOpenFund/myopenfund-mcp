@@ -199,10 +199,12 @@ class Warmer:
         """Enqueue every document (batches of MOF_FILINGS_MAX_DOCS; the indexer leaves a `ready` one
         alone, without any SEC call), then wait until each is `ready` or `failed`, or nothing moves for
         MOF_WARM_STALL_S; the statuses of all of them."""
+        from .filings.indexer import filing_doc_id
+
         indexer = self.stack.indexer
         names = {h["cik"]: h["current_name"] for h in hits}
         tickers = {h["cik"]: h.get("tickers") or [] for h in hits}
-        ids = [r.doc_id for r in refs]
+        ids = [filing_doc_id(r) for r in refs]
         step = self.settings.filings_max_docs
         already = 0
         for i in range(0, len(refs), step):

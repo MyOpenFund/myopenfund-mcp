@@ -24,7 +24,6 @@ from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from ..auth import tier_check
-from ..companies import resolve as res
 from ..companies.common import READ_ONLY, call_budget_s, store_call, time_budget
 from ..companies.router import SourceRouter
 from ..companies.tools import (
@@ -165,19 +164,20 @@ def _forms(forms: list[str] | None) -> list[str] | None:
     return wanted
 
 
-def _local_index(companies: list[dict]) -> dict[str, dict]:
-    """The fetched companies (`FilingsIndexer.fetched_companies`) in the resolver's index shape."""
-    return {
-        c["cik"]: {
-            "cik": c["cik"],
-            "entity_id": None,
-            "names": [{"name": c["name"], "since": None}] if c["name"] else [],
-            "current_name": c["name"],
-            "tickers": list(c["tickers"]),
-            "country": None,
-        }
+def _local_matches(companies: list[dict], query: str) -> list[dict]:
+    """The fetched companies (`FilingsIndexer.fetched_companies`) `query` names exactly: its CIK (with
+    or without leading zeros), one of its tickers, or its whole name (case and spacing aside). Never a
+    part of a name: a substring of a fetched company must not shadow another company not fetched yet,
+    which SEC's resolver then finds."""
+    q = " ".join(query.split()).casefold()
+    cik = q.lstrip("0") if q.isdigit() else None
+    return [
+        c
         for c in companies
-    }
+        if (cik is not None and c["cik"].lstrip("0") == cik)
+        or q in {t.casefold() for t in c["tickers"]}
+        or (c["name"] is not None and " ".join(c["name"].split()).casefold() == q)
+    ]
 
 
 def _check_companies(companies: list[str], settings: Settings) -> None:
@@ -252,21 +252,22 @@ def build_filings_toolset(
         return await lookup_companies(router, companies, call=call, unknown_hint=unknown_hint)
 
     async def scope_companies(companies: list[str]) -> dict[str, str | None]:
-        """CIK -> name of the requested companies, resolved first against the fetched companies (no SEC
-        request: a search of fetched documents works with SEC down); SEC's resolver only for the others.
+        """CIK -> name of the requested companies, resolved first against the fetched companies by CIK,
+        ticker or exact name (no SEC request: a search of fetched documents works with SEC down); SEC's
+        resolver only for the others.
         A CIK that was never fetched needs no resolver either (the scope is then empty)."""
-        local = _local_index(await run("fetched_companies"))
+        local = await run("fetched_companies")
         out: dict[str, str | None] = {}
         missing: list[str] = []
         for q in companies:
-            hits = res.resolve(local, q)
+            hits = _local_matches(local, q)
             if len(hits) > 1:
-                listed = ", ".join(f"{h['current_name']} (CIK {h['cik']})" for h in hits[:10])
+                listed = ", ".join(f"{h['name']} (CIK {h['cik']})" for h in hits[:10])
                 raise tool_error(
                     AMBIGUOUS_COMPANY, f"{q!r} matches {len(hits)} fetched companies: {listed}; pass a CIK"
                 )
             if hits:
-                out.setdefault(hits[0]["cik"], hits[0]["current_name"])
+                out.setdefault(hits[0]["cik"], hits[0]["name"])
             elif q.strip().isdigit():
                 out.setdefault(q.strip().lstrip("0").zfill(10), None)
             else:
