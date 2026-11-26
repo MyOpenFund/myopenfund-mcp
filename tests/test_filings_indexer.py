@@ -19,6 +19,7 @@ from rag_engine.local import LocalIndex
 from myopenfund_mcp.config import Settings
 from myopenfund_mcp.filings import indexer as indexer_module
 from myopenfund_mcp.filings.indexer import (
+    TEXT_FIX,
     DocumentNotFetched,
     FilingsIndexer,
     IndexUnavailable,
@@ -1280,4 +1281,12 @@ def test_enqueue_titles_chunks_with_the_period(tmp_path):
 def test_the_chunker_version_names_the_title_format():
     """The title is the chunk context (embedded and FTS-indexed): a new title format is a new
     collection, so a document indexed under the old titles is never served as ready."""
-    assert chunker_version(chunk_options(Settings())) == "v2-t480-o32-ttl2"
+    assert chunker_version(chunk_options(Settings())) == "v2-t480-o32-ttl2-fm1"
+
+
+def test_the_chunker_version_names_the_rag_engine_text_fix():
+    """rag-engine 0.2.1 keeps the text a cut used to lose (a section starting on a `---` page
+    break, a rule glued to text): an index built before it misses text, so its folder is not read
+    again and its documents are indexed anew."""
+    assert chunker_version(chunk_options(Settings())).endswith(f"-{TEXT_FIX}")
+    assert TEXT_FIX == "fm1"
