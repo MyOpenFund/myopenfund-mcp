@@ -126,3 +126,80 @@ def seed(tmp_path, *, filings: bool = False) -> StoreConfig:
     rep = publish_pending(cfg, now=NOW)
     assert rep.exit_code == 0, rep
     return cfg
+
+
+#: a year-to-date cash-flow filer (Alphabet-like), a capex-only year-to-date filer and semiannual reporters
+GOOGL, SEMI, SEMI9, CAPXO = "0001652044", "0000777777", "0000777778", "0000777779"
+CAPEX = "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment"
+GOOGL_Q1, GOOGL_Q2, GOOGL_Q3 = "0001652044-24-000053", "0001652044-24-000079", "0001652044-24-000118"
+GOOGL_10K, GOOGL_Q2_2025 = "0001652044-25-000014", "0001652044-25-000062"
+SEMI_H1, SEMI_FY = "0000777777-24-000010", "0000777777-25-000003"
+SEMI9_H1, SEMI9_N9, SEMI9_FY = "0000777778-24-000010", "0000777778-24-000020", "0000777778-25-000003"
+CAPXO_Q1, CAPXO_Q2, CAPXO_Q3, CAPXO_FY = ("0000777779-24-000010", "0000777779-24-000020",
+                                          "0000777779-24-000030", "0000777779-25-000003")
+
+
+def seed_ytd(tmp_path) -> StoreConfig:
+    """Alphabet's capex 2024 as filed (3M 12,012; 6M 25,198; 9M 38,259; FY 52,535, $M),
+    with its standalone quarterly revenue (Q1 and Q2 filed, so no revenue quarter is derived there)
+    and its 6-month revenue. Adversarial: the Q2 2025 10-Q re-reports the 6-month 2024 capex as a
+    comparative, so the selection keeps that later vintage (a derived Q2 2024's filing_ref is the
+    2025 10-Q while the period was first published by the Q2 2024 10-Q). SEMI files no quarters
+    (H1 and fiscal year only): its 6-month rows stay. Adversarial: SEMI9 files no quarters either but
+    also a 9-month year-to-date value and an H2 6-month row, so company-corpus derives its Q3 and Q4:
+    those derived quarters must not hide its 6-month rows. Adversarial: CAPXO files capex only (Q1,
+    6M, 9M, FY) and no other concept, so no filed quarter ends at its 6-month date: its derived Q2
+    (6M - Q1) proves the filed Q1 and must hide that 6-month row; its balance sheet at the 6-month
+    end is a quarter-end value, not a semiannual one."""
+    cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
+    for c in (ENTITY_OBSERVATIONS, FUNDAMENTALS, FILING_STATEMENTS):
+        approve_contract(cfg, c, "test")
+    land = cfg.landing
+    write_batch(ENTITY_OBSERVATIONS, pa.Table.from_pylist([
+        obs(GOOGL, "cik", GOOGL, "Alphabet Inc.", date(2015, 10, 2)),
+        obs(GOOGL, "ticker", "GOOGL", valid=date(2026, 11, 2)),
+        obs(SEMI, "cik", SEMI, "SEMIANNUAL REPORTER PLC", date(2015, 1, 1), country="GB"),
+        obs(SEMI9, "cik", SEMI9, "SEMIANNUAL NINE-MONTH REPORTER PLC", date(2015, 1, 1), country="GB"),
+        obs(CAPXO, "cik", CAPXO, "CAPEX ONLY FILER INC", date(2015, 1, 1)),
+    ], schema=ENTITY_OBSERVATIONS.schema), landing_root=land, run_id="r1", producer="test", now=NOW)
+    jan1 = date(2024, 1, 1)
+    q1, h1, n9, fy = date(2024, 3, 31), date(2024, 6, 30), date(2024, 9, 30), date(2024, 12, 31)
+    k_q1, k_q2, k_q3, k_fy = ("2024-04-25T20:00:00", "2024-07-23T20:00:00", "2024-10-29T20:00:00",
+                              "2025-02-04T21:00:00")
+    m = 1_000_000
+    rows = [
+        fact(GOOGL, CAPEX, q1, 12012 * m, start=jan1, freq="quarterly", accn=GOOGL_Q1, known=k_q1),
+        fact(GOOGL, CAPEX, h1, 25198 * m, start=jan1, freq="semiannual", accn=GOOGL_Q2, known=k_q2),
+        fact(GOOGL, CAPEX, h1, 25198 * m, start=jan1, freq="semiannual", accn=GOOGL_Q2_2025,
+             known="2025-07-23T20:00:00"),
+        fact(GOOGL, CAPEX, n9, 38259 * m, start=jan1, freq="ytd9", accn=GOOGL_Q3, known=k_q3),
+        fact(GOOGL, CAPEX, fy, 52535 * m, start=jan1, accn=GOOGL_10K, known=k_fy),
+        fact(GOOGL, REV, q1, 80539 * m, start=jan1, freq="quarterly", accn=GOOGL_Q1, known=k_q1),
+        fact(GOOGL, REV, h1, 84742 * m, start=date(2024, 4, 1), freq="quarterly", accn=GOOGL_Q2,
+             known=k_q2),
+        fact(GOOGL, REV, h1, 165281 * m, start=jan1, freq="semiannual", accn=GOOGL_Q2, known=k_q2),
+        fact(SEMI, REV, h1, 500 * m, start=jan1, freq="semiannual", accn=SEMI_H1,
+             known="2024-08-30T08:00:00"),
+        fact(SEMI, REV, fy, 1100 * m, start=jan1, accn=SEMI_FY, known="2025-03-20T08:00:00"),
+        fact(SEMI9, REV, h1, 500 * m, start=jan1, freq="semiannual", accn=SEMI9_H1,
+             known="2024-08-30T08:00:00"),
+        fact(SEMI9, REV, n9, 800 * m, start=jan1, freq="ytd9", accn=SEMI9_N9, known="2024-11-29T08:00:00"),
+        fact(SEMI9, REV, fy, 1100 * m, start=jan1, accn=SEMI9_FY, known="2025-03-20T08:00:00"),
+        fact(SEMI9, REV, fy, 600 * m, start=date(2024, 7, 1), freq="semiannual", accn=SEMI9_FY,
+             known="2025-03-20T08:00:00"),
+        fact(CAPXO, CAPEX, q1, 10 * m, start=jan1, freq="quarterly", accn=CAPXO_Q1, known=k_q1),
+        fact(CAPXO, CAPEX, h1, 25 * m, start=jan1, freq="semiannual", accn=CAPXO_Q2, known=k_q2),
+        fact(CAPXO, CAPEX, n9, 45 * m, start=jan1, freq="ytd9", accn=CAPXO_Q3, known=k_q3),
+        fact(CAPXO, CAPEX, fy, 70 * m, start=jan1, accn=CAPXO_FY, known=k_fy),
+        fact(CAPXO, "us-gaap:Assets", h1, 900 * m, freq="instant", accn=CAPXO_Q2, known=k_q2),
+    ]
+    write_batch(FUNDAMENTALS, pa.Table.from_pylist(rows, schema=FUNDAMENTALS.schema),
+                landing_root=land, run_id="r1", producer="test", now=NOW)
+    write_batch(FILING_STATEMENTS, pa.Table.from_pylist([
+        position(GOOGL, CAPEX.split(":")[1], "CF", accn=GOOGL_Q1, end=q1, known=k_q1),
+        position(GOOGL, REV.split(":")[1], "IS", accn=GOOGL_Q1, end=q1, known=k_q1),
+    ], schema=FILING_STATEMENTS.schema),
+                landing_root=land, run_id="r1", producer="test", now=NOW)
+    rep = publish_pending(cfg, now=NOW)
+    assert rep.exit_code == 0, rep
+    return cfg

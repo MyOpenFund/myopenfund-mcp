@@ -3,7 +3,25 @@ import time
 
 import anyio
 import pytest
-from companies_fixture import AAPL, AAPL_10K_2025, JPM, NWG, REV, seed
+from companies_fixture import (
+    AAPL,
+    AAPL_10K_2025,
+    CAPEX,
+    CAPXO,
+    GOOGL,
+    GOOGL_10K,
+    GOOGL_Q1,
+    GOOGL_Q2,
+    GOOGL_Q2_2025,
+    GOOGL_Q3,
+    JPM,
+    NWG,
+    REV,
+    SEMI,
+    SEMI9,
+    seed,
+    seed_ytd,
+)
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
@@ -140,10 +158,12 @@ async def test_fundamentals_concepts_and_metrics(store):
     assert rev["known_at"] == "2025-10-31T20:00:00+00:00"
     assert set(rev) == {"cik", "name", "period_end", "frequency", "kind", "key", "label", "value", "unit",
                         "original_tag", "filing_ref", "source_doc_id", "known_at", "location", "conflict",
-                        "source", "reason"}
+                        "derived", "period_published", "period_accession", "source", "reason"}
+    assert rev["derived"] is rev["period_published"] is rev["period_accession"] is None  # filed
     nm = next(r for r in res["rows"] if r["key"] == "net_margin")
     assert set(nm) == {"cik", "name", "period_end", "frequency", "kind", "key", "label", "value", "unit",
-                       "ttm", "sector_relevant", "source", "reason"}
+                       "ttm", "sector_relevant", "derived", "source", "reason"}
+    assert nm["derived"] is None
     # no contact: the store answers, its freshness unchecked (R27)
     assert (rev["source"], rev["reason"]) == (nm["source"], nm["reason"]) == ("store", "freshness_unchecked")
     assert nm["ttm"] is False and nm["unit"] == "%" and abs(nm["value"] - 23.97) < 0.01
@@ -1117,12 +1137,210 @@ async def test_filings_live_fallback_is_capped_at_now():
 
 
 async def test_fundamentals_tells_the_as_filed_quirks():
-    """C11: YTD cash-flow filers, Amazon's TTM annual rows, total_debt at face value."""
+    """Amazon's TTM annual rows, total_debt at face value; YTD cash-flow filers get
+    derived quarters, the filed year-to-date values stay in companies_facts."""
     from source_fakes import FakeLive
 
     async with _routed(None, FakeLive()) as c:
         tool = {t.name: t for t in await c.list_tools()}["companies_fundamentals"]
     freq = tool.inputSchema["properties"]["frequency"]
     text = str(freq) + tool.description
-    assert "year-to-date" in text and "Q1" in text and "ytd9" in text and "companies_facts" in text
+    assert "year-to-date" in text and "ytd9" in text and "companies_facts" in text
+    assert "Q1 only" not in text and "for Q1" not in text
+    assert "Q2 = 6M - Q1, Q3 = 9M - 6M, Q4 = FY - 9M" in tool.description
     assert "trailing" in tool.description and "face value" in tool.description
+    # `derived` is defined for concept and metric rows, and the provenance of a derived row
+    for words in ("from derived quarter values", "filing_ref", "period_accession", "period_published",
+                  "computed:"):
+        assert words in tool.description, words
+
+
+# --- derived quarters (a year-to-date filer, a semiannual reporter) ------------------------------
+
+@pytest.fixture
+def ytd_store(tmp_path):
+    cfg = seed_ytd(tmp_path)
+    s = CompaniesStore(str(cfg.data_root), cfg.catalog)
+    yield s
+    s.close()
+
+
+async def test_fundamentals_ytd_filer_quarter_by_quarter(ytd_store):
+    """Alphabet's capex 2024, quarter by quarter; Q2-Q4 derived from the filed YTD values."""
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"})
+    got = [(r["period_end"], r["frequency"], r["value"], r["derived"]) for r in res["rows"]]
+    m = 1_000_000
+    assert got == [("2024-12-31", "quarterly", 14276 * m, "FY - 9M"),
+                   ("2024-09-30", "quarterly", 13061 * m, "9M - 6M"),
+                   ("2024-06-30", "quarterly", 13186 * m, "6M - Q1"),
+                   ("2024-03-31", "quarterly", 12012 * m, None)]
+    by_end = {r["period_end"]: r for r in res["rows"]}
+    q1, q2, q3, q4 = (by_end[d] for d in ("2024-03-31", "2024-06-30", "2024-09-30", "2024-12-31"))
+    assert q1["location"] == "statement" and q1["original_tag"] == CAPEX and q1["filing_ref"] == GOOGL_Q1
+    assert q1["period_published"] is None and q1["period_accession"] is None  # filed: its own filing
+    for q in (q2, q3, q4):
+        assert q["location"] == "derived" and q["original_tag"] == "derived:" + CAPEX
+    # filing_ref = the latest filing used (the 6M's 2025 re-filing); period_accession = the filing
+    # that first published the period
+    assert (q2["filing_ref"], q2["period_accession"], q2["period_published"]) == (
+        GOOGL_Q2_2025, GOOGL_Q2, "2024-07-23")
+    assert (q3["filing_ref"], q3["period_accession"], q3["period_published"]) == (
+        GOOGL_Q2_2025, GOOGL_Q3, "2024-10-29")
+    assert (q4["filing_ref"], q4["period_accession"], q4["period_published"]) == (
+        GOOGL_10K, GOOGL_10K, "2025-02-04")
+    assert q2["known_at"] == "2025-07-23T20:00:00+00:00"
+
+
+async def test_fundamentals_derived_row_without_a_summary_has_no_period_provenance(ytd_store, monkeypatch):
+    monkeypatch.setattr(ytd_store, "summaries", lambda *a, **kw: [])
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"})
+    derived = [r for r in res["rows"] if r["derived"]]
+    assert len(derived) == 3
+    assert all(r["period_published"] is None and r["period_accession"] is None for r in derived)
+
+
+async def test_fundamentals_filed_quarter_wins_over_derivation(ytd_store):
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["revenue"], "frequency": "quarterly"})
+    assert [(r["period_end"], r["value"], r["derived"]) for r in res["rows"]] == [
+        ("2024-06-30", 84742 * 1_000_000, None), ("2024-03-31", 80539 * 1_000_000, None)]
+
+
+async def test_fundamentals_hides_six_month_inputs_of_quarterly_filers(ytd_store):
+    for args in ({"companies": [GOOGL]}, {"companies": [GOOGL], "metrics": "all"},
+                 {"companies": [GOOGL], "frequency": "semiannual", "metrics": "all"}):
+        res = await _call(ytd_store, "companies_fundamentals", args)
+        assert "semiannual" not in {r["frequency"] for r in res["rows"]}, args
+        assert "ytd9" not in {r["frequency"] for r in res["rows"]}, args
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [GOOGL], "frequency": "semiannual"})
+    assert res["rows"] == []
+
+
+async def test_fundamentals_derived_q2_hides_the_six_month_row(ytd_store):
+    """A derived Q2 (6M - Q1) proves a filed Q1 that fiscal year: the 6-month row it comes from is a
+    derivation input and leaves the output, even with no filed quarter ending at its date."""
+    m = 1_000_000
+    for args in ({"companies": [CAPXO]}, {"companies": [CAPXO], "metrics": "all"}):
+        res = await _call(ytd_store, "companies_fundamentals", args)
+        assert "semiannual" not in {r["frequency"] for r in res["rows"]}, args
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [CAPXO], "frequency": "semiannual"})
+    assert res["rows"] == []
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [CAPXO], "concepts": ["capex"], "frequency": "quarterly"})
+    assert [(r["period_end"], r["value"], r["derived"]) for r in res["rows"]] == [
+        ("2024-12-31", 25 * m, "FY - 9M"), ("2024-09-30", 20 * m, "9M - 6M"),
+        ("2024-06-30", 15 * m, "6M - Q1"), ("2024-03-31", 10 * m, None)]
+
+
+async def test_fundamentals_semiannual_of_a_quarterly_filer_brings_no_balance_sheet(ytd_store):
+    """frequency='semiannual' on a quarterly filer: its 6-month period ends are hidden, so the
+    balance-sheet values dated there come with the quarters, not with a semiannual period."""
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [CAPXO], "frequency": "semiannual"})
+    assert res["rows"] == []
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [CAPXO], "frequency": "quarterly"})
+    assert ("2024-06-30", "instant", "assets") in {
+        (r["period_end"], r["frequency"], r["key"]) for r in res["rows"]}
+
+
+async def test_fundamentals_keeps_semiannual_reporters(ytd_store):
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [SEMI]})
+    assert {(r["period_end"], r["frequency"], r["derived"]) for r in res["rows"]} == {
+        ("2024-12-31", "annual", None), ("2024-06-30", "semiannual", None)}
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [SEMI], "frequency": "semiannual"})
+    assert [(r["key"], r["value"]) for r in res["rows"]] == [("revenue", 500 * 1_000_000)]
+
+
+async def test_metric_from_derived_quarter_marked(ytd_store):
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "metrics": "all", "frequency": "quarterly"})
+    ci = {r["period_end"]: r for r in res["rows"] if r["key"] == "capex_intensity"}
+    # Q2: filed revenue, derived capex -> the metric rests on a derived quarter
+    assert ci["2024-06-30"]["derived"] == "from derived quarter values"
+    assert abs(ci["2024-06-30"]["value"] - 100 * 13186 / 84742) < 1e-9
+    assert ci["2024-03-31"]["derived"] is None  # filed inputs only
+    assert all(r["derived"] is None for r in res["rows"] if r["kind"] == "metric" and r["ttm"])
+
+
+async def test_companies_facts_unchanged(ytd_store):
+    res = await _call(ytd_store, "companies_facts", {"companies": [GOOGL]})
+    capex = sorted((r["frequency"], r["valid_date"]) for r in res["rows"] if r["original_tag"] == CAPEX)
+    assert capex == [("annual", "2024-12-31"), ("quarterly", "2024-03-31"), ("semiannual", "2024-06-30"),
+                     ("ytd9", "2024-09-30")]
+    assert all("derived" not in r for r in res["rows"])
+
+
+async def test_fundamentals_derived_quarters_do_not_hide_a_semiannual_reporters_rows(ytd_store):
+    """SEMI9 files no quarters; its 9-month value makes company-corpus derive Q3 and Q4, yet its H1
+    and H2 6-month rows stay (a derived Q3/Q4 hides no 6-month row)."""
+    m = 1_000_000
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [SEMI9]})
+    got = {(r["period_end"], r["frequency"], r["value"], r["derived"]) for r in res["rows"]}
+    assert ("2024-12-31", "semiannual", 600 * m, None) in got
+    assert ("2024-06-30", "semiannual", 500 * m, None) in got
+    assert ("2024-12-31", "annual", 1100 * m, None) in got
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [SEMI9], "frequency": "semiannual", "metrics": "all"})
+    assert {(r["period_end"], r["value"]) for r in res["rows"] if r["kind"] == "concept"} == {
+        ("2024-12-31", 600 * m), ("2024-06-30", 500 * m)}
+
+
+def _spy(monkeypatch, obj, name):
+    calls, real = [], getattr(obj, name)
+
+    def spy(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(obj, name, spy)
+    return calls
+
+
+async def test_fundamentals_summaries_only_when_needed(ytd_store, monkeypatch):
+    """Summaries only when a derived row is output (its period provenance) or metrics are asked;
+    metrics_from_derived only when metrics are asked."""
+    from company_corpus.concepts import quarters
+    summaries = _spy(monkeypatch, ytd_store, "summaries")
+    from_derived = _spy(monkeypatch, quarters, "metrics_from_derived")
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["capex"], "frequency": "annual"})
+    assert [r["frequency"] for r in res["rows"]] == ["annual"]
+    assert summaries == [] and from_derived == []
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["revenue"], "frequency": "quarterly"})
+    assert all(r["derived"] is None for r in res["rows"]) and summaries == []  # filed quarters only
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"})
+    assert len(summaries) == 1 and from_derived == []  # provenance of the derived rows
+    assert {r["period_accession"] for r in res["rows"] if r["derived"]} == {GOOGL_Q2, GOOGL_Q3, GOOGL_10K}
+    await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "frequency": "annual", "metrics": ["capex_intensity"]})
+    assert len(summaries) == 2 and from_derived
+
+
+async def test_fundamentals_derived_quarter_point_in_time(ytd_store):
+    """Point in time: the derived Q3 exists from the Q3 10-Q's filing (2024-10-29T20:00Z) on."""
+    args = {"companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"}
+    before = await _call(ytd_store, "companies_fundamentals", {**args, "as_of": "2024-10-29T19:59:59Z"})
+    assert [r["period_end"] for r in before["rows"]] == ["2024-06-30", "2024-03-31"]
+    after = await _call(ytd_store, "companies_fundamentals", {**args, "as_of": "2024-10-29T20:00:00Z"})
+    q3 = {r["period_end"]: r for r in after["rows"]}["2024-09-30"]
+    assert (q3["value"], q3["derived"], q3["period_accession"]) == (13061 * 1_000_000, "9M - 6M", GOOGL_Q3)
+    assert q3["filing_ref"] == GOOGL_Q3  # the 2025 re-filing of the 6M is not public yet
+
+
+async def test_fundamentals_pages_with_derived_rows_equal_the_full_page(ytd_store):
+    args = {"companies": [GOOGL], "metrics": "all"}
+    full = await _call(ytd_store, "companies_fundamentals", {**args, "limit": 200})
+    assert full["next_cursor"] is None and any(r["derived"] for r in full["rows"])
+    rows, cursor = [], None
+    while True:
+        res = await _call(ytd_store, "companies_fundamentals", {
+            **args, "limit": 3, **({"cursor": cursor} if cursor else {})})
+        rows += res["rows"]
+        assert res["total"] == full["total"]
+        cursor = res["next_cursor"]
+        if cursor is None:
+            break
+    assert rows == full["rows"]

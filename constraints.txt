@@ -70,7 +70,7 @@ mcp==2.3.0
 mcp-types==2.3.0
 mdurl==0.1.2
 mmh3==5.3.1
-myopenfund-company-corpus==0.2.0
+myopenfund-company-corpus==0.3.0
 myopenfund-open-data-store==0.1.0
 myopenfund-rag-engine==0.2.1
 myopenfund-vault-query==0.1.0

@@ -28,7 +28,7 @@ vault = ["myopenfund-vault-query>=0.1.0,<0.2"]
 companies = [
   "myopenfund-open-data-store[reader]>=0.1.0,<0.2",
   # [live]: live SEC fetching (no-vault mode), new in company-corpus 0.2.0.
-  "myopenfund-company-corpus[live]>=0.2.0,<0.3",
+  "myopenfund-company-corpus[live]>=0.3.0,<0.4",
 ]
 # [onnx]: queries are embedded on the ONNX runtime (CPU), without PyTorch.
 # Same range as [filings]: the two extras resolve one myopenfund-rag-engine release.

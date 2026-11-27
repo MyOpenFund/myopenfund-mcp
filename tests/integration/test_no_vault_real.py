@@ -170,17 +170,23 @@ async def test_quarterly_capex_and_total_debt_since_2022(cache_dir):
         for ticker in TICKERS:
             rows = await _fundamentals(c, {"companies": [ticker], "concepts": ["capex"], "metrics": ["total_debt"],
                                            "frequency": "quarterly", "period_from": SINCE})
-            capex = {str(r["period_end"])[:10]: r["value"] for r in rows if r["key"] == "capex"}
+            capex = {str(r["period_end"])[:10]: r for r in rows if r["key"] == "capex"}
             debt = {str(r["period_end"])[:10]: r["value"] for r in rows if r["key"] == "total_debt"}
             print(f"{ticker}: {len(capex)} quarters of capex, {len(debt)} of total debt")
             assert {r["source"] for r in rows} == {"sec_live"}
-            # as filed: a cash-flow item has a quarterly row only where the filing has a three-month column
-            # (Microsoft and Amazon: Q1-Q3; Alphabet, Meta, Oracle: Q1 only, then 6- and 9-month YTD), so at
-            # least one per fiscal year 2022-2024; total debt (balance sheet) at the first three quarter ends of
-            # a fiscal year at least, the fiscal year end often being under `annual` only (Meta: from Q3 2022)
-            assert sum(day < "2025-01-01" for day in capex) >= 3, (ticker, sorted(capex))
+            # A cash-flow item is filed as a three-month column for some quarters only (Microsoft and
+            # Amazon: Q1-Q3, so Q4 = FY - 9M; Alphabet, Meta, Oracle: Q1, then 6- and 9-month YTD). The
+            # other quarters are derived from the year-to-date values, so 2022-2024 has (nearly) every
+            # quarter. Total debt (balance sheet): at the first three quarter ends of a fiscal year at
+            # least, the fiscal year end often being under `annual` only (Meta: from Q3 2022).
+            early = {day: r for day, r in capex.items() if day < "2025-01-01"}
+            formulas = {r["derived"] for r in early.values()}
+            if ticker in ("GOOGL", "META", "ORCL"):
+                assert len(early) >= 11 and formulas - {None}, (ticker, sorted(early))
+            else:
+                assert "FY - 9M" in formulas, (ticker, sorted(early), formulas)
             assert sum(day < "2025-01-01" for day in debt) >= 8, (ticker, sorted(debt))
-            assert all(v > 0 for v in capex.values()) and all(v > 0 for v in debt.values())
+            assert all(r["value"] > 0 for r in capex.values()) and all(v > 0 for v in debt.values())
 
 
 @pytest.mark.integration
