@@ -913,12 +913,16 @@ them `0700` for its own uid). Configuration:
     10-Q for Q2/Q3, the 10-K for Q4); null on filed rows and when unknown.
 
   The filed 6-month year-to-date rows of a company that files quarters are derivation inputs: they are
-  hidden at the period ends where it filed a quarter, and `companies_facts` still shows them. A company that
-  files no quarters (a semiannual reporter) keeps its 6-month rows. The quarterly TTM gains the derived
+  hidden at the period ends where it filed a quarter or where a derived Q2 (`6M - Q1`, which needs a filed
+  Q1) ends, and `companies_facts` still shows them. A company that files no quarters (a semiannual reporter)
+  keeps its 6-month rows. A semiannual reporter that also files a 9-month value gets derived Q3 and Q4
+  (`9M - 6M`, `FY - 9M`; its H1 and H2 rows stay): their values are right, but `period_published` and
+  `period_accession` are null on them and no quarterly metric is computed from them. The quarterly TTM gains the derived
   quarters too: by default (`MOF_COMPANIES_Q4_RULE=ytd9`) a fourth quarter the company did not report on its
   own is FY minus the 9-month year-to-date, the rule of company-corpus's published outputs; a TTM window
   needing a value the company did not file is absent (no row), never computed another way.
-  `sum_of_quarters` instead takes FY minus Q1, Q2 and Q3 whenever those three quarters are filed.
+  `sum_of_quarters` instead takes FY minus Q1, Q2 and Q3 whenever those three quarters exist, filed or
+  derived.
 - **`frequency`.** In `companies_fundamentals`, `annual`, `quarterly` and `semiannual` also return the
   balance-sheet values (frequency `instant`) dated at the ends of the included periods, as the ratios use
   them; `instant` alone returns balance-sheet values only. In `companies_facts`, `frequency` filters the
@@ -1040,7 +1044,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_COMPANIES_QUERY_TIMEOUT_S` | `20` | Seconds one companies tool call may spend on all its store reads before it answers `[timeout]` (1-3600). |
 | `MOF_COMPANIES_MAX_COMPANIES` | `10` | Most companies a single call may name (1-100). |
 | `MOF_COMPANIES_MAX_CONCURRENCY` | `2` | Store reads running at once (1-16); a read abandoned at its time budget keeps its slot until it ends, so the next callers may also get `[timeout]` for a while. |
-| `MOF_COMPANIES_Q4_RULE` | `ytd9` | How TTM derives a fourth quarter the company did not report on its own: `ytd9` = FY minus the 9-month year-to-date (the rule of company-corpus's published outputs; a TTM needing a 9-month value the store lacks is absent), `sum_of_quarters` = FY minus Q1, Q2 and Q3 (present whenever those three quarters are, some differ from company-corpus's). |
+| `MOF_COMPANIES_Q4_RULE` | `ytd9` | How TTM derives a fourth quarter the company did not report on its own: `ytd9` = FY minus the 9-month year-to-date (the rule of company-corpus's published outputs; a TTM needing a 9-month value the store lacks is absent), `sum_of_quarters` = FY minus Q1, Q2 and Q3 (present whenever those three quarters are, filed or derived; some differ from company-corpus's). |
 | `MOF_RAG_QDRANT_HOST` | unset | Qdrant host name or address, alone: a scheme, a path or a port (`qdrant:6333`) is refused at start, the port being `MOF_RAG_QDRANT_PORT`. An IPv6 address is given bare or in brackets. Unset = no rag toolset. Needs `MOF_RAG_COLLECTION` and `MOF_RAG_MODEL_CACHE` too. |
 | `MOF_RAG_QDRANT_PORT` | `6333` | Qdrant HTTP port (1-65535). |
 | `MOF_RAG_QDRANT_API_KEY` | unset | Qdrant API key; a **read-only** key is enough and recommended. Never logged, shown or put in an error. |
@@ -1068,7 +1072,7 @@ or empty variable takes its default; a bad value stops the server at start, nami
 | `MOF_SEC_CALL_BUDGET_S` | `50` | Time budget of one tool call that fetches from SEC, in seconds (1-3600). Past it the call answers that the company is still being fetched; the fetch goes on and a later call gets the result. |
 | `MOF_SEC_POSITIONS_LOOKBACK_Y` | `5` | Years before now (before `period_to` when given) whose facts get their filings' statement positions fetched (three requests per filing) when a call names no period start (1-50); a call with `period_from` starts there instead. Either start is then moved back by `MOF_SEC_TTM_LOOKBACK_M` months. |
 | `MOF_SEC_POSITIONS_DONOR_DEPTH` | `4` | Earlier report filings (10-K, 10-Q, 20-F, 40-F) looked through, newest first, for the statement positions a filing without its own borrows, as the store's concept selection does (0-40; three requests each). A filing whose donor lies deeper does not read the store's donor: its location reads `unknown` where the store reads `inferred`, or it borrows from an older filing the call reads anyway. |
-| `MOF_SEC_TTM_LOOKBACK_M` | `20` | Months before the period's start (`period_from`, or the start `MOF_SEC_POSITIONS_LOOKBACK_Y` gives a call without one) whose facts' filings also get their statement positions, so the TTM, derived fourth quarters and prior-year averages of the period's ratios are the store's (0-120). A quarterly TTM spans four quarter ends up to 300 days back; its earliest quarter, when derived, reads a 9-month YTD up to 100 days earlier (`ytd9`: under 400 days, 14 months) or three quarters up to 300 days earlier (`sum_of_quarters`: under 600 days, 20 months); the prior-year averages read up to 385 days back. The default covers both Q4 rules; below 14 (or 20 with `sum_of_quarters`) a ratio may differ from the store's. |
+| `MOF_SEC_TTM_LOOKBACK_M` | `20` | Months before the period's start (`period_from`, or the start `MOF_SEC_POSITIONS_LOOKBACK_Y` gives a call without one) whose facts' filings also get their statement positions, so the TTM, derived fourth quarters and prior-year averages of the period's ratios are the store's (0-120). A quarterly TTM spans four quarter ends up to 300 days back; its earliest quarter, when derived, reads a 9-month YTD up to 100 days earlier (`ytd9`: under 400 days, 14 months) or three quarters up to 300 days earlier (`sum_of_quarters`: under 600 days, 20 months); the prior-year averages read up to 385 days back. The default covers both Q4 rules; below 14 (or 20 with `sum_of_quarters`) a ratio may differ from the store's. At `0`, a call with `period_from` may lack the first derived quarters of its range (their earlier year-to-date input lies before the window); the default covers them. |
 | `MOF_SEC_MEMO_COMPANIES` | `50` | Companies whose live tables (computed from SEC) are kept in memory for `MOF_CACHE_TTL_COMPANYFACTS_H`; past it the oldest built is dropped (1-10000). |
 | `MOF_SEC_FAILURE_TTL_S` | `60` | Seconds a failed fetch of a company from SEC (SEC unreachable, refused, unreadable answer) is remembered: calls meanwhile get its error at once, even when it came after their time budget, instead of fetching again (1-3600). |
 | `MOF_SEC_FRESHNESS_BUDGET_S` | `5` | `MOF_COMPANIES_SOURCE=auto` with a store: seconds a call gives the check of the store against SEC's filing list (one cached request per company, at most `MOF_COMPANIES_MAX_CONCURRENCY` at once). A company not checked by then is answered by the store with `reason: freshness_unchecked`, as are all of them for `MOF_SEC_FAILURE_TTL_S` after SEC failed during a check (1-600). |
