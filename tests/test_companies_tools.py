@@ -17,6 +17,7 @@ from companies_fixture import (
     NWG,
     REV,
     SEMI,
+    SEMI9,
     seed,
     seed_ytd,
 )
@@ -1241,3 +1242,78 @@ async def test_companies_facts_unchanged(ytd_store):
     assert capex == [("annual", "2024-12-31"), ("quarterly", "2024-03-31"), ("semiannual", "2024-06-30"),
                      ("ytd9", "2024-09-30")]
     assert all("derived" not in r for r in res["rows"])
+
+
+async def test_fundamentals_derived_quarters_do_not_hide_a_semiannual_reporters_rows(ytd_store):
+    """Spec rule 6: SEMI9 files no quarters; its 9-month value makes company-corpus derive Q3 and
+    Q4, yet its H1 and H2 6-month rows stay (only a FILED quarter hides a 6-month row)."""
+    m = 1_000_000
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [SEMI9]})
+    got = {(r["period_end"], r["frequency"], r["value"], r["derived"]) for r in res["rows"]}
+    assert ("2024-12-31", "semiannual", 600 * m, None) in got
+    assert ("2024-06-30", "semiannual", 500 * m, None) in got
+    assert ("2024-12-31", "annual", 1100 * m, None) in got
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [SEMI9], "frequency": "semiannual", "metrics": "all"})
+    assert {(r["period_end"], r["value"]) for r in res["rows"] if r["kind"] == "concept"} == {
+        ("2024-12-31", 600 * m), ("2024-06-30", 500 * m)}
+
+
+def _spy(monkeypatch, obj, name):
+    calls, real = [], getattr(obj, name)
+
+    def spy(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(obj, name, spy)
+    return calls
+
+
+async def test_fundamentals_summaries_only_when_needed(ytd_store, monkeypatch):
+    """Summaries only when a derived row is output (its period provenance) or metrics are asked;
+    metrics_from_derived only when metrics are asked."""
+    from company_corpus.concepts import quarters
+    summaries = _spy(monkeypatch, ytd_store, "summaries")
+    from_derived = _spy(monkeypatch, quarters, "metrics_from_derived")
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["capex"], "frequency": "annual"})
+    assert [r["frequency"] for r in res["rows"]] == ["annual"]
+    assert summaries == [] and from_derived == []
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["revenue"], "frequency": "quarterly"})
+    assert all(r["derived"] is None for r in res["rows"]) and summaries == []  # filed quarters only
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"})
+    assert len(summaries) == 1 and from_derived == []  # provenance of the derived rows
+    assert {r["period_accession"] for r in res["rows"] if r["derived"]} == {GOOGL_Q2, GOOGL_Q3, GOOGL_10K}
+    await _call(ytd_store, "companies_fundamentals", {
+        "companies": [GOOGL], "frequency": "annual", "metrics": ["capex_intensity"]})
+    assert len(summaries) == 2 and from_derived
+
+
+async def test_fundamentals_derived_quarter_point_in_time(ytd_store):
+    """Spec rule 4: the derived Q3 exists from the Q3 10-Q's filing (2024-10-29T20:00Z) on."""
+    args = {"companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"}
+    before = await _call(ytd_store, "companies_fundamentals", {**args, "as_of": "2024-10-29T19:59:59Z"})
+    assert [r["period_end"] for r in before["rows"]] == ["2024-06-30", "2024-03-31"]
+    after = await _call(ytd_store, "companies_fundamentals", {**args, "as_of": "2024-10-29T20:00:00Z"})
+    q3 = {r["period_end"]: r for r in after["rows"]}["2024-09-30"]
+    assert (q3["value"], q3["derived"], q3["period_accession"]) == (13061 * 1_000_000, "9M - 6M", GOOGL_Q3)
+    assert q3["filing_ref"] == GOOGL_Q3  # the 2025 re-filing of the 6M is not public yet
+
+
+async def test_fundamentals_pages_with_derived_rows_equal_the_full_page(ytd_store):
+    args = {"companies": [GOOGL], "metrics": "all"}
+    full = await _call(ytd_store, "companies_fundamentals", {**args, "limit": 200})
+    assert full["next_cursor"] is None and any(r["derived"] for r in full["rows"])
+    rows, cursor = [], None
+    while True:
+        res = await _call(ytd_store, "companies_fundamentals", {
+            **args, "limit": 3, **({"cursor": cursor} if cursor else {})})
+        rows += res["rows"]
+        assert res["total"] == full["total"]
+        cursor = res["next_cursor"]
+        if cursor is None:
+            break
+    assert rows == full["rows"]

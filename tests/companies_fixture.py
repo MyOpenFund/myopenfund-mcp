@@ -129,11 +129,12 @@ def seed(tmp_path, *, filings: bool = False) -> StoreConfig:
 
 
 #: chantier 12: a year-to-date cash-flow filer (Alphabet-like) and a semiannual reporter
-GOOGL, SEMI = "0001652044", "0000777777"
+GOOGL, SEMI, SEMI9 = "0001652044", "0000777777", "0000777778"
 CAPEX = "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment"
 GOOGL_Q1, GOOGL_Q2, GOOGL_Q3 = "0001652044-24-000053", "0001652044-24-000079", "0001652044-24-000118"
 GOOGL_10K, GOOGL_Q2_2025 = "0001652044-25-000014", "0001652044-25-000062"
 SEMI_H1, SEMI_FY = "0000777777-24-000010", "0000777777-25-000003"
+SEMI9_H1, SEMI9_N9, SEMI9_FY = "0000777778-24-000010", "0000777778-24-000020", "0000777778-25-000003"
 
 
 def seed_ytd(tmp_path) -> StoreConfig:
@@ -142,7 +143,9 @@ def seed_ytd(tmp_path) -> StoreConfig:
     and its 6-month revenue. Adversarial: the Q2 2025 10-Q re-reports the 6-month 2024 capex as a
     comparative, so the selection keeps that later vintage (a derived Q2 2024's filing_ref is the
     2025 10-Q while the period was first published by the Q2 2024 10-Q). SEMI files no quarters
-    (H1 and fiscal year only): its 6-month rows stay."""
+    (H1 and fiscal year only): its 6-month rows stay. Adversarial: SEMI9 files no quarters either but
+    also a 9-month year-to-date value and an H2 6-month row, so company-corpus derives its Q3 and Q4:
+    those derived quarters must not hide its 6-month rows."""
     cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
     for c in (ENTITY_OBSERVATIONS, FUNDAMENTALS, FILING_STATEMENTS):
         approve_contract(cfg, c, "test")
@@ -151,6 +154,7 @@ def seed_ytd(tmp_path) -> StoreConfig:
         obs(GOOGL, "cik", GOOGL, "Alphabet Inc.", date(2015, 10, 2)),
         obs(GOOGL, "ticker", "GOOGL", valid=date(2026, 11, 2)),
         obs(SEMI, "cik", SEMI, "SEMIANNUAL REPORTER PLC", date(2015, 1, 1), country="GB"),
+        obs(SEMI9, "cik", SEMI9, "SEMIANNUAL NINE-MONTH REPORTER PLC", date(2015, 1, 1), country="GB"),
     ], schema=ENTITY_OBSERVATIONS.schema), landing_root=land, run_id="r1", producer="test", now=NOW)
     jan1 = date(2024, 1, 1)
     q1, h1, n9, fy = date(2024, 3, 31), date(2024, 6, 30), date(2024, 9, 30), date(2024, 12, 31)
@@ -171,6 +175,12 @@ def seed_ytd(tmp_path) -> StoreConfig:
         fact(SEMI, REV, h1, 500 * m, start=jan1, freq="semiannual", accn=SEMI_H1,
              known="2024-08-30T08:00:00"),
         fact(SEMI, REV, fy, 1100 * m, start=jan1, accn=SEMI_FY, known="2025-03-20T08:00:00"),
+        fact(SEMI9, REV, h1, 500 * m, start=jan1, freq="semiannual", accn=SEMI9_H1,
+             known="2024-08-30T08:00:00"),
+        fact(SEMI9, REV, n9, 800 * m, start=jan1, freq="ytd9", accn=SEMI9_N9, known="2024-11-29T08:00:00"),
+        fact(SEMI9, REV, fy, 1100 * m, start=jan1, accn=SEMI9_FY, known="2025-03-20T08:00:00"),
+        fact(SEMI9, REV, fy, 600 * m, start=date(2024, 7, 1), freq="semiannual", accn=SEMI9_FY,
+             known="2025-03-20T08:00:00"),
     ]
     write_batch(FUNDAMENTALS, pa.Table.from_pylist(rows, schema=FUNDAMENTALS.schema),
                 landing_root=land, run_id="r1", producer="test", now=NOW)

@@ -174,9 +174,9 @@ async def test_quarterly_capex_and_total_debt_since_2022(cache_dir):
             debt = {str(r["period_end"])[:10]: r["value"] for r in rows if r["key"] == "total_debt"}
             print(f"{ticker}: {len(capex)} quarters of capex, {len(debt)} of total debt")
             assert {r["source"] for r in rows} == {"sec_live"}
-            # as filed: a cash-flow item has a quarterly row only where the filing has a three-month column
-            # (Microsoft and Amazon: Q1-Q3; Alphabet, Meta, Oracle: Q1 only, then 6- and 9-month YTD), so at
-            # least one per fiscal year 2022-2024; total debt (balance sheet) at the first three quarter ends of
+            # a cash-flow item is filed as a three-month column for some quarters only (Microsoft and
+            # Amazon: Q1-Q3; Alphabet, Meta, Oracle: Q1, then 6- and 9-month YTD); the other quarters are
+            # derived (chantier 12), so at least three per fiscal year 2022-2024 in all; total debt (balance sheet) at the first three quarter ends of
             # a fiscal year at least, the fiscal year end often being under `annual` only (Meta: from Q3 2022)
             assert sum(day < "2025-01-01" for day in capex) >= 3, (ticker, sorted(capex))
             assert sum(day < "2025-01-01" for day in debt) >= 8, (ticker, sorted(debt))

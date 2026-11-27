@@ -57,9 +57,11 @@ from .router import (
 from .store import covered_forms, fallback_acceptance
 
 Frequency = Literal["annual", "semiannual", "quarterly", "instant"]
-#: as filed in the store; ytd9 = the 9-month year-to-date, which only derives an unreported Q4
+#: as filed in the store; ytd9 = the 9-month year-to-date, which derives Q3 (9M - 6M) and Q4 (FY - 9M)
 FactsFrequency = Literal[*get_args(Frequency), "ytd9"]
-#: stored frequencies that exist only to derive other values (TTM): never output by companies_fundamentals
+#: stored frequencies that exist only to derive other values (derived quarters, TTM): never output by
+#: companies_fundamentals (a quarterly filer's 6-month rows are derivation inputs too, hidden per period:
+#: see `_hidden_semiannual`)
 _DERIVATION_ONLY = frozenset({"ytd9"})
 SECTOR = ("unknown (SIC not in the store): sector_relevant is null for the ratios that depend on the "
           "sector (banks, insurers)")
@@ -69,9 +71,8 @@ FUNDAMENTALS_FREQUENCY_DESCRIPTION = (
     "Period covered: annual/quarterly/semiannual include the balance-sheet values (frequency 'instant') "
     "dated at those period ends, as the ratios use them; 'instant' = balance-sheet values only; "
     "omitted = all. 'quarterly' includes the standalone quarters derived from filed year-to-date values "
-    "(`derived` set); the filed 6-month year-to-date values of a company that reports quarters are "
-    "derivation inputs, not output here ('semiannual' keeps semiannual reporters), and 9-month ones "
-    "('ytd9') never are: both stay in companies_facts")
+    "(`derived` set). Filed 6-month (companies that report quarters) and 9-month ('ytd9') year-to-date "
+    "values are not output here; read them in companies_facts.")
 FACTS_FREQUENCY_DESCRIPTION = ("The fact's own period as filed (balance-sheet values are 'instant'; "
                                "'ytd9' = 9-month year-to-date); omitted = all")
 MAX_QUERY_CHARS = 200
@@ -82,6 +83,14 @@ MAX_CURSOR_CHARS = 200
 _SUMMARY_FREQUENCY = {"semi-annual": "semiannual"}
 #: a metric row's `derived` when the metric rests on a derived quarter (spec rule 8)
 FROM_DERIVED = "from derived quarter values"
+
+
+def _hidden_semiannual(sel: list[dict], hidden_semiannual) -> set[dt.date]:
+    """One company's 6-month period ends hidden from companies_fundamentals (spec rule 6): those where
+    the company FILED a quarter. Derived quarters do not count, so the derived Q3/Q4 of an issuer
+    that files no quarters (a semiannual reporter with a 9-month value) leave its 6-month rows in."""
+    return hidden_semiannual([r for r in sel if not (r["frequency"] == "quarterly"
+                                                     and r.get("derived") is not None)])
 
 
 def _in_range(day: dt.date, period_from: dt.date | None, period_to: dt.date | None) -> bool:
@@ -354,7 +363,8 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         rows have it null. `derived` on a concept row = that formula (location 'derived',
         original_tag 'derived:<tag>'); on a metric row = 'from derived quarter values' when the
         metric rests on one; null otherwise, including computed totals (location 'derived',
-        original_tag 'computed:<tag>') and TTM rows. On a derived concept row `filing_ref` and
+        original_tag 'computed:<tag>') and TTM rows (a TTM built on derived quarters carries
+        `derived` null too). On a derived concept row `filing_ref` and
         `known_at` are the latest filing used (often a later re-filing), `period_accession` and
         `period_published` the filing that first published the period (null when unknown, and on
         filed rows). The filed 6- and 9-month year-to-date values stay in companies_facts (see
@@ -380,7 +390,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
 
         def keep(day, freq, hidden):  # a duration period (or, for frequency='instant', a balance-sheet date)
             # output filter only: store.summaries below still receives the whole selection (ytd9 included).
-            # `hidden`: the company's 6-month year-to-date period ends where it reports a quarter
+            # `hidden`: the company's 6-month year-to-date period ends where it files a quarter
             # (derivation inputs, spec rule 6), its concept rows and summaries alike
             return (freq not in _DERIVATION_ONLY and not (freq == "semiannual" and day in hidden)
                     and (frequency is None or freq == frequency) and _in_range(day, period_from, period_to))
@@ -405,12 +415,18 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
             # the standalone quarters of a year-to-date filer (company-corpus; idempotent, so the
             # summaries computing them again from this selection give the same quarters)
             sel = with_derived_quarters(sel)
+            hidden = _hidden_semiannual(sel, hidden_semiannual)
+            # ends of this company's included duration periods (any concept, before the concept filter)
+            period_ends = {r["valid_date"] for r in sel if keep(r["valid_date"], r["frequency"], hidden)}
+            out = [r for r in sel if not (concepts and r["concept"] not in concepts)
+                   and keep_concept(r, period_ends, hidden)]
             summaries = []
-            # derived concept rows take their period's publication from its summary
-            if sel and (wanted or any(r.get("derived") is not None for r in sel)):
+            # metrics, or the output's derived concept rows, which take their period's publication
+            # from its summary
+            if sel and (wanted or any(r.get("derived") is not None for r in out)):
                 summaries = await call(router.source(route).summaries, cik=h["cik"], name=h["current_name"],
                                        rows=sel, vintages=vintages)
-            return route, sel, summaries
+            return route, sel, out, summaries, hidden
 
         rows, version = [], None
         with time_budget(settings, budget_s) as scope:
@@ -418,17 +434,13 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
             hits = await lookup(companies)
             routes = await plan(hits, when, budget)
             found = await per_company(hits, lambda h: one(h, routes, budget))
-            for h, (route, sel, summaries) in zip(hits, found, strict=True):
+            for h, (route, sel, out, summaries, hidden) in zip(hits, found, strict=True):
                 cik, name, origin = h["cik"], h["current_name"], _origin(route)
-                hidden = hidden_semiannual(sel)
-                # ends of this company's included duration periods (any concept, before the concept filter)
-                period_ends = {r["valid_date"] for r in sel if keep(r["valid_date"], r["frequency"], hidden)}
+                version = version or next((r["dictionary_version"] for r in sel
+                                           if r.get("dictionary_version")), None)
                 first = {(s.period_end, _SUMMARY_FREQUENCY.get(s.frequency, s.frequency)): s
                          for s in summaries}
-                for r in sel:
-                    version = version or r.get("dictionary_version")
-                    if (concepts and r["concept"] not in concepts) or not keep_concept(r, period_ends, hidden):
-                        continue
+                for r in out:
                     formula = r.get("derived")
                     period = first.get((r["valid_date"], r["frequency"])) if formula is not None else None
                     rows.append({"cik": cik, "name": name, "period_end": r["valid_date"],
@@ -441,7 +453,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                                  "period_published": period.publication_date if period else None,
                                  "period_accession": (period.accession or None) if period else None,
                                  **origin})
-                for s in summaries:
+                for s in summaries if wanted else ():
                     freq = _SUMMARY_FREQUENCY.get(s.frequency, s.frequency)
                     if s.period_end is None or not keep(s.period_end, freq, hidden):
                         continue
