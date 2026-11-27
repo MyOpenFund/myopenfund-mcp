@@ -46,7 +46,7 @@ hpack==4.2.0
 html5lib==1.1
 httpcore==1.0.9
 httpcore2==2.16.2
-httpx==0.28.1
+httpx==0.29.0
 httpx2==2.16.2
 huggingface_hub==1.33.0
 hyperframe==6.1.0
@@ -72,7 +72,7 @@ mdurl==0.1.2
 mmh3==5.3.1
 myopenfund-company-corpus==0.2.0
 myopenfund-open-data-store==0.1.0
-myopenfund-rag-engine==0.2.0
+myopenfund-rag-engine==0.2.1
 myopenfund-vault-query==0.1.0
 nbformat==5.10.4
 numpy==2.5.5
