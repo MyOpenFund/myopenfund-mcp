@@ -7,6 +7,7 @@ from companies_fixture import (
     AAPL,
     AAPL_10K_2025,
     CAPEX,
+    CAPXO,
     GOOGL,
     GOOGL_10K,
     GOOGL_Q1,
@@ -1136,7 +1137,7 @@ async def test_filings_live_fallback_is_capped_at_now():
 
 
 async def test_fundamentals_tells_the_as_filed_quirks():
-    """C11: Amazon's TTM annual rows, total_debt at face value; chantier 12: YTD cash-flow filers get
+    """Amazon's TTM annual rows, total_debt at face value; YTD cash-flow filers get
     derived quarters, the filed year-to-date values stay in companies_facts."""
     from source_fakes import FakeLive
 
@@ -1154,7 +1155,7 @@ async def test_fundamentals_tells_the_as_filed_quirks():
         assert words in tool.description, words
 
 
-# --- chantier 12: derived quarters (a year-to-date filer, a semiannual reporter) -----------------
+# --- derived quarters (a year-to-date filer, a semiannual reporter) ------------------------------
 
 @pytest.fixture
 def ytd_store(tmp_path):
@@ -1165,7 +1166,7 @@ def ytd_store(tmp_path):
 
 
 async def test_fundamentals_ytd_filer_quarter_by_quarter(ytd_store):
-    """Spec §5: Alphabet's capex 2024, quarter by quarter; Q2-Q4 derived from the filed YTD values."""
+    """Alphabet's capex 2024, quarter by quarter; Q2-Q4 derived from the filed YTD values."""
     res = await _call(ytd_store, "companies_fundamentals", {
         "companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"})
     got = [(r["period_end"], r["frequency"], r["value"], r["derived"]) for r in res["rows"]]
@@ -1217,6 +1218,32 @@ async def test_fundamentals_hides_six_month_inputs_of_quarterly_filers(ytd_store
     assert res["rows"] == []
 
 
+async def test_fundamentals_derived_q2_hides_the_six_month_row(ytd_store):
+    """A derived Q2 (6M - Q1) proves a filed Q1 that fiscal year: the 6-month row it comes from is a
+    derivation input and leaves the output, even with no filed quarter ending at its date."""
+    m = 1_000_000
+    for args in ({"companies": [CAPXO]}, {"companies": [CAPXO], "metrics": "all"}):
+        res = await _call(ytd_store, "companies_fundamentals", args)
+        assert "semiannual" not in {r["frequency"] for r in res["rows"]}, args
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [CAPXO], "frequency": "semiannual"})
+    assert res["rows"] == []
+    res = await _call(ytd_store, "companies_fundamentals", {
+        "companies": [CAPXO], "concepts": ["capex"], "frequency": "quarterly"})
+    assert [(r["period_end"], r["value"], r["derived"]) for r in res["rows"]] == [
+        ("2024-12-31", 25 * m, "FY - 9M"), ("2024-09-30", 20 * m, "9M - 6M"),
+        ("2024-06-30", 15 * m, "6M - Q1"), ("2024-03-31", 10 * m, None)]
+
+
+async def test_fundamentals_semiannual_of_a_quarterly_filer_brings_no_balance_sheet(ytd_store):
+    """frequency='semiannual' on a quarterly filer: its 6-month period ends are hidden, so the
+    balance-sheet values dated there come with the quarters, not with a semiannual period."""
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [CAPXO], "frequency": "semiannual"})
+    assert res["rows"] == []
+    res = await _call(ytd_store, "companies_fundamentals", {"companies": [CAPXO], "frequency": "quarterly"})
+    assert ("2024-06-30", "instant", "assets") in {
+        (r["period_end"], r["frequency"], r["key"]) for r in res["rows"]}
+
+
 async def test_fundamentals_keeps_semiannual_reporters(ytd_store):
     res = await _call(ytd_store, "companies_fundamentals", {"companies": [SEMI]})
     assert {(r["period_end"], r["frequency"], r["derived"]) for r in res["rows"]} == {
@@ -1245,8 +1272,8 @@ async def test_companies_facts_unchanged(ytd_store):
 
 
 async def test_fundamentals_derived_quarters_do_not_hide_a_semiannual_reporters_rows(ytd_store):
-    """Spec rule 6: SEMI9 files no quarters; its 9-month value makes company-corpus derive Q3 and
-    Q4, yet its H1 and H2 6-month rows stay (only a FILED quarter hides a 6-month row)."""
+    """SEMI9 files no quarters; its 9-month value makes company-corpus derive Q3 and Q4, yet its H1
+    and H2 6-month rows stay (a derived Q3/Q4 hides no 6-month row)."""
     m = 1_000_000
     res = await _call(ytd_store, "companies_fundamentals", {"companies": [SEMI9]})
     got = {(r["period_end"], r["frequency"], r["value"], r["derived"]) for r in res["rows"]}
@@ -1293,7 +1320,7 @@ async def test_fundamentals_summaries_only_when_needed(ytd_store, monkeypatch):
 
 
 async def test_fundamentals_derived_quarter_point_in_time(ytd_store):
-    """Spec rule 4: the derived Q3 exists from the Q3 10-Q's filing (2024-10-29T20:00Z) on."""
+    """Point in time: the derived Q3 exists from the Q3 10-Q's filing (2024-10-29T20:00Z) on."""
     args = {"companies": [GOOGL], "concepts": ["capex"], "frequency": "quarterly"}
     before = await _call(ytd_store, "companies_fundamentals", {**args, "as_of": "2024-10-29T19:59:59Z"})
     assert [r["period_end"] for r in before["rows"]] == ["2024-06-30", "2024-03-31"]

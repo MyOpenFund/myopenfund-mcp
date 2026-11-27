@@ -81,16 +81,17 @@ CompanyId = Annotated[str, Field(max_length=MAX_QUERY_CHARS)]
 MAX_CURSOR_CHARS = 200
 #: company-corpus's PeriodSummary frequency labels -> the store's
 _SUMMARY_FREQUENCY = {"semi-annual": "semiannual"}
-#: a metric row's `derived` when the metric rests on a derived quarter (spec rule 8)
+#: a metric row's `derived` when the metric rests on a derived quarter (its value moves without it)
 FROM_DERIVED = "from derived quarter values"
 
 
-def _hidden_semiannual(sel: list[dict], hidden_semiannual) -> set[dt.date]:
-    """One company's 6-month period ends hidden from companies_fundamentals (spec rule 6): those where
-    the company FILED a quarter. Derived quarters do not count, so the derived Q3/Q4 of an issuer
-    that files no quarters (a semiannual reporter with a 9-month value) leave its 6-month rows in."""
+def _hidden_semiannual(sel: list[dict], hidden_semiannual, formula_q2: str) -> set[dt.date]:
+    """One company's 6-month period ends hidden from companies_fundamentals (derivation inputs):
+    those where the company FILED a quarter, or where a derived Q2 (``formula_q2``, 6M - Q1) ends,
+    whose existence proves a filed Q1 that fiscal year. Derived Q3/Q4 (9M - 6M, FY - 9M) hide
+    nothing, so a semiannual reporter that also files a 9-month value keeps its H1/H2 rows."""
     return hidden_semiannual([r for r in sel if not (r["frequency"] == "quarterly"
-                                                     and r.get("derived") is not None)])
+                                                     and r.get("derived") not in (None, formula_q2))])
 
 
 def _in_range(day: dt.date, period_from: dt.date | None, period_to: dt.date | None) -> bool:
@@ -364,11 +365,10 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         original_tag 'derived:<tag>'); on a metric row = 'from derived quarter values' when the
         metric rests on one; null otherwise, including computed totals (location 'derived',
         original_tag 'computed:<tag>') and TTM rows (a TTM built on derived quarters carries
-        `derived` null too). On a derived concept row `filing_ref` and
-        `known_at` are the latest filing used (often a later re-filing), `period_accession` and
-        `period_published` the filing that first published the period (null when unknown, and on
-        filed rows). The filed 6- and 9-month year-to-date values stay in companies_facts (see
-        `frequency`). As filed: Amazon's `annual` rows include trailing twelve-month values from
+        `derived` null too). On a derived concept row `filing_ref` and `known_at` are the latest
+        filing used (often a later re-filing), `period_accession` and `period_published` the filing
+        that first published the period (null when unknown, and on filed rows). The filed 6- and
+        9-month year-to-date values stay in companies_facts (see `frequency`). As filed: Amazon's `annual` rows include trailing twelve-month values from
         its 10-Qs (at quarter ends); total_debt may be at face value."""
         concept_labels, metric_keys = catalogs()
         bad = sorted(set(concepts or []) - set(concept_labels))
@@ -383,6 +383,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         page, offset = check(companies, period_from, period_to, limit, cursor)
         when = parse_as_of(as_of)
         from company_corpus.concepts.quarters import (  # lazy, as the sources import company-corpus
+            FORMULA_Q2,
             hidden_semiannual,
             metrics_from_derived,
             with_derived_quarters,
@@ -390,8 +391,8 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
 
         def keep(day, freq, hidden):  # a duration period (or, for frequency='instant', a balance-sheet date)
             # output filter only: store.summaries below still receives the whole selection (ytd9 included).
-            # `hidden`: the company's 6-month year-to-date period ends where it files a quarter
-            # (derivation inputs, spec rule 6), its concept rows and summaries alike
+            # `hidden`: the company's 6-month year-to-date period ends that are derivation inputs of a
+            # quarterly filer (`_hidden_semiannual`), its concept rows and summaries alike
             return (freq not in _DERIVATION_ONLY and not (freq == "semiannual" and day in hidden)
                     and (frequency is None or freq == frequency) and _in_range(day, period_from, period_to))
 
@@ -415,7 +416,7 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
             # the standalone quarters of a year-to-date filer (company-corpus; idempotent, so the
             # summaries computing them again from this selection give the same quarters)
             sel = with_derived_quarters(sel)
-            hidden = _hidden_semiannual(sel, hidden_semiannual)
+            hidden = _hidden_semiannual(sel, hidden_semiannual, FORMULA_Q2)
             # ends of this company's included duration periods (any concept, before the concept filter)
             period_ends = {r["valid_date"] for r in sel if keep(r["valid_date"], r["frequency"], hidden)}
             out = [r for r in sel if not (concepts and r["concept"] not in concepts)

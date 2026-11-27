@@ -128,24 +128,29 @@ def seed(tmp_path, *, filings: bool = False) -> StoreConfig:
     return cfg
 
 
-#: chantier 12: a year-to-date cash-flow filer (Alphabet-like) and a semiannual reporter
-GOOGL, SEMI, SEMI9 = "0001652044", "0000777777", "0000777778"
+#: a year-to-date cash-flow filer (Alphabet-like), a capex-only year-to-date filer and semiannual reporters
+GOOGL, SEMI, SEMI9, CAPXO = "0001652044", "0000777777", "0000777778", "0000777779"
 CAPEX = "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment"
 GOOGL_Q1, GOOGL_Q2, GOOGL_Q3 = "0001652044-24-000053", "0001652044-24-000079", "0001652044-24-000118"
 GOOGL_10K, GOOGL_Q2_2025 = "0001652044-25-000014", "0001652044-25-000062"
 SEMI_H1, SEMI_FY = "0000777777-24-000010", "0000777777-25-000003"
 SEMI9_H1, SEMI9_N9, SEMI9_FY = "0000777778-24-000010", "0000777778-24-000020", "0000777778-25-000003"
+CAPXO_Q1, CAPXO_Q2, CAPXO_Q3, CAPXO_FY = ("0000777779-24-000010", "0000777779-24-000020",
+                                          "0000777779-24-000030", "0000777779-25-000003")
 
 
 def seed_ytd(tmp_path) -> StoreConfig:
-    """Alphabet's capex 2024 as filed (spec §5: 3M 12,012; 6M 25,198; 9M 38,259; FY 52,535, $M),
+    """Alphabet's capex 2024 as filed (3M 12,012; 6M 25,198; 9M 38,259; FY 52,535, $M),
     with its standalone quarterly revenue (Q1 and Q2 filed, so no revenue quarter is derived there)
     and its 6-month revenue. Adversarial: the Q2 2025 10-Q re-reports the 6-month 2024 capex as a
     comparative, so the selection keeps that later vintage (a derived Q2 2024's filing_ref is the
     2025 10-Q while the period was first published by the Q2 2024 10-Q). SEMI files no quarters
     (H1 and fiscal year only): its 6-month rows stay. Adversarial: SEMI9 files no quarters either but
     also a 9-month year-to-date value and an H2 6-month row, so company-corpus derives its Q3 and Q4:
-    those derived quarters must not hide its 6-month rows."""
+    those derived quarters must not hide its 6-month rows. Adversarial: CAPXO files capex only (Q1,
+    6M, 9M, FY) and no other concept, so no filed quarter ends at its 6-month date: its derived Q2
+    (6M - Q1) proves the filed Q1 and must hide that 6-month row; its balance sheet at the 6-month
+    end is a quarter-end value, not a semiannual one."""
     cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
     for c in (ENTITY_OBSERVATIONS, FUNDAMENTALS, FILING_STATEMENTS):
         approve_contract(cfg, c, "test")
@@ -155,6 +160,7 @@ def seed_ytd(tmp_path) -> StoreConfig:
         obs(GOOGL, "ticker", "GOOGL", valid=date(2026, 11, 2)),
         obs(SEMI, "cik", SEMI, "SEMIANNUAL REPORTER PLC", date(2015, 1, 1), country="GB"),
         obs(SEMI9, "cik", SEMI9, "SEMIANNUAL NINE-MONTH REPORTER PLC", date(2015, 1, 1), country="GB"),
+        obs(CAPXO, "cik", CAPXO, "CAPEX ONLY FILER INC", date(2015, 1, 1)),
     ], schema=ENTITY_OBSERVATIONS.schema), landing_root=land, run_id="r1", producer="test", now=NOW)
     jan1 = date(2024, 1, 1)
     q1, h1, n9, fy = date(2024, 3, 31), date(2024, 6, 30), date(2024, 9, 30), date(2024, 12, 31)
@@ -181,6 +187,11 @@ def seed_ytd(tmp_path) -> StoreConfig:
         fact(SEMI9, REV, fy, 1100 * m, start=jan1, accn=SEMI9_FY, known="2025-03-20T08:00:00"),
         fact(SEMI9, REV, fy, 600 * m, start=date(2024, 7, 1), freq="semiannual", accn=SEMI9_FY,
              known="2025-03-20T08:00:00"),
+        fact(CAPXO, CAPEX, q1, 10 * m, start=jan1, freq="quarterly", accn=CAPXO_Q1, known=k_q1),
+        fact(CAPXO, CAPEX, h1, 25 * m, start=jan1, freq="semiannual", accn=CAPXO_Q2, known=k_q2),
+        fact(CAPXO, CAPEX, n9, 45 * m, start=jan1, freq="ytd9", accn=CAPXO_Q3, known=k_q3),
+        fact(CAPXO, CAPEX, fy, 70 * m, start=jan1, accn=CAPXO_FY, known=k_fy),
+        fact(CAPXO, "us-gaap:Assets", h1, 900 * m, freq="instant", accn=CAPXO_Q2, known=k_q2),
     ]
     write_batch(FUNDAMENTALS, pa.Table.from_pylist(rows, schema=FUNDAMENTALS.schema),
                 landing_root=land, run_id="r1", producer="test", now=NOW)
