@@ -940,7 +940,7 @@ def test_sec_http_error_is_coded_with_the_live_message():
     assert str(err) == f"[backend_unavailable] {LIVE_BACKEND_MESSAGE}"
 
 
-# --- chantier 12: derived quarters through the tool, store and live alike ---------------------------
+# --- derived quarters through the tool, store and live alike -------------------------------------
 async def _fundamentals(settings, args, **sources):
     from fastmcp import Client
 
