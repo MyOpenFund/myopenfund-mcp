@@ -107,9 +107,9 @@ gives it.
   MCP server, or `warm`, on the same `MOF_CACHE_DIR` answers `[index_unavailable]` for the filings tools
   (the other tools work). Give each its own `MOF_CACHE_DIR`, or stop the first.
 - **Upgrading from an earlier build.** The index folder under `<MOF_CACHE_DIR>/index/` is named after the
-  model and the chunker version; builds before the chunk titles stated the period (chunker version ending
-  `ttl2`) wrote folders that are no longer read: their documents are fetched and indexed again, and the
-  old folders are orphaned, safe to delete.
+  model and the chunker version; folders written by an earlier chunker (a chunker version not ending
+  `ttl2-fm1`: before the chunk titles stated the period, or before 0.2.1) are no longer read: their
+  documents are fetched and indexed again, and the old folders are orphaned, safe to delete.
 - **The embedding model is downloaded once, at the first fetch of filings**: about 1.1 GB, pinned to one
   revision. Later runs read it from the cache. No other model or data file is downloaded.
 - **`MOF_CACHE=off`** keeps no HTTP entries and no index between runs: they live in a temporary folder
@@ -228,6 +228,13 @@ URL), run `pip uninstall -y vault-query open-data-store company-corpus rag-engin
 - Still installed under the pre-PyPI names (`vault-query`, `open-data-store`, `company-corpus`,
   `rag-engine`)? Uninstall them first, as in the migration line above.
 
+**Upgrading from 0.2.0.** 0.2.1 needs `myopenfund-rag-engine` 0.2.1, whose chunker keeps text 0.2.0
+lost: a filing section starting on a `---` page break lost its first page (about 2 % of the text of a
+10-K, up to 5 % for some issuers). Upgrade with `pip install -U "myopenfund-mcp[companies,filings]"`
+(with the extras you use). Re-indexing happens automatically: the chunker version is now
+`v2-t480-o32-ttl2-fm1`, so the filings indexed by 0.2.0 are fetched and indexed again at the next
+`companies_fetch_filings` (or `warm`), and the old folders under `<MOF_CACHE_DIR>/index/` can be deleted.
+
 To try the latest `main` before a release (the dependencies still come from PyPI):
 
 ```bash
@@ -302,8 +309,8 @@ the ones the CI tested:
   which fails when a build requirement is not pinned in the file at a version its specifier allows.
 - **The MyOpenFund packages** (`myopenfund-vault-query`, `myopenfund-open-data-store`,
   `myopenfund-company-corpus`, `myopenfund-rag-engine`): ordinary PyPI dependencies, capped in
-  `pyproject.toml` below their next breaking release (`>=0.m.0,<0.(m+1)`, e.g.
-  `myopenfund-rag-engine>=0.2.0,<0.3`) and pinned to one exact version in
+  `pyproject.toml` below their next breaking release (`>=0.m.n,<0.(m+1)`, e.g.
+  `myopenfund-rag-engine>=0.2.1,<0.3`) and pinned to one exact version in
   `constraints.txt`.
 
 The `install` service passes both files of the release's tag as URLs and pins the package itself (the constraints files of the release's tag `v<version>`):
@@ -424,7 +431,7 @@ into a volume at each start of the stack.
 2. **Payload indexes, once, from the data side.** The filters and the list of valid filter values use
    Qdrant's payload indexes. Whoever owns the collection creates them, once per collection, with a key
    that can write, from an environment where `rag-engine` is installed (the ingestion's own, or any venv
-   with `pip install "myopenfund-rag-engine>=0.2.0,<0.3"`,
+   with `pip install "myopenfund-rag-engine>=0.2.1,<0.3"`,
    the range this server is built on). Give the host AND the port: the engine's default port is 6333.
    The key is typed at a prompt here too:
 

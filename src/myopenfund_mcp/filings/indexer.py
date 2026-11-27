@@ -11,8 +11,8 @@ embedding workers) do the work.
   Software, not data: they stay in the persistent cache folder even with `MOF_CACHE=off`;
 - `<root>/index/<collection>/`: rag-engine's `LocalIndex` (Qdrant local mode + SQLite FTS5). The
   collection name (`rag_engine.local.collection_name`) holds the model, its pinned revision, the
-  chunker version (`v2-t<MOF_CHUNK_MAX_TOKENS>-o<MOF_CHUNK_OVERLAP_TOKENS>-<TITLE_FORMAT>`) and the ONNX provider,
-  so vectors of two setups are never mixed;
+  chunker version (`v2-t<MOF_CHUNK_MAX_TOKENS>-o<MOF_CHUNK_OVERLAP_TOKENS>-<TITLE_FORMAT>-<TEXT_FIX>`) and
+  the ONNX provider, so vectors of two setups are never mixed;
 - `<root>/index/status.sqlite3`: this module's record, keyed by collection: one row per document
   (state, chunks done/total, error, metadata, title, fingerprint of its cut) and one row per stored
   chunk (number, section, text), which `read` serves and a resume reads.
@@ -273,11 +273,21 @@ def chunk_options(settings: Settings) -> ChunkingOptions:
 #: documents indexed under the old titles are never served as ready. Bump it when the format changes.
 TITLE_FORMAT = "ttl2"
 
+#: Fix level of rag-engine's chunker, part of the cut's label like the title format. `fm1`:
+#: rag-engine 0.2.1 keeps the text 0.2.0 lost (a section starting on a `---` page break was read
+#: as YAML front matter and its first page dropped; a rule glued to text dropped the text), so an
+#: index built before it is never served as ready and its documents are indexed again. Bump it
+#: when a rag-engine release changes the chunks of the same text.
+TEXT_FIX = "fm1"
+
 
 def chunker_version(options: ChunkingOptions) -> str:
-    """The label of a cut: the profile, the two sizes the settings change and the title format
-    (`v2-t480-o32-ttl2`)."""
-    return f"{options.version}-t{options.max_chunk_token_count}-o{options.overlap_tokens}-{TITLE_FORMAT}"
+    """The label of a cut: the profile, the two sizes the settings change, the title format and
+    rag-engine's text fix (`v2-t480-o32-ttl2-fm1`)."""
+    return (
+        f"{options.version}-t{options.max_chunk_token_count}-o{options.overlap_tokens}"
+        f"-{TITLE_FORMAT}-{TEXT_FIX}"
+    )
 
 
 def filing_title(company: str, form: str, report_date: dt.date | None, filed: dt.date | None) -> str:

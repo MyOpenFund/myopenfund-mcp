@@ -32,9 +32,10 @@ companies = [
 ]
 # [onnx]: queries are embedded on the ONNX runtime (CPU), without PyTorch.
 # Same range as [filings]: the two extras resolve one myopenfund-rag-engine release.
-rag = ["myopenfund-rag-engine[onnx]>=0.2.0,<0.3"]
+rag = ["myopenfund-rag-engine[onnx]>=0.2.1,<0.3"]
 # [filings]: the local filings index (no-vault mode), new in rag-engine 0.2.0. [local] brings [onnx].
-filings = ["myopenfund-rag-engine[local,graph]>=0.2.0,<0.3"]
+# 0.2.1: the chunker keeps the text 0.2.0 lost (indexer.TEXT_FIX).
+filings = ["myopenfund-rag-engine[local,graph]>=0.2.1,<0.3"]
 dev = ["pytest>=8.3", "ruff>=0.6", "pyyaml>=6"]
 
 [project.urls]
