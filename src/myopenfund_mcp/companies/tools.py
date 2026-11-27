@@ -1,7 +1,8 @@
 """The `companies` toolset: identify companies, read their filed facts, concepts and ratios as of a date.
 
 Concepts and ratios come from company-corpus through the store adapter or the live SEC source, chosen
-per company by the source router (`MOF_COMPANIES_SOURCE`); nothing is computed here. Every row says
+per company by the source router (`MOF_COMPANIES_SOURCE`); nothing is computed here (the derived
+quarters of `companies_fundamentals` are company-corpus's `with_derived_quarters`). Every row says
 where it comes from (`source`, and `reason` when `auto` answered live). Every argument is checked
 before any source is touched, and each call has ONE time budget (`companies_query_timeout_s`, plus
 `sec_call_budget_s` when SEC may be reached) shared by all its reads; the companies of a call are
@@ -67,9 +68,10 @@ COMPANIES_DESCRIPTION = ("CIKs, tickers or entity_ids, at most the server maximu
 FUNDAMENTALS_FREQUENCY_DESCRIPTION = (
     "Period covered: annual/quarterly/semiannual include the balance-sheet values (frequency 'instant') "
     "dated at those period ends, as the ratios use them; 'instant' = balance-sheet values only; "
-    "omitted = all. As filed: a company filing cash flows year-to-date (e.g. Alphabet, Meta, Oracle) has "
-    "quarterly cash-flow values for Q1 only, later quarters as 6- or 9-month year-to-date ('ytd9' in "
-    "companies_facts)")
+    "omitted = all. 'quarterly' includes the standalone quarters derived from filed year-to-date values "
+    "(`derived` set); the filed 6-month year-to-date values of a company that reports quarters are "
+    "derivation inputs, not output here ('semiannual' keeps semiannual reporters), and 9-month ones "
+    "('ytd9') never are: both stay in companies_facts")
 FACTS_FREQUENCY_DESCRIPTION = ("The fact's own period as filed (balance-sheet values are 'instant'; "
                                "'ytd9' = 9-month year-to-date); omitted = all")
 MAX_QUERY_CHARS = 200
@@ -78,6 +80,8 @@ CompanyId = Annotated[str, Field(max_length=MAX_QUERY_CHARS)]
 MAX_CURSOR_CHARS = 200
 #: company-corpus's PeriodSummary frequency labels -> the store's
 _SUMMARY_FREQUENCY = {"semi-annual": "semiannual"}
+#: a metric row's `derived` when the metric rests on a derived quarter (spec rule 8)
+FROM_DERIVED = "from derived quarter values"
 
 
 def _in_range(day: dt.date, period_from: dt.date | None, period_to: dt.date | None) -> bool:
@@ -345,9 +349,17 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
         debt and margin ratios accordingly. Rows: newest period first per company, concepts before
         metrics; datetimes are UTC; `source` says where a company's rows come from (store or
         sec_live), `reason` why SEC answered when the store could have. `[warming]` = still fetching
-        from SEC: call again. As filed: year-to-date cash-flow filers (Alphabet, Meta, Oracle) give
-        quarterly cash flows for Q1 only (see `frequency`); Amazon's `annual` rows include trailing
-        twelve-month values from its 10-Qs (at quarter ends); total_debt may be at face value."""
+        from SEC: call again. Derived quarters: rows with `derived` set are standalone quarters
+        computed from filed year-to-date values (Q2 = 6M - Q1, Q3 = 9M - 6M, Q4 = FY - 9M); filed
+        rows have it null. `derived` on a concept row = that formula (location 'derived',
+        original_tag 'derived:<tag>'); on a metric row = 'from derived quarter values' when the
+        metric rests on one; null otherwise, including computed totals (location 'derived',
+        original_tag 'computed:<tag>') and TTM rows. On a derived concept row `filing_ref` and
+        `known_at` are the latest filing used (often a later re-filing), `period_accession` and
+        `period_published` the filing that first published the period (null when unknown, and on
+        filed rows). The filed 6- and 9-month year-to-date values stay in companies_facts (see
+        `frequency`). As filed: Amazon's `annual` rows include trailing twelve-month values from
+        its 10-Qs (at quarter ends); total_debt may be at face value."""
         concept_labels, metric_keys = catalogs()
         bad = sorted(set(concepts or []) - set(concept_labels))
         if bad:
@@ -360,17 +372,24 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
             raise tool_error(UNKNOWN_METRIC, f"unknown {bad}; valid: 'all' or {', '.join(sorted(metric_keys))}")
         page, offset = check(companies, period_from, period_to, limit, cursor)
         when = parse_as_of(as_of)
+        from company_corpus.concepts.quarters import (  # lazy, as the sources import company-corpus
+            hidden_semiannual,
+            metrics_from_derived,
+            with_derived_quarters,
+        )
 
-        def keep(day, freq):  # a duration period (or, for frequency='instant', a balance-sheet date)
-            # output filter only: store.summaries below still receives the whole selection (ytd9 included)
-            return (freq not in _DERIVATION_ONLY and (frequency is None or freq == frequency)
-                    and _in_range(day, period_from, period_to))
+        def keep(day, freq, hidden):  # a duration period (or, for frequency='instant', a balance-sheet date)
+            # output filter only: store.summaries below still receives the whole selection (ytd9 included).
+            # `hidden`: the company's 6-month year-to-date period ends where it reports a quarter
+            # (derivation inputs, spec rule 6), its concept rows and summaries alike
+            return (freq not in _DERIVATION_ONLY and not (freq == "semiannual" and day in hidden)
+                    and (frequency is None or freq == frequency) and _in_range(day, period_from, period_to))
 
-        def keep_concept(r, period_ends):
+        def keep_concept(r, period_ends, hidden):
             """F1's period model: a duration frequency brings the instants dated at its period ends."""
             if frequency not in (None, "instant") and r["frequency"] == "instant":
                 return r["valid_date"] in period_ends
-            return keep(r["valid_date"], r["frequency"])
+            return keep(r["valid_date"], r["frequency"], hidden)
 
         async def one(h, routes, budget):
             route, got = routes[h["cik"]], None
@@ -383,8 +402,12 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                 route, got = await on_live(h, route, budget, "concept_rows", cik=h["cik"], as_of=when,
                                            period_from=period_from, period_to=period_to)
             sel, vintages = got
+            # the standalone quarters of a year-to-date filer (company-corpus; idempotent, so the
+            # summaries computing them again from this selection give the same quarters)
+            sel = with_derived_quarters(sel)
             summaries = []
-            if wanted and sel:
+            # derived concept rows take their period's publication from its summary
+            if sel and (wanted or any(r.get("derived") is not None for r in sel)):
                 summaries = await call(router.source(route).summaries, cik=h["cik"], name=h["current_name"],
                                        rows=sel, vintages=vintages)
             return route, sel, summaries
@@ -397,23 +420,32 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
             found = await per_company(hits, lambda h: one(h, routes, budget))
             for h, (route, sel, summaries) in zip(hits, found, strict=True):
                 cik, name, origin = h["cik"], h["current_name"], _origin(route)
+                hidden = hidden_semiannual(sel)
                 # ends of this company's included duration periods (any concept, before the concept filter)
-                period_ends = {r["valid_date"] for r in sel if keep(r["valid_date"], r["frequency"])}
+                period_ends = {r["valid_date"] for r in sel if keep(r["valid_date"], r["frequency"], hidden)}
+                first = {(s.period_end, _SUMMARY_FREQUENCY.get(s.frequency, s.frequency)): s
+                         for s in summaries}
                 for r in sel:
                     version = version or r.get("dictionary_version")
-                    if (concepts and r["concept"] not in concepts) or not keep_concept(r, period_ends):
+                    if (concepts and r["concept"] not in concepts) or not keep_concept(r, period_ends, hidden):
                         continue
+                    formula = r.get("derived")
+                    period = first.get((r["valid_date"], r["frequency"])) if formula is not None else None
                     rows.append({"cik": cik, "name": name, "period_end": r["valid_date"],
                                  "frequency": r["frequency"], "kind": "concept", "key": r["concept"],
                                  "label": concept_labels.get(r["concept"], r["concept"]), "value": r["value"],
                                  "unit": r["unit"], "original_tag": r["original_tag"],
                                  "filing_ref": r["filing_ref"], "source_doc_id": r["source_doc_id"],
                                  "known_at": r["known_at"], "location": r["location"],
-                                 "conflict": r["conflict"], **origin})
+                                 "conflict": r["conflict"], "derived": formula,
+                                 "period_published": period.publication_date if period else None,
+                                 "period_accession": (period.accession or None) if period else None,
+                                 **origin})
                 for s in summaries:
                     freq = _SUMMARY_FREQUENCY.get(s.frequency, s.frequency)
-                    if s.period_end is None or not keep(s.period_end, freq):
+                    if s.period_end is None or not keep(s.period_end, freq, hidden):
                         continue
+                    on_derived = metrics_from_derived(s)
                     for is_ttm, block in ((False, s.derived), (True, s.ttm)):
                         for key, m in block.items():
                             if key in wanted and m.get("value") is not None:
@@ -421,7 +453,9 @@ def build_companies_toolset(router: SourceRouter, settings: Settings, *, auth_en
                                              "frequency": freq, "kind": "metric", "key": key,
                                              "label": m.get("label"), "value": m["value"],
                                              "unit": m.get("unit"), "ttm": is_ttm,
-                                             "sector_relevant": m.get("sector_relevant"), **origin})
+                                             "sector_relevant": m.get("sector_relevant"),
+                                             "derived": FROM_DERIVED if not is_ttm and key in on_derived
+                                             else None, **origin})
         rows.sort(key=lambda r: (r["cik"], _newest_first(r["period_end"]), r["frequency"],
                                  r["kind"] != "concept", r["key"]))
         chunk, nxt = page_of(rows, page, offset)

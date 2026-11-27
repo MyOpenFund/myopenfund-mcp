@@ -938,3 +938,59 @@ def test_sec_http_error_is_coded_with_the_live_message():
 
     err = coded(SecHttpError(401, "401 for https://www.sec.gov/x"))
     assert str(err) == f"[backend_unavailable] {LIVE_BACKEND_MESSAGE}"
+
+
+# --- chantier 12: derived quarters through the tool, store and live alike ---------------------------
+async def _fundamentals(settings, args, **sources):
+    from fastmcp import Client
+
+    from myopenfund_mcp.server import build_server
+
+    async with Client(build_server(settings, **sources)) as c:
+        return (await c.call_tool("companies_fundamentals", args)).data
+
+
+@pytest.mark.anyio
+async def test_store_and_live_same_derived_rows(make):
+    """companies_fundamentals derives the same quarters from the live selection as from the store's
+    (every vintage, every filing's positions): Microsoft's Q4 FY2024 = FY - 9M, its 10-K the
+    period's first publication."""
+    from source_fakes import FakeStore
+
+    live = make()
+
+    class SelectionStore(FakeStore):
+        def concept_rows(self, cik, as_of):
+            self._enter("concept_rows", cik)
+            return _all_positions(cik, as_of)
+
+        def summaries(self, cik, name, rows, vintages):
+            self._enter("summaries", cik)
+            return live.summaries(cik, name, rows, vintages)
+
+        def concept_catalog(self):
+            return live.concept_catalog()
+
+        def metric_catalog(self):
+            return live.metric_catalog()
+
+    store = SelectionStore((MSFT,))
+    args = {"companies": [MSFT], "frequency": "quarterly", "metrics": "all",
+            "period_from": "2023-07-01", "period_to": "2025-03-31", "as_of": LATER.isoformat()}
+    by_store = await _fundamentals(Settings(companies_source="store", companies_catalog="x"), args,
+                                   companies_store=store)
+    by_live = await _fundamentals(_settings(companies_source="sec", sec_contact="test@example.invalid"),
+                                  args, companies_live=live)
+
+    def view(res):
+        return [{k: v for k, v in r.items() if k not in ("source", "reason")} for r in res["rows"]]
+
+    assert {r["source"] for r in by_store["rows"]} == {"store"} and "concept_rows" in store.calls
+    assert {r["source"] for r in by_live["rows"]} == {"sec_live"}
+    assert view(by_store) == view(by_live)
+    derived = [r for r in view(by_live) if r["kind"] == "concept" and r["derived"]]
+    q4 = [r for r in derived if r["key"] == "revenue" and r["period_end"] == "2024-06-30"]
+    assert len(q4) == 1 and q4[0]["derived"] == "FY - 9M"
+    assert q4[0]["value"] == MSFT_REVENUE_FY2024 - MSFT_YTD9_REVENUE
+    assert q4[0]["period_accession"] == MSFT_K24 and q4[0]["period_published"] == "2024-07-30"
+    assert "semiannual" not in {r["frequency"] for r in by_live["rows"]}
