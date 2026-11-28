@@ -17,6 +17,9 @@ that hit's `url`. The scenario runs RUNS times; the criterion is at least REQUIR
 Runs are independent samples: temperature SAMPLING_TEMPERATURE and a distinct seed per run. A run that
 hits an Ollama error (HTTP, timeout, malformed tool call) counts as a FAIL with the error, not an abort.
 
+Each run prints its line: pass or why not, then every tool call with its arguments and, when the tool
+failed, its error message, then the answer (`-s` shows them on success too).
+
 Opt-in: marker `llm`, needs a running Ollama. The model comes from MOF_MCP_IT_OLLAMA_MODEL (default
 qwen3:4b). If the 4B model fails the criterion, the documented default test model is the smallest one
 that passes (decision 2026-11-24): set the new default in DEFAULT_MODEL below and in the README.
@@ -31,6 +34,7 @@ from __future__ import annotations
 
 import datetime as dt
 import http.client
+import json
 import os
 import re
 import time
@@ -293,10 +297,11 @@ def load(ref: FilingRef, sec) -> FilingDocument:
 
 
 class Recording:
-    """A Client stand-in that keeps every tool result (name, arguments, structured content)."""
+    """A Client stand-in that keeps every tool result (name, arguments, structured content) and every
+    call (name, arguments, the tool's error message or None), for the run lines."""
 
     def __init__(self, client: Client):
-        self.client, self.results = client, []
+        self.client, self.results, self.calls = client, [], []
 
     async def list_tools(self):
         return await self.client.list_tools()
@@ -304,9 +309,20 @@ class Recording:
     async def call_tool(self, name, args, **kw):
         result = await self.client.call_tool(name, args, **kw)
         content = result.structured_content
-        self.results.append((name, args, content if content is not None else
-                             "\n".join(getattr(b, "text", "") for b in result.content)))
+        text = "\n".join(getattr(b, "text", "") for b in result.content)
+        self.results.append((name, args, content if content is not None else text))
+        self.calls.append((name, args, text if result.is_error else None))
         return result
+
+
+def run_line(n: int, ok: bool, why: str, calls: list[tuple[str, dict, str | None]], answer: str) -> str:
+    """A run's report: the summary line, then one line per call with its arguments and tool error."""
+    lines = [f"run {n}: {'PASS' if ok else 'FAIL'} rounds={len(calls)} tools={[c[0] for c in calls]} {why}"]
+    for i, (name, args, error) in enumerate(calls, 1):
+        line = f"  call {i}: {name} {json.dumps(args, ensure_ascii=False, default=str)}"
+        lines.append(line + (f" -> error: {error}" if error is not None else ""))
+    lines.append(f"  answer: {answer!r}")
+    return "\n".join(lines)
 
 
 async def warm_server(tmp_path):
@@ -336,19 +352,20 @@ async def warm_server(tmp_path):
     return indexer, make_client
 
 
-async def run_once(make_client, chat) -> tuple[bool, str, list[tuple[str, dict]], str]:
+async def run_once(make_client, chat) -> tuple[bool, str, list[tuple[str, dict, str | None]], str]:
+    """(pass, why not, calls as (tool, arguments, tool error or None), final answer)."""
     async with make_client() as client:
         recorder = Recording(client)
-        calls, answer = await llm_smoke.run_session(recorder, chat, QUESTION, max_rounds=MAX_ROUNDS)
+        _calls, answer = await llm_smoke.run_session(recorder, chat, QUESTION, max_rounds=MAX_ROUNDS)
     ok, why = scenario_passed(recorder.results, answer)
-    return ok, why, calls, answer
+    return ok, why, recorder.calls, answer
 
 
 #: What a flaky Ollama raises mid-run: HTTP errors and timeouts (OSError), malformed JSON or tool call.
 RUN_ERRORS = (OSError, http.client.HTTPException, urllib.error.URLError, ValueError, KeyError, TypeError)
 
 
-async def run_guarded(make_client, chat) -> tuple[bool, str, list[tuple[str, dict]], str]:
+async def run_guarded(make_client, chat) -> tuple[bool, str, list[tuple[str, dict, str | None]], str]:
     """run_once, but an Ollama error makes this run a FAIL carrying the error instead of aborting."""
     try:
         return await run_once(make_client, chat)
@@ -525,7 +542,6 @@ async def test_scripted_good_model_passes_on_the_offline_server(tmp_path):
                             "query": "financing capital expenditures", "companies": ["MSFT", "GOOGL"], "limit": 8}}}]}
                 tool_text = [m["content"] for m in messages if m["role"] == "tool"]
                 assert len(tool_text) == 2
-                import json
                 hits = json.loads(tool_text[1])["hits"]
                 urls.extend(h["url"] for h in hits)
                 best = next(h for h in hits if "capital expenditures" in h["text"])
@@ -539,6 +555,34 @@ async def test_scripted_good_model_passes_on_the_offline_server(tmp_path):
         indexer.close()
     assert ok, (why, calls, answer)
     assert [c[0] for c in calls] == ["companies_facts", "companies_search_filings"] and urls
+
+
+@pytest.mark.anyio
+async def test_recording_keeps_each_calls_arguments_and_tool_error(tmp_path):
+    indexer, make_client = await warm_server(tmp_path)
+    try:
+        async with make_client() as client:
+            recorder = Recording(client)
+            await recorder.call_tool("companies_resolve", {"query": "Microsoft"}, raise_on_error=False)
+            await recorder.call_tool("companies_facts", {"companies": ["NOPE-XYZ"]}, raise_on_error=False)
+    finally:
+        indexer.close()
+    (ok_name, ok_args, ok_error), (bad_name, bad_args, bad_error) = recorder.calls
+    assert (ok_name, ok_args, ok_error) == ("companies_resolve", {"query": "Microsoft"}, None)
+    assert (bad_name, bad_args) == ("companies_facts", {"companies": ["NOPE-XYZ"]})
+    assert bad_error and bad_error.startswith("[")  # the tool's own message, stable [code] first
+
+
+def test_run_line_shows_each_calls_arguments_and_error():
+    calls = [("companies_resolve", {"query": "Microsoft"}, None),
+             ("companies_fundamentals", {"companies": ["MSFT"], "items": ["capex"]}, "[invalid_argument] bad item")]
+    line = run_line(2, False, "no FY2024 capex row", calls, "the answer")
+    assert line.splitlines()[0] == ("run 2: FAIL rounds=2 tools=['companies_resolve', 'companies_fundamentals'] "
+                                    "no FY2024 capex row")
+    assert '  call 1: companies_resolve {"query": "Microsoft"}' in line.splitlines()
+    assert ('  call 2: companies_fundamentals {"companies": ["MSFT"], "items": ["capex"]} '
+            "-> error: [invalid_argument] bad item") in line.splitlines()
+    assert line.splitlines()[-1] == "  answer: 'the answer'"
 
 
 # --- the opt-in scenario ------------------------------------------------------------------------------
@@ -557,8 +601,7 @@ async def test_small_model_scenario(tmp_path):
                 "temperature": SAMPLING_TEMPERATURE, "seed": SEED_BASE + n, "num_ctx": NUM_CTX})
             ok, why, calls, answer = await run_guarded(make_client, chat)
             passes += ok
-            report.append(f"run {n}: {'PASS' if ok else 'FAIL'} rounds={len(calls)} "
-                          f"tools={[c[0] for c in calls]} {why}\n  answer: {answer!r}")
+            report.append(run_line(n, ok, why, calls, answer))
             print(report[-1])
     finally:
         indexer.close()
