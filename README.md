@@ -171,13 +171,6 @@ Progress goes to stderr; run it again to resume, documents already `ready` are n
 your assistant's MCP server first, as only one process can hold the index. More in
 [Warming the cache ahead of questions](https://github.com/MyOpenFund/myopenfund-mcp#warming-the-cache-ahead-of-questions-warm).
 
-### Small local models
-
-A small local model (for example one served by Ollama, through an MCP-capable client) can call these
-tools; see [Local models](https://github.com/MyOpenFund/myopenfund-mcp#local-models). Ask one question at a time, name the companies and the period,
-and check the quoted passages and figures against the `url` link of each result's `source`, as reading
-long filings and combining numbers is where small models struggle most.
-
 > **MyOpenFund manages nobody's money and gives no investment advice.** What you do with these documents
 > and facts is your decision.
 
@@ -1114,24 +1107,7 @@ The server works with any MCP client, including clients driving local models. No
 LLM: every v1 tool is deterministic and the client's model does the reasoning. Tools that will use an LLM
 later (such as an answer tool over RAG) are optional, always support a local backend, and are not mounted
 when no LLM is configured. Tool descriptions are directive and arguments are validated against the input
-schema, to help small models call them correctly.
-
-How small is small enough is measured, not assumed: `tests/llm/test_scenario_small_model.py` asks a local
-model, over a fake SEC (no network, no download), to compare the capital expenditures of two companies in
-two fiscal years and to quote and cite what each annual report says about financing them. A run passes
-when the answer has both FY2024 values, equal to the rows the tools returned, and quotes a passage with
-the `url` of a `companies_search_filings` result; the model must pass at least 4 runs of 6. The default
-test model is `qwen3:4b`; if it fails, the documented default is the smallest model that passes.
-**Status (0.2.0): not yet validated with a small model.** `qwen3:4b` scored 0 of 6 on a 4-CPU cloud run
-(it answered from the passages without calling `companies_facts`, before the tool descriptions said
-facts come first); the reference runs, `qwen3:4b` then `qwen3:8b`, are on Apple silicon. Claude
-(Claude Code over stdio, real SEC) answers the same scenario correctly. Run it with a local Ollama
-(`ollama pull qwen3:4b`):
-
-```bash
-MOF_MCP_IT_OLLAMA_URL=http://127.0.0.1:11434 MOF_MCP_IT_OLLAMA_MODEL=qwen3:4b \
-  .venv/bin/python -m pytest -m llm tests/llm/test_scenario_small_model.py -s
-```
+schema, to help models call them correctly.
 
 ## Roadmap
 
